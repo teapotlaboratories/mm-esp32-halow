@@ -1,0 +1,20 @@
+<map id="beacon_stuffing.c" name="beacon_stuffing.c">
+<area shape="rect" id="node1" title="Example app using the WLAN Beacon Vendor Specific IE Filter API." alt="" coords="518,5,654,32"/>
+<area shape="rect" id="node2" title=" " alt="" coords="111,155,181,181"/>
+<area shape="rect" id="node3" title=" " alt="" coords="853,80,932,107"/>
+<area shape="rect" id="node4" href="$mmhal__app_8h_source.html" title=" " alt="" coords="719,80,829,107"/>
+<area shape="rect" id="node9" href="$mmosal_8h_source.html" title=" " alt="" coords="484,80,571,107"/>
+<area shape="rect" id="node13" href="$mmwlan_8h_source.html" title=" " alt="" coords="257,80,347,107"/>
+<area shape="rect" id="node16" href="$mmconfig_8h_source.html" title=" " alt="" coords="595,80,694,107"/>
+<area shape="rect" id="node17" href="$mmutils_8h_source.html" title=" " alt="" coords="371,80,459,107"/>
+<area shape="rect" id="node18" title=" " alt="" coords="957,80,1111,107"/>
+<area shape="rect" id="node5" title=" " alt="" coords="603,155,686,181"/>
+<area shape="rect" id="node6" title=" " alt="" coords="806,155,881,181"/>
+<area shape="rect" id="node7" title=" " alt="" coords="711,155,781,181"/>
+<area shape="rect" id="node8" title=" " alt="" coords="905,155,969,181"/>
+<area shape="rect" id="node10" title=" " alt="" coords="401,155,467,181"/>
+<area shape="rect" id="node11" title=" " alt="" coords="305,155,376,181"/>
+<area shape="rect" id="node12" title=" " alt="" coords="492,155,579,181"/>
+<area shape="rect" id="node14" title=" " alt="" coords="206,155,281,181"/>
+<area shape="rect" id="node15" title=" " alt="" coords="5,155,87,181"/>
+</map>

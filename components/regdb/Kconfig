@@ -1,0 +1,23 @@
+menu "Regulatory Database"
+
+choice WIFI_MORSE_AU_CHANNELISATION
+	prompt "Australian channelisation configuration"
+	default WIFI_MORSE_AU_CHANNELISATION_REVMF
+	help
+		Australia's channelisation rules for 802.11ah changed in the 2024
+		version of the 802.11 standard. Additionally, there is a proposal for
+		2028 which includes better positioned 8 MHz channels.
+
+	config WIFI_MORSE_AU_CHANNELISATION_2020
+		bool "s1g_channel_list_au_80211_2020"
+
+	config WIFI_MORSE_AU_CHANNELISATION_2024
+		bool "s1g_channel_list_au_80211_2024"
+
+	config WIFI_MORSE_AU_CHANNELISATION_REVMF
+		bool "s1g_channel_list_au_80211_revmf"
+
+endchoice
+
+endmenu
+

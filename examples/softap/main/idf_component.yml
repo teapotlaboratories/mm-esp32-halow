@@ -1,0 +1,5 @@
+dependencies:
+  morsemicro/firmware:
+    version: ^2.10.4-esp32-2
+  morsemicro/halow:
+    version: ^2.10.4-esp32-2

@@ -1,0 +1,19 @@
+# Copyright 2026 Morse Micro
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config WIFI_SSID
+	string "Wi-Fi SSID"
+	default "MorseMicroESP32AP"
+
+config WIFI_PSK
+	string "Wi-Fi Password"
+	default "12345678"
+
+config S1G_CHANNEL
+    int "S1G Channel"
+    default 27
+
+config S1G_OPCLASS
+    int "S1G Op-Class"
+    default 68
