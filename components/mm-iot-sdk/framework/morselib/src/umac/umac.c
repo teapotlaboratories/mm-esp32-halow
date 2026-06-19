@@ -1335,6 +1335,10 @@ struct umac_ibss_ctx
     uint8_t ssid[MMWLAN_SSID_MAXLEN];
     uint8_t ssid_len;
     struct ie_s1g_operation s1g_op;
+    /* Single shared peer record for the cell. IBSS has no association, so all
+     * TX/RX maps to this one stad; the real DA/SA travel in the 802.11 header
+     * (construct_80211_data_header). Good enough for the 2-node Phase-1 gate. */
+    struct umac_sta_data *stad;
 };
 static struct umac_ibss_ctx g_ibss;
 
@@ -1508,21 +1512,21 @@ static void umac_ibss_process_rx_mgmt_frame(struct umac_data *umacd,
     MMLOG_DBG("IBSS: answered PROBE_REQ\n");
 }
 
-/* No association in IBSS — peer lookups return NULL (frames are allowed
- * pre-association). Data-plane ops are minimal stubs for now (the 0x88B5 data
- * path is the next increment); only the mgmt/probe path is exercised here. */
-static struct umac_sta_data *umac_ibss_lookup_null(struct umac_data *umacd, const uint8_t *addr)
+/* IBSS has no association: all peers map to a single shared stad
+ * (g_ibss.stad); the real DA/SA travel in the 802.11 header. The TX path
+ * requires a non-NULL stad, so the lookups return the shared record. */
+static struct umac_sta_data *umac_ibss_lookup_peer(struct umac_data *umacd, const uint8_t *addr)
 {
     MM_UNUSED(umacd);
     MM_UNUSED(addr);
-    return NULL;
+    return g_ibss.stad;
 }
 
-static struct umac_sta_data *umac_ibss_lookup_null_aid(struct umac_data *umacd, uint16_t aid)
+static struct umac_sta_data *umac_ibss_lookup_aid(struct umac_data *umacd, uint16_t aid)
 {
     MM_UNUSED(umacd);
     MM_UNUSED(aid);
-    return NULL;
+    return g_ibss.stad;
 }
 
 static bool umac_ibss_set_sleep_state(struct umac_sta_data *stad, bool asleep)
@@ -1534,18 +1538,18 @@ static bool umac_ibss_set_sleep_state(struct umac_sta_data *stad, bool asleep)
 
 static bool umac_ibss_is_tx_paused(struct umac_sta_data *stad)
 {
-    MM_UNUSED(stad);
-    return false;
+    return (stad != NULL) ? umac_sta_data_is_paused(stad) : true;
 }
 
+/* Per-stad TX queue, mirroring the STA datapath (single shared stad). */
 static void umac_ibss_enqueue_tx_frame(struct umac_data *umacd,
                                        struct umac_sta_data *stad,
                                        struct mmpkt *txbuf)
 {
     MM_UNUSED(umacd);
-    MM_UNUSED(stad);
-    /* Data TX not wired yet — drop to avoid leaking the buffer. */
-    mmpkt_release(txbuf);
+    MMOSAL_TASK_ENTER_CRITICAL();
+    umac_sta_data_queue_pkt(stad, txbuf);
+    MMOSAL_TASK_EXIT_CRITICAL();
 }
 
 static bool umac_ibss_dequeue_tx_frame(struct umac_data *umacd,
@@ -1553,9 +1557,22 @@ static bool umac_ibss_dequeue_tx_frame(struct umac_data *umacd,
                                        struct mmpkt **txbuf)
 {
     MM_UNUSED(umacd);
-    MM_UNUSED(stad);
-    MM_UNUSED(txbuf);
-    return false;
+    *stad = NULL;
+    *txbuf = NULL;
+    struct umac_sta_data *s = g_ibss.stad;
+    if (s == NULL || umac_sta_data_is_paused(s))
+    {
+        return false;
+    }
+    MMOSAL_TASK_ENTER_CRITICAL();
+    *txbuf = umac_sta_data_pop_pkt(s);
+    bool has_more = umac_sta_data_get_queued_len(s);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    if (*txbuf != NULL)
+    {
+        *stad = s;
+    }
+    return has_more;
 }
 
 static void umac_ibss_construct_80211_data_header(struct umac_sta_data *stad,
@@ -1588,9 +1605,9 @@ static const uint16_t umac_ibss_frames_allowed_pre_association[] = {
 
 static const struct umac_datapath_ops datapath_ops_ibss = {
     .process_rx_mgmt_frame = umac_ibss_process_rx_mgmt_frame,
-    .lookup_stad_by_peer_addr = umac_ibss_lookup_null,
-    .lookup_stad_by_tx_dest_addr = umac_ibss_lookup_null,
-    .lookup_stad_by_aid = umac_ibss_lookup_null_aid,
+    .lookup_stad_by_peer_addr = umac_ibss_lookup_peer,
+    .lookup_stad_by_tx_dest_addr = umac_ibss_lookup_peer,
+    .lookup_stad_by_aid = umac_ibss_lookup_aid,
     .set_stad_sleep_state = umac_ibss_set_sleep_state,
     .is_stad_tx_paused = umac_ibss_is_tx_paused,
     .enqueue_tx_frame = umac_ibss_enqueue_tx_frame,
@@ -1692,6 +1709,22 @@ static enum mmwlan_status umac_ibss_do_start(struct umac_data *umacd,
     {
         g_ibss.s1g_op = *cur;
     }
+
+    /* Shared peer record for the cell (datapath_ops_ibss). Allocate after the
+     * memset so it isn't zeroed; the real DA/SA travel in the 802.11 header. */
+    g_ibss.stad = umac_sta_data_alloc_static(umacd);
+    if (g_ibss.stad == NULL)
+    {
+        MMLOG_ERR("IBSS: failed to allocate shared peer record\n");
+        status = MMWLAN_NO_MEM;
+        goto error;
+    }
+    umac_sta_data_set_bssid(g_ibss.stad, g_ibss.bssid);
+    umac_sta_data_set_peer_addr(g_ibss.stad, mac_addr_broadcast);
+    /* Open IBSS (no keys): mark the peer OPEN so the TX datapath sends plaintext
+     * (umac_datapath.c only encrypts when security_type != MMWLAN_OPEN). */
+    umac_sta_data_set_security(g_ibss.stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
+
     g_ibss.active = true;
 
     if (args->start_beaconing)

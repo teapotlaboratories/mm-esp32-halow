@@ -601,6 +601,14 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     {
         vif = MMWLAN_VIF_AP;
     }
+    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_ADHOC) !=
+             UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        /* IBSS / ad-hoc: AP-type vif, but RX data was being dropped here because
+         * only STA/AP were recognised. Map to MMWLAN_VIF_AP (no dedicated IBSS
+         * vif enum) so received data frames are delivered up. */
+        vif = MMWLAN_VIF_AP;
+    }
     else
     {
         MMLOG_WRN("Invalid RX VIF\n");
