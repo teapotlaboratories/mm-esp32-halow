@@ -267,6 +267,8 @@ enum mmdrv_interface_type
     MMDRV_INTERFACE_TYPE_STA = 1,
     /** An access point interface */
     MMDRV_INTERFACE_TYPE_AP = 2,
+    /** An IBSS / ad-hoc interface (value matches MORSE_CMD_INTERFACE_TYPE_ADHOC). */
+    MMDRV_INTERFACE_TYPE_ADHOC = 4,
 };
 
 /**
@@ -367,6 +369,28 @@ int mmdrv_set_channel(uint32_t op_chan_freq_hz,
  * @returns 0 on success or an appropriate error code.
  */
 int mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period, uint32_t cssid);
+
+/**
+ * Set the BSSID of the given interface (MORSE_CMD_ID_BSSID_SET).
+ * Used by the IBSS / ad-hoc path. Recreated from the MorseMicro Linux driver.
+ *
+ * @param vif_id  VIF ID of the interface.
+ * @param bssid   6-byte BSSID to set.
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid);
+
+/**
+ * Configure IBSS / ad-hoc operation on the given interface
+ * (MORSE_CMD_ID_IBSS_CONFIG). This is the command that puts the chip into
+ * ad-hoc operation. Recreated from the MorseMicro Linux driver.
+ *
+ * @param vif_id  VIF ID of the (ADHOC-type) interface.
+ * @param bssid   6-byte IBSS BSSID (shared by all peers in the cell).
+ * @param opcode  @ref morse_cmd_ibss_opcode (CREATE / JOIN / STOP).
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_cfg_ibss(uint16_t vif_id, const uint8_t *bssid, uint8_t opcode);
 
 /**
  * Update the STA state. This is used for both STA and AP interface types.

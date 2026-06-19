@@ -44,12 +44,17 @@ enum morse_cmd_id
     MORSE_CMD_ID_STANDBY_MODE = 0x0031,
     MORSE_CMD_ID_DHCP_OFFLOAD = 0x0032,
     MORSE_CMD_ID_UPDATE_OUI_FILTER = 0x0034,
+    /* IBSS / ad-hoc config — undeclared upstream; recreated from the MorseMicro
+     * Linux driver (morse_driver) for the RISK-01 IBSS bring-up. */
+    MORSE_CMD_ID_IBSS_CONFIG = 0x0035,
     MORSE_CMD_ID_TWT_AGREEMENT_VALIDATE = 0x0036,
     MORSE_CMD_ID_HW_SCAN = 0x0044,
     MORSE_CMD_ID_SET_WHITELIST = 0x0045,
     MORSE_CMD_ID_ARP_PERIODIC_REFRESH = 0x0046,
     MORSE_CMD_ID_SET_TCP_KEEPALIVE = 0x0047,
     MORSE_CMD_ID_LI_SLEEP = 0x0049,
+    /* Set interface BSSID — undeclared upstream; recreated from morse_driver. */
+    MORSE_CMD_ID_BSSID_SET = 0x0052,
     MORSE_CMD_ID_SEQUENCE_NUMBER_SPACES = 0x004B,
     MORSE_CMD_ID_SET_CQM_RSSI = 0x004F,
 
@@ -338,6 +343,44 @@ struct MM_PACKED morse_cmd_req_bss_config
 
 
 struct MM_PACKED morse_cmd_resp_bss_config
+{
+    struct morse_cmd_header hdr;
+    uint32_t status;
+};
+
+
+/* IBSS / ad-hoc commands — undeclared in the upstream ESP32 SDK header, but the
+ * v1.17.6 chip firmware supports them. Layouts recreated from the MorseMicro
+ * Linux driver (morse_driver: morse_cmd_cfg_ibss / morse_cmd_set_bssid). See
+ * docs/worklog/2026-06-18-risk01-ibss-recon.md. */
+enum morse_cmd_ibss_opcode
+{
+    MORSE_CMD_IBSS_OPCODE_CREATE = 0,
+    MORSE_CMD_IBSS_OPCODE_JOIN = 1,
+    MORSE_CMD_IBSS_OPCODE_STOP = 2,
+};
+
+struct MM_PACKED morse_cmd_req_ibss_config
+{
+    struct morse_cmd_header hdr;
+    uint8_t ibss_bssid[MORSE_CMD_MAC_ADDR_LEN];
+    uint8_t ibss_cfg_opcode;       /* enum morse_cmd_ibss_opcode */
+    uint8_t ibss_probe_filtering;  /* firmware-side probe-req filtering for IBSS */
+};
+
+struct MM_PACKED morse_cmd_resp_ibss_config
+{
+    struct morse_cmd_header hdr;
+    uint32_t status;
+};
+
+struct MM_PACKED morse_cmd_req_bssid_set
+{
+    struct morse_cmd_header hdr;
+    struct morse_cmd_mac_addr bssid;
+};
+
+struct MM_PACKED morse_cmd_resp_bssid_set
 {
     struct morse_cmd_header hdr;
     uint32_t status;

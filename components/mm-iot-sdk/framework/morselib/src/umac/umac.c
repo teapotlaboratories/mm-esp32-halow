@@ -28,6 +28,21 @@
 #include "umac/ate/umac_ate.h"
 #include "umac/wnm_sleep/umac_wnm_sleep.h"
 
+/* IBSS / ad-hoc (RISK-01) — host-generated beacon + datapath. */
+#include "umac/umac_ibss.h"
+#include "umac/frames/frames_common.h"
+#include "umac/ies/ssid.h"
+#include "umac/ies/s1g_capabilities.h"
+#include "umac/ies/s1g_operation.h"
+#include "umac/rc/umac_rc.h"
+#include "umac/data/umac_data.h"
+#include "umac/datapath/umac_datapath_data.h"
+#include "umac/datapath/umac_datapath_private.h"
+#include "dot11/dot11.h"
+#include "dot11/dot11_ies.h"
+#include "dot11/dot11_utils.h"
+#include "common/consbuf.h"
+
 
 #if MM_VERSION < MM_VERSION_NUMBER(0, 0, 0)
 
@@ -1290,6 +1305,444 @@ enum mmwlan_status mmwlan_ap_enable(const struct mmwlan_ap_args *args)
     }
 
     UMAC_QUEUE_EVT_AND_WAIT(umac_ap_start_evt_handler, ap_start, &status, .args = args);
+
+    umac_stop_core_if_no_interface(umacd);
+
+    return status;
+}
+
+/*
+ * IBSS / ad-hoc bring-up (RISK-01). EXPERIMENTAL: drives undocumented chip-
+ * firmware commands ported from the MorseMicro Linux driver (morse_driver).
+ * Mirrors the AP enable path above but skips the supplicant and issues the
+ * IBSS_CONFIG command. Compiled only when AP-type code is present.
+ * See docs/worklog/2026-06-18-risk01-ibss-recon.md.
+ */
+extern uint32_t ieee80211_crc32(const uint8_t *frame, size_t frame_len);
+
+/* --- IBSS host-generated beacon ---------------------------------------------
+ * The MM6108 firmware does NOT auto-beacon in IBSS mode; the host must generate
+ * and TX each beacon (as on the Linux driver). We keep a single IBSS context and
+ * build a long S1G beacon (IBSS capability bit, no TIM) modelled on
+ * frame_probe_response_build. */
+struct umac_ibss_ctx
+{
+    bool active;
+    uint16_t vif_id;
+    uint16_t beacon_interval_tus;
+    uint8_t bssid[MMWLAN_MAC_ADDR_LEN];
+    uint8_t my_mac[MMWLAN_MAC_ADDR_LEN];
+    uint8_t ssid[MMWLAN_SSID_MAXLEN];
+    uint8_t ssid_len;
+    struct ie_s1g_operation s1g_op;
+};
+static struct umac_ibss_ctx g_ibss;
+
+bool umac_ibss_is_active(void)
+{
+    return g_ibss.active;
+}
+
+static void umac_ibss_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *params)
+{
+    MM_UNUSED(params);
+
+    struct dot11_hdr *hdr = (struct dot11_hdr *)consbuf_reserve(buf, sizeof(*hdr));
+    if (hdr)
+    {
+        /* IBSS beacon: broadcast DA, our own MAC as SA, shared IBSS BSSID. */
+        dot11_build_pv0_mgmt_header(hdr,
+                                    DOT11_FC_SUBTYPE_BEACON,
+                                    0,
+                                    mac_addr_broadcast,
+                                    g_ibss.my_mac,
+                                    g_ibss.bssid);
+    }
+
+    const uint8_t zero_timestamp[8] = { 0 };
+    consbuf_append(buf, zero_timestamp, sizeof(zero_timestamp));
+
+    uint16_t beacon_interval = htole16(g_ibss.beacon_interval_tus);
+    consbuf_append(buf, (const uint8_t *)&beacon_interval, sizeof(beacon_interval));
+
+    uint16_t capability_info = 0;
+    DOT11_CAPABILITY_INFORMATION_SET_IBSS(capability_info, 1);
+    consbuf_append(buf, (const uint8_t *)&capability_info, sizeof(capability_info));
+
+    ie_ssid_build(buf, g_ibss.ssid, g_ibss.ssid_len);
+
+    /* IBSS Parameter Set (EID 6, len 2, ATIM window = 0). Linux mac80211 ALWAYS
+     * emits this in IBSS beacons/probe-resps (net/mac80211/ibss.c:133) and it is
+     * carried through into the S1G beacon. ATIM=0 => no power-save window (all
+     * peers always awake), which is all we need for data exchange. */
+    {
+        const uint8_t ibss_param[4] = { 6 /* WLAN_EID_IBSS_PARAMS */, 2, 0x00, 0x00 };
+        consbuf_append(buf, ibss_param, sizeof(ibss_param));
+    }
+
+    ie_s1g_capabilities_build(umacd, buf);
+
+    /* S1G Operation IE — no morselib builder exists, so pack it by hand from the
+     * channel morselib selected in SET_CHANNEL. */
+    struct dot11_ie_s1g_operation op = { 0 };
+    op.header.element_id = DOT11_IE_S1G_OPERATION;
+    op.header.length = sizeof(op) - sizeof(op.header);
+    uint8_t cw = 0;
+    DOT11_S1G_OP_CHAN_WIDTH_SET_PRI_CHAN_WIDTH(cw,
+        (g_ibss.s1g_op.primary_channel_width_mhz > 1) ? 1 : 0);
+    DOT11_S1G_OP_CHAN_WIDTH_SET_OP_CHAN_WIDTH(cw,
+        (g_ibss.s1g_op.operation_channel_width_mhz > 0)
+            ? (uint8_t)(g_ibss.s1g_op.operation_channel_width_mhz - 1) : 0);
+    DOT11_S1G_OP_CHAN_WIDTH_SET_PRI_CHAN_LOC(cw, g_ibss.s1g_op.primary_1mhz_channel_loc);
+    op.channel_width = cw;
+    op.operating_class = g_ibss.s1g_op.operating_class;
+    op.primary_channel_number = g_ibss.s1g_op.primary_channel_number;
+    op.channel_center_freq = g_ibss.s1g_op.operating_channel_index;
+    /* basic_s1g_mcs_nss_set left 0 (no required basic MCS). */
+    consbuf_append(buf, (const uint8_t *)&op, sizeof(op));
+}
+
+struct mmpkt *umac_ibss_get_beacon(struct umac_data *umacd)
+{
+    struct mmpkt *beacon = build_mgmt_frame(umacd, umac_ibss_build_beacon, NULL);
+    if (beacon == NULL)
+    {
+        MMLOG_WRN("Failed to generate IBSS beacon\n");
+        return NULL;
+    }
+
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(beacon);
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->vif_id = g_ibss.vif_id;
+    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+    return beacon;
+}
+
+/* --- IBSS datapath ----------------------------------------------------------
+ * Mirrors the Linux IBSS behaviour: answer probe requests with a probe response
+ * (net/mac80211/ibss.c ieee80211_ibss_rx_probe_req → presp template) so the node
+ * is discoverable by an active scanner; transmit/receive data frames with IBSS
+ * addressing (ToDS=FromDS=0, A1=DA, A2=SA, A3=BSSID). No association/STA state in
+ * IBSS, so the stad lookups return NULL and PROBE_REQ is allowed pre-association. */
+
+struct umac_ibss_probe_resp_params
+{
+    const uint8_t *da;
+};
+
+/* Append the common IBSS body IEs (after the SSID): IBSS Parameter Set, S1G
+ * Capabilities, S1G Operation. Shared shape with the beacon. */
+static void umac_ibss_append_s1g_ies(struct umac_data *umacd, struct consbuf *buf)
+{
+    const uint8_t ibss_param[4] = { 6 /* WLAN_EID_IBSS_PARAMS */, 2, 0x00, 0x00 };
+    consbuf_append(buf, ibss_param, sizeof(ibss_param));
+
+    ie_s1g_capabilities_build(umacd, buf);
+
+    struct dot11_ie_s1g_operation op = { 0 };
+    op.header.element_id = DOT11_IE_S1G_OPERATION;
+    op.header.length = sizeof(op) - sizeof(op.header);
+    uint8_t cw = 0;
+    DOT11_S1G_OP_CHAN_WIDTH_SET_PRI_CHAN_WIDTH(cw,
+        (g_ibss.s1g_op.primary_channel_width_mhz > 1) ? 1 : 0);
+    DOT11_S1G_OP_CHAN_WIDTH_SET_OP_CHAN_WIDTH(cw,
+        (g_ibss.s1g_op.operation_channel_width_mhz > 0)
+            ? (uint8_t)(g_ibss.s1g_op.operation_channel_width_mhz - 1) : 0);
+    DOT11_S1G_OP_CHAN_WIDTH_SET_PRI_CHAN_LOC(cw, g_ibss.s1g_op.primary_1mhz_channel_loc);
+    op.channel_width = cw;
+    op.operating_class = g_ibss.s1g_op.operating_class;
+    op.primary_channel_number = g_ibss.s1g_op.primary_channel_number;
+    op.channel_center_freq = g_ibss.s1g_op.operating_channel_index;
+    consbuf_append(buf, (const uint8_t *)&op, sizeof(op));
+}
+
+static void umac_ibss_build_probe_resp(struct umac_data *umacd, struct consbuf *buf, void *params)
+{
+    const struct umac_ibss_probe_resp_params *p =
+        (const struct umac_ibss_probe_resp_params *)params;
+
+    struct dot11_hdr *hdr = (struct dot11_hdr *)consbuf_reserve(buf, sizeof(*hdr));
+    if (hdr)
+    {
+        dot11_build_pv0_mgmt_header(hdr, DOT11_FC_SUBTYPE_PROBE_RSP, 0,
+                                    p->da, g_ibss.my_mac, g_ibss.bssid);
+    }
+    const uint8_t zero_timestamp[8] = { 0 };
+    consbuf_append(buf, zero_timestamp, sizeof(zero_timestamp));
+    uint16_t beacon_interval = htole16(g_ibss.beacon_interval_tus);
+    consbuf_append(buf, (const uint8_t *)&beacon_interval, sizeof(beacon_interval));
+    uint16_t capability_info = 0;
+    DOT11_CAPABILITY_INFORMATION_SET_IBSS(capability_info, 1);
+    consbuf_append(buf, (const uint8_t *)&capability_info, sizeof(capability_info));
+    ie_ssid_build(buf, g_ibss.ssid, g_ibss.ssid_len);
+    umac_ibss_append_s1g_ies(umacd, buf);
+}
+
+static void umac_ibss_process_rx_mgmt_frame(struct umac_data *umacd,
+                                            struct umac_sta_data *stad,
+                                            struct mmpktview *rxbufview)
+{
+    MM_UNUSED(stad);
+    const struct dot11_hdr *header = (const struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    uint16_t subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+    if (subtype != DOT11_FC_SUBTYPE_PROBE_REQ)
+    {
+        return; /* beacons handled elsewhere (merge); ignore the rest for now */
+    }
+
+    /* Reply with a probe response (Linux: ieee80211_ibss_rx_probe_req). */
+    struct umac_ibss_probe_resp_params params = { .da = dot11_get_sa(header) };
+    struct mmpkt *resp = build_mgmt_frame(umacd, umac_ibss_build_probe_resp, &params);
+    if (resp == NULL)
+    {
+        return;
+    }
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(resp);
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->vif_id = g_ibss.vif_id;
+    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+    (void)mmdrv_tx_frame(resp, true);
+    MMLOG_DBG("IBSS: answered PROBE_REQ\n");
+}
+
+/* No association in IBSS — peer lookups return NULL (frames are allowed
+ * pre-association). Data-plane ops are minimal stubs for now (the 0x88B5 data
+ * path is the next increment); only the mgmt/probe path is exercised here. */
+static struct umac_sta_data *umac_ibss_lookup_null(struct umac_data *umacd, const uint8_t *addr)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(addr);
+    return NULL;
+}
+
+static struct umac_sta_data *umac_ibss_lookup_null_aid(struct umac_data *umacd, uint16_t aid)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(aid);
+    return NULL;
+}
+
+static bool umac_ibss_set_sleep_state(struct umac_sta_data *stad, bool asleep)
+{
+    MM_UNUSED(stad);
+    MM_UNUSED(asleep);
+    return false;
+}
+
+static bool umac_ibss_is_tx_paused(struct umac_sta_data *stad)
+{
+    MM_UNUSED(stad);
+    return false;
+}
+
+static void umac_ibss_enqueue_tx_frame(struct umac_data *umacd,
+                                       struct umac_sta_data *stad,
+                                       struct mmpkt *txbuf)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(stad);
+    /* Data TX not wired yet — drop to avoid leaking the buffer. */
+    mmpkt_release(txbuf);
+}
+
+static bool umac_ibss_dequeue_tx_frame(struct umac_data *umacd,
+                                       struct umac_sta_data **stad,
+                                       struct mmpkt **txbuf)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(stad);
+    MM_UNUSED(txbuf);
+    return false;
+}
+
+static void umac_ibss_construct_80211_data_header(struct umac_sta_data *stad,
+                                                  const struct umac_8023_hdr *hdr_8023,
+                                                  struct dot11_data_hdr *data_hdr)
+{
+    MM_UNUSED(stad);
+    /* IBSS data addressing: ToDS=FromDS=0, A1=DA, A2=SA, A3=BSSID. */
+    uint16_t frame_control = (DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE) |
+                             (DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE);
+    mac_addr_copy(data_hdr->base.addr1, hdr_8023->dest_addr);
+    mac_addr_copy(data_hdr->base.addr2, hdr_8023->src_addr);
+    mac_addr_copy(data_hdr->base.addr3, g_ibss.bssid);
+    data_hdr->base.frame_control = htole16(frame_control);
+}
+
+static enum mmwlan_sta_state umac_ibss_get_sta_state(struct umac_sta_data *stad)
+{
+    MM_UNUSED(stad);
+    return MMWLAN_STA_CONNECTED;
+}
+
+static const uint16_t umac_ibss_frames_allowed_pre_association[] = {
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_REQ),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, BEACON),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, AUTH),
+    UINT16_MAX,
+};
+
+static const struct umac_datapath_ops datapath_ops_ibss = {
+    .process_rx_mgmt_frame = umac_ibss_process_rx_mgmt_frame,
+    .lookup_stad_by_peer_addr = umac_ibss_lookup_null,
+    .lookup_stad_by_tx_dest_addr = umac_ibss_lookup_null,
+    .lookup_stad_by_aid = umac_ibss_lookup_null_aid,
+    .set_stad_sleep_state = umac_ibss_set_sleep_state,
+    .is_stad_tx_paused = umac_ibss_is_tx_paused,
+    .enqueue_tx_frame = umac_ibss_enqueue_tx_frame,
+    .dequeue_tx_frame = umac_ibss_dequeue_tx_frame,
+    .construct_80211_data_header = umac_ibss_construct_80211_data_header,
+    .get_sta_state = umac_ibss_get_sta_state,
+    .frames_allowed_pre_association = umac_ibss_frames_allowed_pre_association,
+};
+
+static enum mmwlan_status umac_ibss_do_start(struct umac_data *umacd,
+                                             const struct mmwlan_ibss_args *args)
+{
+    const struct mmwlan_s1g_channel *chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
+    if (chan == NULL || !umac_regdb_op_class_match(umacd, args->op_class, chan))
+    {
+        MMLOG_ERR("IBSS: no matching channel (op_class=%u chan#=%u)\n",
+                  args->op_class,
+                  args->s1g_chan_num);
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    uint16_t vif_id = 0;
+    enum mmwlan_status status =
+        umac_interface_add(umacd, UMAC_INTERFACE_ADHOC, args->bssid, &vif_id);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("IBSS: ADD_INTERFACE(ADHOC) failed: %d\n", status);
+        return status;
+    }
+    MMLOG_INF("IBSS: ADD_INTERFACE(ADHOC) ok (vif_id=%u)\n", vif_id);
+
+    /* Configure the IBSS datapath: delivers RX mgmt frames (so we can answer
+     * probe requests → discoverable by an active scan) and uses IBSS data
+     * addressing. Must be set before beaconing / any RX. */
+    umac_data_get_datapath(umacd)->ops = &datapath_ops_ibss;
+
+    status = umac_interface_set_channel_from_regdb(umacd, chan, false);
+    if (status != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("IBSS: SET_CHANNEL failed: %d\n", status);
+        goto error;
+    }
+    MMLOG_INF("IBSS: SET_CHANNEL ok (chan#=%u, %u MHz)\n", args->s1g_chan_num, chan->bw_mhz);
+
+    int ret = mmdrv_set_bssid(vif_id, args->bssid);
+    MMLOG_INF("IBSS: BSSID_SET (" MM_MAC_ADDR_FMT ") ret=%d\n",
+              MM_MAC_ADDR_VAL(args->bssid),
+              ret);
+    if (ret != 0)
+    {
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+
+    uint16_t beacon_int = args->beacon_interval_tus ? args->beacon_interval_tus
+                                                    : MMWLAN_DEFAULT_AP_BEACON_INTERVAL_TUS;
+    uint32_t cssid = ieee80211_crc32(args->ssid, args->ssid_len);
+    ret = mmdrv_cfg_bss(vif_id, beacon_int, 0 /* IBSS has no DTIM */, cssid);
+    MMLOG_INF("IBSS: BSS_CONFIG (bi=%u cssid=0x%08lx) ret=%d\n",
+              beacon_int,
+              (unsigned long)cssid,
+              ret);
+    if (ret != 0)
+    {
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+
+    uint8_t opcode = args->creator ? MORSE_CMD_IBSS_OPCODE_CREATE : MORSE_CMD_IBSS_OPCODE_JOIN;
+    ret = mmdrv_cfg_ibss(vif_id, args->bssid, opcode);
+    MMLOG_INF("IBSS: IBSS_CONFIG(%s) ret=%d\n", args->creator ? "CREATE" : "JOIN", ret);
+    /* On this chip firmware, ADD_INTERFACE(ADHOC) + BSS_CONFIG already establish
+     * the BSS, so IBSS_CONFIG(CREATE) returns EEXIST(-17). Treat that as
+     * already-created and keep the interface up (do NOT tear down). */
+    if (ret == -17 /* EEXIST */)
+    {
+        MMLOG_INF("IBSS: IBSS_CONFIG reports already-exists (rc -17) — treating as created\n");
+    }
+    else if (ret != 0)
+    {
+        MMLOG_ERR("IBSS: IBSS_CONFIG rejected by firmware (ret=%d)\n", ret);
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+
+    /* Populate the IBSS beacon context (host generates beacons; firmware does
+     * not auto-beacon in ad-hoc mode). Must be set before start_beaconing so the
+     * beacon worker has a valid context when it first fires. */
+    memset(&g_ibss, 0, sizeof(g_ibss));
+    g_ibss.vif_id = vif_id;
+    g_ibss.beacon_interval_tus = beacon_int;
+    memcpy(g_ibss.bssid, args->bssid, sizeof(g_ibss.bssid));
+    (void)umac_interface_get_device_mac_addr(umacd, g_ibss.my_mac);
+    g_ibss.ssid_len =
+        (args->ssid_len > MMWLAN_SSID_MAXLEN) ? MMWLAN_SSID_MAXLEN : (uint8_t)args->ssid_len;
+    memcpy(g_ibss.ssid, args->ssid, g_ibss.ssid_len);
+    const struct ie_s1g_operation *cur = umac_interface_get_current_s1g_operation_info(umacd);
+    if (cur != NULL)
+    {
+        g_ibss.s1g_op = *cur;
+    }
+    g_ibss.active = true;
+
+    if (args->start_beaconing)
+    {
+        ret = mmdrv_start_beaconing(vif_id);
+        MMLOG_INF("IBSS: START_BEACONING ret=%d\n", ret);
+    }
+
+    MMLOG_INF("IBSS: enable sequence complete\n");
+    return MMWLAN_SUCCESS;
+
+error:
+    umac_interface_remove(umacd, UMAC_INTERFACE_ADHOC);
+    return status;
+}
+
+static void umac_ibss_start_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    enum mmwlan_status status = umac_ibss_do_start(umacd, evt->args.ibss_start.args);
+    if (evt->args.ibss_start.status)
+    {
+        *evt->args.ibss_start.status = status;
+    }
+    if (evt->args.ibss_start.semb)
+    {
+        mmosal_semb_give(evt->args.ibss_start.semb);
+    }
+}
+
+enum mmwlan_status mmwlan_ibss_enable(const struct mmwlan_ibss_args *args)
+{
+    enum mmwlan_status status = MMWLAN_ERROR;
+    struct umac_data *umacd = umac_data_get_umacd();
+    struct umac_root_data *data = umac_data_get_root(umacd);
+    if (data == NULL)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+    if (args == NULL || mm_mac_addr_is_zero(args->bssid))
+    {
+        MMLOG_ERR("IBSS: a non-zero shared BSSID is required\n");
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    status = umac_core_start(umacd);
+    if (status != MMWLAN_SUCCESS)
+    {
+        return status;
+    }
+
+    UMAC_QUEUE_EVT_AND_WAIT(umac_ibss_start_evt_handler, ibss_start, &status, .args = args);
 
     umac_stop_core_if_no_interface(umacd);
 

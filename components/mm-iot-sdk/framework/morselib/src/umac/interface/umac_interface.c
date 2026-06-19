@@ -43,6 +43,9 @@ static inline const char *umac_interface_type_to_str(enum umac_interface_type ty
         case UMAC_INTERFACE_AP:
             return "AP";
 
+        case UMAC_INTERFACE_ADHOC:
+            return "IBSS";
+
         default:
             return "??";
     }
@@ -141,13 +144,15 @@ bool umac_interface_type_is_compatible_with_active(struct umac_interface_data *d
                                                    enum umac_interface_type type)
 {
 
-    if ((data->active_interface_types & VIF_STA_INTERFACE_TYPES_MASK) && (type & UMAC_INTERFACE_AP))
+    if ((data->active_interface_types & VIF_STA_INTERFACE_TYPES_MASK) &&
+        (type & (UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC)))
     {
         return false;
     }
 
 
-    if ((data->active_interface_types & UMAC_INTERFACE_AP) && (type & VIF_STA_INTERFACE_TYPES_MASK))
+    if ((data->active_interface_types & (UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC)) &&
+        (type & VIF_STA_INTERFACE_TYPES_MASK))
     {
         return false;
     }
@@ -214,7 +219,9 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
         }
 
         enum mmdrv_interface_type drv_if_type =
-            (type == UMAC_INTERFACE_AP) ? MMDRV_INTERFACE_TYPE_AP : MMDRV_INTERFACE_TYPE_STA;
+            (type == UMAC_INTERFACE_AP)      ? MMDRV_INTERFACE_TYPE_AP :
+            (type == UMAC_INTERFACE_ADHOC)   ? MMDRV_INTERFACE_TYPE_ADHOC :
+                                               MMDRV_INTERFACE_TYPE_STA;
         ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
         MMOSAL_ASSERT(ret == 0);
 
