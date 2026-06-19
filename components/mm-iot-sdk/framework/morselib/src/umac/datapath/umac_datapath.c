@@ -342,6 +342,15 @@ static void umac_datapath_process_rx_mgmt_frame_sta(struct umac_data *umacd,
             umac_scan_process_probe_resp(umacd, rxbufview);
             break;
 
+        /* RISK-01: also surface BEACONS to the scanner so IBSS/ad-hoc cells
+         * (which beacon but don't answer probe requests) are discoverable. A
+         * beacon body is layout-compatible with a probe response; the parser is
+         * subtype-agnostic, and umac_scan_process_probe_resp ignores beacons when
+         * no scan is active. */
+        case DOT11_FC_SUBTYPE_BEACON:
+            umac_scan_process_probe_resp(umacd, rxbufview);
+            break;
+
         case DOT11_FC_SUBTYPE_DISASSOC:
             umac_connection_process_disassoc_req(umacd, rxbufview);
             break;

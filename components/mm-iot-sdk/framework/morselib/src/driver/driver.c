@@ -537,6 +537,10 @@ int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_typ
             if_type = MORSE_CMD_INTERFACE_TYPE_AP;
             break;
 
+        case MMDRV_INTERFACE_TYPE_ADHOC:
+            if_type = MORSE_CMD_INTERFACE_TYPE_ADHOC;
+            break;
+
         default:
             return -EINVAL;
     }
@@ -805,6 +809,38 @@ int mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period, ui
                            .beacon_interval_tu = htole16(beacon_int),
                            .cssid = htole32(cssid),
                            .dtim_period = htole16(dtim_period));
+
+    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
+}
+
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_req_bssid_set cmd =
+        MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_BSSID_SET, vif_id);
+    memcpy(cmd.bssid.octet, bssid, sizeof(cmd.bssid.octet));
+
+    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
+}
+
+int mmdrv_cfg_ibss(uint16_t vif_id, const uint8_t *bssid, uint8_t opcode)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_req_ibss_config cmd =
+        MORSE_COMMAND_INIT(cmd,
+                           MORSE_CMD_ID_IBSS_CONFIG,
+                           vif_id,
+                           .ibss_cfg_opcode = opcode,
+                           .ibss_probe_filtering = 1);
+    memcpy(cmd.ibss_bssid, bssid, sizeof(cmd.ibss_bssid));
 
     return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
 }

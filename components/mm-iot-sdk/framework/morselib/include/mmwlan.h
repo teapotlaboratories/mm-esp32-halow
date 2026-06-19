@@ -2462,6 +2462,55 @@ enum mmwlan_status mmwlan_ap_enable(const struct mmwlan_ap_args *args);
 enum mmwlan_status mmwlan_ap_disable(void);
 
 /**
+ * Arguments data structure for @ref mmwlan_ibss_enable().
+ *
+ * IBSS / ad-hoc support is a Rimba addition (RISK-01), not part of the stock
+ * MorseMicro SDK. The command sequence was ported from the MorseMicro Linux
+ * driver; see docs/worklog/2026-06-18-risk01-ibss-recon.md.
+ *
+ * @warning EXPERIMENTAL: drives undocumented chip-firmware commands; the stock
+ *          SDK does not support ad-hoc and MorseMicro will not support a
+ *          modified morselib.
+ */
+struct mmwlan_ibss_args
+{
+    /** SSID of the IBSS (used only to derive the compressed SSID). */
+    uint8_t ssid[MMWLAN_SSID_MAXLEN];
+    /** Length of the SSID. */
+    uint16_t ssid_len;
+    /** IBSS BSSID. MUST be identical on every node in the cell. */
+    uint8_t bssid[MMWLAN_MAC_ADDR_LEN];
+    /** Operating class (combined with @c s1g_chan_num to select the channel). */
+    uint16_t op_class;
+    /** S1G channel number (must exist in the configured channel list). */
+    uint16_t s1g_chan_num;
+    /** Beacon interval in TUs. 0 => @ref MMWLAN_DEFAULT_AP_BEACON_INTERVAL_TUS. */
+    uint16_t beacon_interval_tus;
+    /** If true, CREATE the IBSS (first node); else JOIN an existing one. */
+    bool creator;
+    /** If true, start host beaconing after configuration. Requires a beacon
+     *  body; leave false for the command-acceptance test. */
+    bool start_beaconing;
+};
+
+/** Initialiser for @ref mmwlan_ibss_args. */
+#define MMWLAN_IBSS_ARGS_INIT { 0 }
+
+/**
+ * Enable IBSS / ad-hoc mode.
+ *
+ * Drives the ported ADD_INTERFACE(ADHOC) -> SET_CHANNEL -> BSSID_SET ->
+ * BSS_CONFIG -> IBSS_CONFIG sequence. Call after @c mmwlan_boot() (e.g. after
+ * mmhalow_init()) from a clean state with no STA/AP interface active.
+ *
+ * @param args  IBSS configuration.
+ * @return @ref MMWLAN_SUCCESS on success, else an appropriate error code.
+ *
+ * @warning EXPERIMENTAL — see @ref mmwlan_ibss_args.
+ */
+enum mmwlan_status mmwlan_ibss_enable(const struct mmwlan_ibss_args *args);
+
+/**
  * Gets the BSSID address of the AP, if it is active.
  *
  * @param bssid  The BSSID of the AP. Length must be @ref MMWLAN_MAC_ADDR_LEN.

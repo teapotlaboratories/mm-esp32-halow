@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "mmlog.h"
 #include "umac/ap/umac_ap.h"
+#include "umac/umac_ibss.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/connection/umac_connection.h"
@@ -207,5 +208,9 @@ void mmdrv_host_stats_increment_datapath_driver_rx_read_failures(void)
 struct mmpkt *mmdrv_host_get_beacon(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
+    if (umac_ibss_is_active())
+    {
+        return umac_ibss_get_beacon(umacd);
+    }
     return umac_ap_get_beacon(umacd);
 }
