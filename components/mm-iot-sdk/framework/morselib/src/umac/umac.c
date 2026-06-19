@@ -1325,6 +1325,9 @@ extern uint32_t ieee80211_crc32(const uint8_t *frame, size_t frame_len);
  * and TX each beacon (as on the Linux driver). We keep a single IBSS context and
  * build a long S1G beacon (IBSS capability bit, no TIM) modelled on
  * frame_probe_response_build. */
+/* Max simultaneously-tracked IBSS peers (per-peer station records). */
+#define UMAC_IBSS_MAX_PEERS 8
+
 struct umac_ibss_ctx
 {
     bool active;
@@ -1335,10 +1338,20 @@ struct umac_ibss_ctx
     uint8_t ssid[MMWLAN_SSID_MAXLEN];
     uint8_t ssid_len;
     struct ie_s1g_operation s1g_op;
-    /* Single shared peer record for the cell. IBSS has no association, so all
-     * TX/RX maps to this one stad; the real DA/SA travel in the 802.11 header
-     * (construct_80211_data_header). Good enough for the 2-node Phase-1 gate. */
-    struct umac_sta_data *stad;
+    /* Per-peer station records, mirroring Linux mac80211 sta_info /
+     * ieee80211_ibss_add_sta: each discovered peer (by MAC) gets its own stad so
+     * RX dedup/sequence tracking is per-peer (correct for >2 nodes), and each peer
+     * carries an AID handle the firmware can bind a CCMP key to (SET_STA_STATE /
+     * INSTALL_KEY). Peers are created on first RX from a new transmitter address.
+     * Indexed so that aid == (slot + 1); slot 0 → aid 1 (aid 0 is reserved). */
+    struct umac_sta_data *peers[UMAC_IBSS_MAX_PEERS];
+    /* Firmware SET_STA_STATE return code per peer (0 = accepted), for diagnostics
+     * via mmwlan_ibss_get_peers() — tells us whether per-peer keying is feasible. */
+    int peer_sta_state_ret[UMAC_IBSS_MAX_PEERS];
+    /* Shared record for group/broadcast frames and the single TX queue. The real
+     * DA/SA still travel in the 802.11 header (construct_80211_data_header);
+     * per-peer unicast TX keying moves onto the peer stads when CCMP lands. */
+    struct umac_sta_data *bcast_stad;
 };
 static struct umac_ibss_ctx g_ibss;
 
@@ -1512,21 +1525,135 @@ static void umac_ibss_process_rx_mgmt_frame(struct umac_data *umacd,
     MMLOG_DBG("IBSS: answered PROBE_REQ\n");
 }
 
-/* IBSS has no association: all peers map to a single shared stad
- * (g_ibss.stad); the real DA/SA travel in the 802.11 header. The TX path
- * requires a non-NULL stad, so the lookups return the shared record. */
+/* Find the per-peer record for a unicast peer MAC, creating one on first contact
+ * (Linux: ieee80211_ibss_add_sta on a frame from a new peer). Group/broadcast
+ * addresses map to the shared bcast record. Never returns NULL while IBSS is up:
+ * if the peer table is full or allocation fails it falls back to bcast_stad so RX
+ * is not dropped — that peer just loses its own dedup/seq space. Called from the
+ * RX path with the transmitter address, so peers appear as their data frames do. */
+static struct umac_sta_data *umac_ibss_get_or_add_peer(struct umac_data *umacd,
+                                                       const uint8_t *mac)
+{
+    if (mac == NULL || mm_mac_addr_is_multicast(mac))
+    {
+        return g_ibss.bcast_stad;
+    }
+    /* The BSSID is not a peer. S1G beacons carry SA = BSSID (SW-4741) and are not
+     * matched by the legacy (MGMT,BEACON) pre-association filter, so they reach
+     * this RX lookup; map them to the shared record rather than minting a bogus
+     * peer for the cell's own BSSID. */
+    if (mm_mac_addr_is_equal(mac, g_ibss.bssid))
+    {
+        return g_ibss.bcast_stad;
+    }
+
+    int free_slot = -1;
+    for (int i = 0; i < UMAC_IBSS_MAX_PEERS; i++)
+    {
+        if (g_ibss.peers[i] != NULL)
+        {
+            if (umac_sta_data_matches_peer_addr(g_ibss.peers[i], mac))
+            {
+                return g_ibss.peers[i];
+            }
+        }
+        else if (free_slot < 0)
+        {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot < 0)
+    {
+        MMLOG_WRN("IBSS: peer table full (%u); using shared record for " MM_MAC_ADDR_FMT "\n",
+                  UMAC_IBSS_MAX_PEERS, MM_MAC_ADDR_VAL(mac));
+        return g_ibss.bcast_stad;
+    }
+
+    struct umac_sta_data *stad = umac_sta_data_alloc(umacd);
+    if (stad == NULL)
+    {
+        MMLOG_WRN("IBSS: failed to alloc peer record for " MM_MAC_ADDR_FMT "\n",
+                  MM_MAC_ADDR_VAL(mac));
+        return g_ibss.bcast_stad;
+    }
+
+    uint16_t aid = (uint16_t)(free_slot + 1); /* aid 0 reserved */
+    umac_sta_data_set_aid(stad, aid);
+    umac_sta_data_set_bssid(stad, g_ibss.bssid);
+    umac_sta_data_set_peer_addr(stad, mac);
+    /* Open for now; CCMP (#15) installs a per-peer key against this AID. */
+    umac_sta_data_set_security(stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
+    umac_rc_start(stad, 0 /* sgi_flags */, 7 /* max_mcs */);
+
+    MMOSAL_TASK_ENTER_CRITICAL();
+    g_ibss.peers[free_slot] = stad;
+    MMOSAL_TASK_EXIT_CRITICAL();
+
+    /* NOTE: registering the peer with the firmware (SET_STA_STATE → a station
+     * handle for CCMP keying, the morse_op_sta_state mirror) is intentionally NOT
+     * done here. On this firmware it returns -116 on the ADHOC interface, and
+     * because morse_cmd_tx blocks, issuing it from this RX/core-task context
+     * stalls the datapath. Firmware-station registration is deferred to the CCMP
+     * work (#15), where it must be done off the hot path and the -116 understood.
+     * The host-side per-peer record below is sufficient for RX dedup/sequence. */
+    g_ibss.peer_sta_state_ret[free_slot] = 0;
+    MMLOG_INF("IBSS: peer added " MM_MAC_ADDR_FMT " aid=%u\n", MM_MAC_ADDR_VAL(mac), aid);
+
+    return stad;
+}
+
+unsigned mmwlan_ibss_get_peers(struct mmwlan_ibss_peer_info *out, unsigned max)
+{
+    unsigned n = 0;
+    if (!g_ibss.active)
+    {
+        return 0;
+    }
+    for (int i = 0; i < UMAC_IBSS_MAX_PEERS; i++)
+    {
+        if (g_ibss.peers[i] == NULL)
+        {
+            continue;
+        }
+        if (out != NULL && n < max)
+        {
+            const uint8_t *pa = umac_sta_data_peek_peer_addr(g_ibss.peers[i]);
+            if (pa != NULL)
+            {
+                mac_addr_copy(out[n].mac_addr, pa);
+            }
+            out[n].aid = umac_sta_data_get_aid(g_ibss.peers[i]);
+            out[n].sta_state_result = g_ibss.peer_sta_state_ret[i];
+        }
+        n++;
+    }
+    return n;
+}
+
+/* RX sender / EAPOL RA lookup → per-peer record (created on first contact). */
 static struct umac_sta_data *umac_ibss_lookup_peer(struct umac_data *umacd, const uint8_t *addr)
+{
+    return umac_ibss_get_or_add_peer(umacd, addr);
+}
+
+/* Normal data TX → the shared record (single TX queue); the 802.11 header carries
+ * the real DA. Per-peer unicast TX keying lands with CCMP (#15). */
+static struct umac_sta_data *umac_ibss_lookup_tx_dest(struct umac_data *umacd, const uint8_t *addr)
 {
     MM_UNUSED(umacd);
     MM_UNUSED(addr);
-    return g_ibss.stad;
+    return g_ibss.bcast_stad;
 }
 
 static struct umac_sta_data *umac_ibss_lookup_aid(struct umac_data *umacd, uint16_t aid)
 {
     MM_UNUSED(umacd);
-    MM_UNUSED(aid);
-    return g_ibss.stad;
+    if (aid >= 1 && aid <= UMAC_IBSS_MAX_PEERS && g_ibss.peers[aid - 1] != NULL)
+    {
+        return g_ibss.peers[aid - 1];
+    }
+    return g_ibss.bcast_stad;
 }
 
 static bool umac_ibss_set_sleep_state(struct umac_sta_data *stad, bool asleep)
@@ -1559,7 +1686,7 @@ static bool umac_ibss_dequeue_tx_frame(struct umac_data *umacd,
     MM_UNUSED(umacd);
     *stad = NULL;
     *txbuf = NULL;
-    struct umac_sta_data *s = g_ibss.stad;
+    struct umac_sta_data *s = g_ibss.bcast_stad;
     if (s == NULL || umac_sta_data_is_paused(s))
     {
         return false;
@@ -1606,7 +1733,7 @@ static const uint16_t umac_ibss_frames_allowed_pre_association[] = {
 static const struct umac_datapath_ops datapath_ops_ibss = {
     .process_rx_mgmt_frame = umac_ibss_process_rx_mgmt_frame,
     .lookup_stad_by_peer_addr = umac_ibss_lookup_peer,
-    .lookup_stad_by_tx_dest_addr = umac_ibss_lookup_peer,
+    .lookup_stad_by_tx_dest_addr = umac_ibss_lookup_tx_dest,
     .lookup_stad_by_aid = umac_ibss_lookup_aid,
     .set_stad_sleep_state = umac_ibss_set_sleep_state,
     .is_stad_tx_paused = umac_ibss_is_tx_paused,
@@ -1710,20 +1837,22 @@ static enum mmwlan_status umac_ibss_do_start(struct umac_data *umacd,
         g_ibss.s1g_op = *cur;
     }
 
-    /* Shared peer record for the cell (datapath_ops_ibss). Allocate after the
-     * memset so it isn't zeroed; the real DA/SA travel in the 802.11 header. */
-    g_ibss.stad = umac_sta_data_alloc_static(umacd);
-    if (g_ibss.stad == NULL)
+    /* Shared record for group/broadcast frames + the single TX queue
+     * (datapath_ops_ibss). Allocate after the memset so it isn't zeroed; the real
+     * DA/SA travel in the 802.11 header. Per-peer records are created lazily on RX
+     * (umac_ibss_get_or_add_peer); the peers[] table is zeroed by the memset. */
+    g_ibss.bcast_stad = umac_sta_data_alloc_static(umacd);
+    if (g_ibss.bcast_stad == NULL)
     {
         MMLOG_ERR("IBSS: failed to allocate shared peer record\n");
         status = MMWLAN_NO_MEM;
         goto error;
     }
-    umac_sta_data_set_bssid(g_ibss.stad, g_ibss.bssid);
-    umac_sta_data_set_peer_addr(g_ibss.stad, mac_addr_broadcast);
-    /* Open IBSS (no keys): mark the peer OPEN so the TX datapath sends plaintext
+    umac_sta_data_set_bssid(g_ibss.bcast_stad, g_ibss.bssid);
+    umac_sta_data_set_peer_addr(g_ibss.bcast_stad, mac_addr_broadcast);
+    /* Open IBSS (no keys): mark OPEN so the TX datapath sends plaintext
      * (umac_datapath.c only encrypts when security_type != MMWLAN_OPEN). */
-    umac_sta_data_set_security(g_ibss.stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
+    umac_sta_data_set_security(g_ibss.bcast_stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
 
     g_ibss.active = true;
 

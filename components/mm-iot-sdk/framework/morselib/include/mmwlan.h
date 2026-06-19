@@ -2510,6 +2510,32 @@ struct mmwlan_ibss_args
  */
 enum mmwlan_status mmwlan_ibss_enable(const struct mmwlan_ibss_args *args);
 
+/** Per-peer info for an active IBSS, returned by @ref mmwlan_ibss_get_peers(). */
+struct mmwlan_ibss_peer_info
+{
+    /** Peer MAC address. */
+    uint8_t mac_addr[MMWLAN_MAC_ADDR_LEN];
+    /** Local station handle (AID) assigned to the peer; used for keying. */
+    uint16_t aid;
+    /** Reserved: firmware SET_STA_STATE registration result. Always 0 for now —
+     *  registration is deferred to the CCMP work (it returns -116 on ADHOC). */
+    int sta_state_result;
+};
+
+/**
+ * Snapshot the per-peer station records of the active IBSS.
+ *
+ * Peers are created on first receipt of a frame from a new transmitter (mirroring
+ * mac80211 @c ieee80211_ibss_add_sta).
+ *
+ * @param out  Caller buffer to fill (may be NULL to just count).
+ * @param max  Capacity of @p out in entries.
+ * @return Number of peers written (or that would be written if @p out is NULL).
+ *
+ * @warning EXPERIMENTAL.
+ */
+unsigned mmwlan_ibss_get_peers(struct mmwlan_ibss_peer_info *out, unsigned max);
+
 /**
  * Gets the BSSID address of the AP, if it is active.
  *
