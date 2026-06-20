@@ -33,6 +33,9 @@ void umac_datapath_configure_sta_mode(struct umac_data *umacd);
 void umac_datapath_configure_ap_mode(struct umac_data *umacd);
 
 
+void umac_datapath_configure_ibss_mode(struct umac_data *umacd);
+
+
 void umac_datapath_configure_scan_mode(struct umac_data *umacd);
 
 

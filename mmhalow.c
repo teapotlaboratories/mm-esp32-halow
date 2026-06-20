@@ -44,16 +44,6 @@ static void halow_rx(struct mmpkt *rxpkt, void *arg)
 
     struct mmpktview *pktview = mmpkt_open(rxpkt);
     uint32_t data_len = mmpkt_get_data_length(pktview);
-    /* RISK-01 hardening: surface received Rimba EtherType 0x88B5 L2 frames (lwIP
-     * would otherwise drop them). Test instrumentation for the 0x88B5 gate. */
-    if (data_len >= 14) {
-        const uint8_t *d = mmpkt_get_data_start(pktview);
-        if (d[12] == 0x88 && d[13] == 0xb5) {
-            ESP_LOGI(TAG, "RX 0x88B5 from %02x:%02x:%02x:%02x:%02x:%02x len=%lu payload='%.*s'",
-                     d[6], d[7], d[8], d[9], d[10], d[11], (unsigned long)data_len,
-                     (int)(data_len > 14 ? data_len - 14 : 0), (const char *)(d + 14));
-        }
-    }
     esp_err_t ret =
         esp_netif_receive(halow_netif, mmpkt_get_data_start(pktview), data_len, pktview);
 
@@ -333,4 +323,9 @@ enum mmwlan_status mmhalow_status()
 void mmhalow_wifi_start(){
     mmhalow_netif_driver_t *morse_drv = esp_netif_get_io_driver(halow_netif);
     mmwlan_ap_enable(&morse_drv->ap_args);
+}
+
+esp_netif_t *mmhalow_get_netif(void)
+{
+    return halow_netif;
 }

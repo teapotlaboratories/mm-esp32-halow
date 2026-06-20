@@ -2461,80 +2461,9 @@ enum mmwlan_status mmwlan_ap_enable(const struct mmwlan_ap_args *args);
  */
 enum mmwlan_status mmwlan_ap_disable(void);
 
-/**
- * Arguments data structure for @ref mmwlan_ibss_enable().
- *
- * IBSS / ad-hoc support is a Rimba addition (RISK-01), not part of the stock
- * MorseMicro SDK. The command sequence was ported from the MorseMicro Linux
- * driver; see docs/worklog/2026-06-18-risk01-ibss-recon.md.
- *
- * @warning EXPERIMENTAL: drives undocumented chip-firmware commands; the stock
- *          SDK does not support ad-hoc and MorseMicro will not support a
- *          modified morselib.
- */
-struct mmwlan_ibss_args
-{
-    /** SSID of the IBSS (used only to derive the compressed SSID). */
-    uint8_t ssid[MMWLAN_SSID_MAXLEN];
-    /** Length of the SSID. */
-    uint16_t ssid_len;
-    /** IBSS BSSID. MUST be identical on every node in the cell. */
-    uint8_t bssid[MMWLAN_MAC_ADDR_LEN];
-    /** Operating class (combined with @c s1g_chan_num to select the channel). */
-    uint16_t op_class;
-    /** S1G channel number (must exist in the configured channel list). */
-    uint16_t s1g_chan_num;
-    /** Beacon interval in TUs. 0 => @ref MMWLAN_DEFAULT_AP_BEACON_INTERVAL_TUS. */
-    uint16_t beacon_interval_tus;
-    /** If true, CREATE the IBSS (first node); else JOIN an existing one. */
-    bool creator;
-    /** If true, start host beaconing after configuration. Requires a beacon
-     *  body; leave false for the command-acceptance test. */
-    bool start_beaconing;
-};
-
-/** Initialiser for @ref mmwlan_ibss_args. */
-#define MMWLAN_IBSS_ARGS_INIT { 0 }
-
-/**
- * Enable IBSS / ad-hoc mode.
- *
- * Drives the ported ADD_INTERFACE(ADHOC) -> SET_CHANNEL -> BSSID_SET ->
- * BSS_CONFIG -> IBSS_CONFIG sequence. Call after @c mmwlan_boot() (e.g. after
- * mmhalow_init()) from a clean state with no STA/AP interface active.
- *
- * @param args  IBSS configuration.
- * @return @ref MMWLAN_SUCCESS on success, else an appropriate error code.
- *
- * @warning EXPERIMENTAL — see @ref mmwlan_ibss_args.
- */
-enum mmwlan_status mmwlan_ibss_enable(const struct mmwlan_ibss_args *args);
-
-/** Per-peer info for an active IBSS, returned by @ref mmwlan_ibss_get_peers(). */
-struct mmwlan_ibss_peer_info
-{
-    /** Peer MAC address. */
-    uint8_t mac_addr[MMWLAN_MAC_ADDR_LEN];
-    /** Local station handle (AID) assigned to the peer; used for keying. */
-    uint16_t aid;
-    /** Reserved: firmware SET_STA_STATE registration result. Always 0 for now —
-     *  registration is deferred to the CCMP work (it returns -116 on ADHOC). */
-    int sta_state_result;
-};
-
-/**
- * Snapshot the per-peer station records of the active IBSS.
- *
- * Peers are created on first receipt of a frame from a new transmitter (mirroring
- * mac80211 @c ieee80211_ibss_add_sta).
- *
- * @param out  Caller buffer to fill (may be NULL to just count).
- * @param max  Capacity of @p out in entries.
- * @return Number of peers written (or that would be written if @p out is NULL).
- *
- * @warning EXPERIMENTAL.
- */
-unsigned mmwlan_ibss_get_peers(struct mmwlan_ibss_peer_info *out, unsigned max);
+/* IBSS / ad-hoc public API now lives in umac/ibss/umac_ibss.h (adopted from the
+ * momentary-systems esp-halow-ibss fork): mmwlan_ibss_start/stop/age_peers/
+ * foreach_peer/register_peer_cb + struct mmwlan_ibss_args. */
 
 /**
  * Gets the BSSID address of the AP, if it is active.

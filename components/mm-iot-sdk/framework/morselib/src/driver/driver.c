@@ -47,6 +47,80 @@ void mmdrv_pre_init(void)
     morse_trns_init();
 }
 
+/* Probe: send MORSE_CMD_REQ_ADD_INTERFACE with an arbitrary firmware-side
+ * interface_type, bypassing mmdrv_add_if's switch (which only knows STA/AP).
+ * Reports the transport return value and the firmware's status code so the
+ * caller can distinguish "firmware rejected the type code itself" from
+ * "firmware accepted the type but couldn't honor the request right now". */
+int mmprobe_add_iface_raw(uint32_t iface_type, uint32_t *fw_status_out)
+{
+    if (fw_status_out)
+    {
+        *fw_status_out = 0;
+    }
+
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    /* Locally-administered, unicast MAC distinct from device MAC. */
+    static const uint8_t probe_addr[6] = { 0x02, 0x00, 0x00, 0xde, 0xad, 0xbe };
+
+    struct morse_cmd_resp_add_interface resp = { 0 };
+    struct morse_cmd_req_add_interface cmd = MORSE_COMMAND_INIT(cmd,
+                                                                MORSE_CMD_ID_ADD_INTERFACE,
+                                                                UNKNOWN_VIF_ID,
+                                                                .interface_type =
+                                                                    htole32(iface_type));
+    memcpy(cmd.addr.octet, probe_addr, sizeof(cmd.addr.octet));
+
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    if (fw_status_out)
+    {
+        *fw_status_out = (ret == 0) ? le32toh(resp.status) : 0;
+    }
+    return ret;
+}
+
+/* Probe: remove an interface by raw vif_id (wrapper over mmdrv_rm_if). Used to
+ * clear the boot-time STA so a subsequent add can be tested as the sole
+ * interface, eliminating the "second interface" confound. */
+int mmprobe_rm_iface_raw(uint16_t vif_id)
+{
+    return mmdrv_rm_if(vif_id);
+}
+
+/* Probe: dump the firmware capability words this blob advertises. The
+ * firmware_flags bitmap and morse_caps flags come straight off the chip's
+ * host table during init, so this documents exactly what the loaded .mbin
+ * claims to support. */
+void mmprobe_dump_fw_caps(void)
+{
+    MMLOG_ERR("FWCAPS firmware_flags = 0x%08x\n", (unsigned)driver_data.firmware_flags);
+    MMLOG_ERR("FWCAPS   SUPPORT_S1G              = %d\n",
+              !!(driver_data.firmware_flags & MORSE_FW_FLAGS_SUPPORT_S1G));
+    MMLOG_ERR("FWCAPS   SUPPORT_HW_SCAN          = %d\n",
+              !!(driver_data.firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_SCAN));
+    MMLOG_ERR("FWCAPS   REPORTS_TX_BEACON_COMPL  = %d\n",
+              !!(driver_data.firmware_flags & MORSE_FW_FLAGS_REPORTS_TX_BEACON_COMPLETION));
+    MMLOG_ERR("FWCAPS   SUPPORT_CHIP_HALT_IRQ    = %d\n",
+              !!(driver_data.firmware_flags & MORSE_FW_FLAGS_SUPPORT_CHIP_HALT_IRQ));
+    MMLOG_ERR("FWCAPS   SUPPORT_HW_REATTACH      = %d\n",
+              !!(driver_data.firmware_flags & MORSE_FW_FLAGS_SUPPORT_HW_REATTACH));
+
+    for (unsigned i = 0; i < MORSE_CAPS_FLAGS_WIDTH; i++)
+    {
+        MMLOG_ERR("FWCAPS morse_caps.flags[%u] = 0x%08x\n",
+                  i,
+                  (unsigned)driver_data.capabilities.flags[i]);
+    }
+}
+
 void mmdrv_post_deinit(void)
 {
     morse_trns_deinit();
@@ -813,33 +887,22 @@ int mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period, ui
     return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
 }
 
-int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid)
+int mmdrv_cfg_ibss(uint16_t vif_id,
+                   const uint8_t *bssid,
+                   enum morse_cmd_ibss_config_opcode opcode,
+                   bool probe_filtering)
 {
     if (!driver_data.started)
     {
         return -ENODEV;
     }
 
-    struct morse_cmd_req_bssid_set cmd =
-        MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_BSSID_SET, vif_id);
-    memcpy(cmd.bssid.octet, bssid, sizeof(cmd.bssid.octet));
-
-    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
-}
-
-int mmdrv_cfg_ibss(uint16_t vif_id, const uint8_t *bssid, uint8_t opcode)
-{
-    if (!driver_data.started)
-    {
-        return -ENODEV;
-    }
-
-    struct morse_cmd_req_ibss_config cmd =
-        MORSE_COMMAND_INIT(cmd,
-                           MORSE_CMD_ID_IBSS_CONFIG,
-                           vif_id,
-                           .ibss_cfg_opcode = opcode,
-                           .ibss_probe_filtering = 1);
+    struct morse_cmd_req_ibss_config cmd = MORSE_COMMAND_INIT(cmd,
+                                                              MORSE_CMD_ID_IBSS_CONFIG,
+                                                              vif_id,
+                                                              .ibss_cfg_opcode = (uint8_t)opcode,
+                                                              .ibss_probe_filtering =
+                                                                  probe_filtering ? 1 : 0);
     memcpy(cmd.ibss_bssid, bssid, sizeof(cmd.ibss_bssid));
 
     return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);

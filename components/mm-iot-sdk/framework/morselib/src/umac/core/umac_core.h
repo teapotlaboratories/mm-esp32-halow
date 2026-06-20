@@ -256,15 +256,6 @@ struct umac_evt
 
         struct
         {
-            const struct mmwlan_ibss_args *args;
-
-            struct mmosal_semb *semb;
-
-            volatile enum mmwlan_status *status;
-        } ibss_start;
-
-        struct
-        {
 
             const uint8_t *sta_addr;
 

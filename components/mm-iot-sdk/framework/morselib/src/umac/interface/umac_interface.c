@@ -144,15 +144,26 @@ bool umac_interface_type_is_compatible_with_active(struct umac_interface_data *d
                                                    enum umac_interface_type type)
 {
 
-    if ((data->active_interface_types & VIF_STA_INTERFACE_TYPES_MASK) &&
-        (type & (UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC)))
+    if ((data->active_interface_types & VIF_STA_INTERFACE_TYPES_MASK) && (type & UMAC_INTERFACE_AP))
     {
         return false;
     }
 
 
-    if ((data->active_interface_types & (UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC)) &&
-        (type & VIF_STA_INTERFACE_TYPES_MASK))
+    if ((data->active_interface_types & UMAC_INTERFACE_AP) && (type & VIF_STA_INTERFACE_TYPES_MASK))
+    {
+        return false;
+    }
+
+
+    /* ADHOC is exclusive with every other active type, and conversely no other
+     * type may be added while ADHOC is active. */
+    if ((data->active_interface_types & UMAC_INTERFACE_ADHOC) && type != UMAC_INTERFACE_ADHOC)
+    {
+        return false;
+    }
+    if ((type & UMAC_INTERFACE_ADHOC) &&
+        (data->active_interface_types & ~(uint16_t)UMAC_INTERFACE_ADHOC))
     {
         return false;
     }
@@ -218,10 +229,19 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
             MMLOG_DBG("Device MAC address: " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(data->mac_addr));
         }
 
-        enum mmdrv_interface_type drv_if_type =
-            (type == UMAC_INTERFACE_AP)      ? MMDRV_INTERFACE_TYPE_AP :
-            (type == UMAC_INTERFACE_ADHOC)   ? MMDRV_INTERFACE_TYPE_ADHOC :
-                                               MMDRV_INTERFACE_TYPE_STA;
+        enum mmdrv_interface_type drv_if_type;
+        if (type == UMAC_INTERFACE_AP)
+        {
+            drv_if_type = MMDRV_INTERFACE_TYPE_AP;
+        }
+        else if (type == UMAC_INTERFACE_ADHOC)
+        {
+            drv_if_type = MMDRV_INTERFACE_TYPE_ADHOC;
+        }
+        else
+        {
+            drv_if_type = MMDRV_INTERFACE_TYPE_STA;
+        }
         ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
         MMOSAL_ASSERT(ret == 0);
 
@@ -404,8 +424,19 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
         return MMWLAN_UNAVAILABLE;
     }
 
-    enum mmdrv_interface_type drv_if_type = (type == UMAC_INTERFACE_AP) ? MMDRV_INTERFACE_TYPE_AP :
-                                                                          MMDRV_INTERFACE_TYPE_STA;
+    enum mmdrv_interface_type drv_if_type;
+    if (type == UMAC_INTERFACE_AP)
+    {
+        drv_if_type = MMDRV_INTERFACE_TYPE_AP;
+    }
+    else if (type == UMAC_INTERFACE_ADHOC)
+    {
+        drv_if_type = MMDRV_INTERFACE_TYPE_ADHOC;
+    }
+    else
+    {
+        drv_if_type = MMDRV_INTERFACE_TYPE_STA;
+    }
     int ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
     if (ret != 0)
     {

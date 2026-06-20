@@ -99,6 +99,16 @@ enum mmwlan_status umac_connection_register_link_cb(struct umac_data *umacd,
                                                     void *arg);
 
 
+/**
+ * Fire the link-state callbacks (global + per-vif). For interface modes that
+ * don't run through the STA connection FSM — currently IBSS — so mmhalow's
+ * netif can transition to connected.
+ */
+void umac_connection_signal_link_state(struct umac_data *umacd,
+                                       enum mmwlan_vif vif,
+                                       enum mmwlan_link_state state);
+
+
 int umac_connection_get_ssid(struct umac_data *umacd, uint8_t *ssid);
 
 
