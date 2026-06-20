@@ -1288,7 +1288,18 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
                                                         frame_ver_type_subtype,
                                                         header->frame_control))
     {
-        const uint8_t *ta = dot11_get_ta(header);
+        /* S1G beacons use the compressed dot11_s1g_beacon_hdr, where the
+         * transmitter is source_addr (offset 4) — not addr2. dot11_get_ta() reads
+         * the addr2 offset, which in an S1G beacon lands in the time_stamp field,
+         * so a reference (morse_driver) S1G beacon mints a fresh phantom peer every
+         * beacon interval from the ticking timestamp (#16, Linux IBSS interop).
+         * Reading source_addr fixes that and lets the BSSID check in
+         * get_or_add_peer correctly drop our own SA=BSSID beacons while admitting a
+         * real peer's beacon (enabling passive beacon discovery). */
+        const uint8_t *ta =
+            (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
+                ? ((const struct dot11_s1g_beacon_hdr *)header)->source_addr
+                : dot11_get_ta(header);
         MMOSAL_DEV_ASSERT(data->ops != NULL);
         struct umac_sta_data *stad = data->ops->lookup_stad_by_peer_addr(umacd, ta);
         if (stad == NULL)
