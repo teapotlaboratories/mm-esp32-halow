@@ -25,13 +25,13 @@ enum umac_interface_type
 
     UMAC_INTERFACE_AP = 8,
 
-    /* IBSS / ad-hoc. AP-type interface (it beacons), mapped to
-     * MMDRV_INTERFACE_TYPE_ADHOC. Added for the RISK-01 IBSS bring-up. */
+    /** IBSS / ad-hoc interface. Like AP, the host generates beacons and answers
+     *  probe requests; unlike AP there is no association. Mutually exclusive
+     *  with STA/SCAN/AP. */
     UMAC_INTERFACE_ADHOC = 16,
 
-    UMAC_INTERFACE_ALL =
-        (UMAC_INTERFACE_NONE | UMAC_INTERFACE_SCAN | UMAC_INTERFACE_STA | UMAC_INTERFACE_AP |
-         UMAC_INTERFACE_ADHOC),
+    UMAC_INTERFACE_ALL = (UMAC_INTERFACE_NONE | UMAC_INTERFACE_SCAN | UMAC_INTERFACE_STA |
+                          UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC),
 };
 
 

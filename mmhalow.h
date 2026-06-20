@@ -91,3 +91,10 @@ void mmhalow_print_version_info(void);
  * Start an AP interface
  */
 void mmhalow_wifi_start();
+
+/**
+ * Return the esp_netif handle backing the HaLow interface. Useful for callers
+ * that need to set static IP, query DHCP, etc. NULL if @ref mmhalow_init has
+ * not been called.
+ */
+esp_netif_t *mmhalow_get_netif(void);

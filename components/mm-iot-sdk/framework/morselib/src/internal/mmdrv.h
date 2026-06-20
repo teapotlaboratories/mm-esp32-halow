@@ -267,7 +267,7 @@ enum mmdrv_interface_type
     MMDRV_INTERFACE_TYPE_STA = 1,
     /** An access point interface */
     MMDRV_INTERFACE_TYPE_AP = 2,
-    /** An IBSS / ad-hoc interface (value matches MORSE_CMD_INTERFACE_TYPE_ADHOC). */
+    /** An IBSS / ad-hoc interface */
     MMDRV_INTERFACE_TYPE_ADHOC = 4,
 };
 
@@ -285,6 +285,32 @@ enum mmdrv_interface_type
  * @returns 0 on success or an appropriate error code.
  */
 int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type);
+
+/**
+ * Probe: send an ADD_INTERFACE command with an arbitrary firmware-side
+ * interface type code (see @ref morse_cmd_interface_type), bypassing the
+ * STA/AP-only switch in @ref mmdrv_add_if. Used to ask the firmware blob
+ * directly whether it recognizes types like ADHOC (4) or MESH (5).
+ *
+ * @param iface_type      Firmware-protocol interface_type value to send.
+ * @param fw_status_out   If non-NULL and the transport completed, populated
+ *                        with the firmware's status code from the response
+ *                        (0 == firmware-side success).
+ *
+ * @returns 0 on transport success (in which case fw_status_out holds the
+ *          firmware's verdict), or a negative errno for transport-level
+ *          failures.
+ */
+int mmprobe_add_iface_raw(uint32_t iface_type, uint32_t *fw_status_out);
+
+/**
+ * Probe: log the firmware capability words (firmware_flags + morse_caps)
+ * that the currently-loaded firmware advertised at init time.
+ */
+void mmprobe_dump_fw_caps(void);
+
+/** Probe: remove an interface by raw vif_id (wrapper over mmdrv_rm_if). */
+int mmprobe_rm_iface_raw(uint16_t vif_id);
 
 /**
  * Remove the given interface.
@@ -371,26 +397,23 @@ int mmdrv_set_channel(uint32_t op_chan_freq_hz,
 int mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period, uint32_t cssid);
 
 /**
- * Set the BSSID of the given interface (MORSE_CMD_ID_BSSID_SET).
- * Used by the IBSS / ad-hoc path. Recreated from the MorseMicro Linux driver.
+ * Configure IBSS (ad-hoc) operation on an interface.
  *
- * @param vif_id  VIF ID of the interface.
- * @param bssid   6-byte BSSID to set.
+ * Sends @ref MORSE_CMD_ID_IBSS_CONFIG. Mirrors the Linux driver's
+ * morse_cmd_cfg_ibss: CREATE starts a new IBSS, JOIN joins an existing one,
+ * STOP tears it down.
+ *
+ * @param vif_id           VIF id of the ADHOC interface.
+ * @param bssid            IBSS BSSID (shared by all nodes in the cell).
+ * @param opcode           CREATE / JOIN / STOP.
+ * @param probe_filtering  Enable firmware-side IBSS probe-request filtering.
+ *
  * @returns 0 on success or an appropriate error code.
  */
-int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid);
-
-/**
- * Configure IBSS / ad-hoc operation on the given interface
- * (MORSE_CMD_ID_IBSS_CONFIG). This is the command that puts the chip into
- * ad-hoc operation. Recreated from the MorseMicro Linux driver.
- *
- * @param vif_id  VIF ID of the (ADHOC-type) interface.
- * @param bssid   6-byte IBSS BSSID (shared by all peers in the cell).
- * @param opcode  @ref morse_cmd_ibss_opcode (CREATE / JOIN / STOP).
- * @returns 0 on success or an appropriate error code.
- */
-int mmdrv_cfg_ibss(uint16_t vif_id, const uint8_t *bssid, uint8_t opcode);
+int mmdrv_cfg_ibss(uint16_t vif_id,
+                   const uint8_t *bssid,
+                   enum morse_cmd_ibss_config_opcode opcode,
+                   bool probe_filtering);
 
 /**
  * Update the STA state. This is used for both STA and AP interface types.

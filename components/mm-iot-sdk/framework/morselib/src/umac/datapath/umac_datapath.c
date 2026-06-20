@@ -28,6 +28,7 @@
 #include "umac/rc/umac_rc.h"
 #include "umac/ba/umac_ba.h"
 #include "umac/twt/umac_twt.h"
+#include "umac/ibss/umac_ibss.h"
 #include "umac/ies/mmie.h"
 #include "umac/frames/disassociation.h"
 #include "umac/frames/deauthentication.h"
@@ -154,7 +155,13 @@ static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmp
 
     if (!umac_connection_addr_matches_bssid(umacd, s1g_header->source_addr))
     {
-        MMLOG_DBG("Beacon received from another AP.\n");
+        /* In IBSS a peer's beacon carries source_addr = the peer's own MAC (not the
+         * BSSID). Add it as a peer — passive beacon discovery, mirroring Linux
+         * ieee80211_ibss_rx_bss_info. (#16: the stock handler dropped these as
+         * "another AP", so IBSS peers were only discovered once they sent data,
+         * leaving the mesh incomplete. get-or-create handles zero/multicast; we
+         * don't receive our own beacon.) */
+        (void)umac_ibss_get_or_create_peer_stad(s1g_header->source_addr);
         return;
     }
 
@@ -339,14 +346,11 @@ static void umac_datapath_process_rx_mgmt_frame_sta(struct umac_data *umacd,
             break;
 
         case DOT11_FC_SUBTYPE_PROBE_RSP:
-            umac_scan_process_probe_resp(umacd, rxbufview);
-            break;
-
-        /* RISK-01: also surface BEACONS to the scanner so IBSS/ad-hoc cells
-         * (which beacon but don't answer probe requests) are discoverable. A
-         * beacon body is layout-compatible with a probe response; the parser is
-         * subtype-agnostic, and umac_scan_process_probe_resp ignores beacons when
-         * no scan is active. */
+        /* A beacon's fixed body (timestamp/beacon-interval/capability + IEs)
+         * matches a probe response, so the same parser handles it. Routing
+         * beacons here lets a scan passively discover IBSS peers (which may
+         * only beacon, not answer probe requests). umac_scan_process_probe_resp
+         * ignores frames when no scan is active. */
         case DOT11_FC_SUBTYPE_BEACON:
             umac_scan_process_probe_resp(umacd, rxbufview);
             break;
@@ -597,16 +601,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     {
         vif = MMWLAN_VIF_STA;
     }
-    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != UMAC_INTERFACE_VIF_ID_INVALID)
-    {
-        vif = MMWLAN_VIF_AP;
-    }
-    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_ADHOC) !=
+    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC) !=
              UMAC_INTERFACE_VIF_ID_INVALID)
     {
-        /* IBSS / ad-hoc: AP-type vif, but RX data was being dropped here because
-         * only STA/AP were recognised. Map to MMWLAN_VIF_AP (no dedicated IBSS
-         * vif enum) so received data frames are delivered up. */
+        /* IBSS reuses the AP per-vif slot for state/ext-cb registration. */
         vif = MMWLAN_VIF_AP;
     }
     else
@@ -898,6 +896,18 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
     {
         MMLOG_DBG("Dropping frame, not transmitted from our AP.\n");
         goto drop;
+    }
+
+    /* IBSS: stash per-frame RSSI on the sender's peer record and fire
+     * the per-frame rx cb. Gated on umac_ibss_is_active() so AP/STA
+     * paths pay just a single-bool check here. */
+    if (umac_ibss_is_active())
+    {
+        const struct mmdrv_rx_metadata *rxmeta = mmdrv_get_rx_metadata(rxbuf);
+        if (rxmeta != NULL)
+        {
+            umac_ibss_record_peer_rx(dot11_get_ta(header), rxmeta->rssi);
+        }
     }
 
     struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
@@ -1288,18 +1298,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
                                                         frame_ver_type_subtype,
                                                         header->frame_control))
     {
-        /* S1G beacons use the compressed dot11_s1g_beacon_hdr, where the
-         * transmitter is source_addr (offset 4) — not addr2. dot11_get_ta() reads
-         * the addr2 offset, which in an S1G beacon lands in the time_stamp field,
-         * so a reference (morse_driver) S1G beacon mints a fresh phantom peer every
-         * beacon interval from the ticking timestamp (#16, Linux IBSS interop).
-         * Reading source_addr fixes that and lets the BSSID check in
-         * get_or_add_peer correctly drop our own SA=BSSID beacons while admitting a
-         * real peer's beacon (enabling passive beacon discovery). */
-        const uint8_t *ta =
-            (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
-                ? ((const struct dot11_s1g_beacon_hdr *)header)->source_addr
-                : dot11_get_ta(header);
+        const uint8_t *ta = dot11_get_ta(header);
         MMOSAL_DEV_ASSERT(data->ops != NULL);
         struct umac_sta_data *stad = data->ops->lookup_stad_by_peer_addr(umacd, ta);
         if (stad == NULL)
@@ -2650,6 +2649,135 @@ void umac_datapath_configure_sta_mode(struct umac_data *umacd)
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     data->ops = &datapath_ops_sta;
     MMLOG_INF("Datapath configured for STA mode\n");
+}
+
+/* Defined in umac_datapath_ap.c; reused for the IBSS ops table. */
+extern const uint16_t frames_allowed_pre_association_ap_mode[];
+
+/* IBSS rx lookup: each unicast sender gets its own per-peer stad so the
+ * receive-side sequence number / dedup state is isolated per sender. Broadcast,
+ * multicast and NULL fall through to the common stad. */
+static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_ibss(struct umac_data *umacd,
+                                                                         const uint8_t *addr)
+{
+    MM_UNUSED(umacd);
+    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
+    {
+        return umac_ibss_get_common_stad();
+    }
+    return umac_ibss_get_or_create_peer_stad(addr);
+}
+
+/* IBSS tx-dest lookup: always the common stad. Our outgoing frames share one
+ * SNS2/3 sequence space per IEEE 802.11 — the receiver dedupes per-sender, not
+ * per-(sender, my-MAC), so we don't need per-destination tx state. Keeping TX
+ * simple also means broadcast/multicast and unicast TX share the one txq the
+ * dequeue path consults (see umac_datapath_tx_dequeue_frame_ibss). */
+static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_ibss(
+    struct umac_data *umacd, const uint8_t *addr)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(addr);
+    return umac_ibss_get_common_stad();
+}
+
+/* In IBSS there is no association handshake; the controlled port is always
+ * open, so report CONNECTED to allow data tx/rx through the common stad. */
+static enum mmwlan_sta_state umac_datapath_get_state_ibss(struct umac_sta_data *stad)
+{
+    MM_UNUSED(stad);
+    return MMWLAN_STA_CONNECTED;
+}
+
+static void umac_datapath_process_rx_mgmt_frame_ibss(struct umac_data *umacd,
+                                                     struct umac_sta_data *stad,
+                                                     struct mmpktview *rxbufview)
+{
+    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    uint16_t subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+    switch (subtype)
+    {
+        case DOT11_FC_SUBTYPE_PROBE_REQ:
+            umac_ibss_handle_probe_req(umacd, rxbufview);
+            break;
+
+        case DOT11_FC_SUBTYPE_PROBE_RSP:
+        case DOT11_FC_SUBTYPE_BEACON:
+            umac_scan_process_probe_resp(umacd, rxbufview);
+            break;
+
+        default:
+            MM_UNUSED(stad);
+            break;
+    }
+}
+
+/* IBSS data frames are sent peer-to-peer: ToDS=0, FromDS=0, addr1=DA,
+ * addr2=SA (this node), addr3=BSSID. (Contrast STA mode, which sets ToDS and
+ * addr1=BSSID.) */
+static void umac_datapath_construct_80211_data_header_ibss(struct umac_sta_data *stad,
+                                                           const struct umac_8023_hdr *hdr_8023,
+                                                           struct dot11_data_hdr *data_hdr)
+{
+    uint16_t frame_control = DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
+                             DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE;
+
+    mac_addr_copy(data_hdr->base.addr1, hdr_8023->dest_addr);
+    umac_interface_get_mac_addr(stad, data_hdr->base.addr2);
+    umac_sta_data_get_bssid(stad, data_hdr->base.addr3);
+    data_hdr->base.frame_control = htole16(frame_control);
+}
+
+/* IBSS dequeue: the STA-mode dequeue at umac_datapath_tx_dequeue_frame_sta uses
+ * umac_connection_get_stad() to find the stad — which is NULL for IBSS (no
+ * association FSM). Use our common stad directly instead, otherwise enqueued
+ * frames sit in the txq forever. */
+static bool umac_datapath_tx_dequeue_frame_ibss(struct umac_data *umacd,
+                                                struct umac_sta_data **stad_ptr,
+                                                struct mmpkt **txbuf_ptr)
+{
+    MM_UNUSED(umacd);
+    MMOSAL_ASSERT(stad_ptr && txbuf_ptr);
+    *stad_ptr = NULL;
+    *txbuf_ptr = NULL;
+
+    struct umac_sta_data *stad = umac_ibss_get_common_stad();
+    if (stad == NULL || umac_sta_data_is_paused(stad))
+    {
+        return false;
+    }
+
+    MMOSAL_TASK_ENTER_CRITICAL();
+    *txbuf_ptr = umac_sta_data_pop_pkt(stad);
+    bool has_more = umac_sta_data_get_queued_len(stad);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    if (*txbuf_ptr != NULL)
+    {
+        *stad_ptr = stad;
+    }
+    return has_more;
+}
+
+const struct umac_datapath_ops datapath_ops_ibss = {
+    .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_ibss,
+    .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_ibss,
+    .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_ibss,
+    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_sta,
+    .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
+    .is_stad_tx_paused = umac_sta_data_is_paused,
+    .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
+    .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_ibss,
+    .construct_80211_data_header = umac_datapath_construct_80211_data_header_ibss,
+    .get_sta_state = umac_datapath_get_state_ibss,
+    .frames_allowed_pre_association = frames_allowed_pre_association_ap_mode,
+};
+
+void umac_datapath_configure_ibss_mode(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->ops = &datapath_ops_ibss;
+    MMLOG_INF("Datapath configured for IBSS mode\n");
 }
 
 void umac_datapath_configure_scan_mode(struct umac_data *umacd)

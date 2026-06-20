@@ -6,7 +6,7 @@
 #include "common/common.h"
 #include "mmlog.h"
 #include "umac/ap/umac_ap.h"
-#include "umac/umac_ibss.h"
+#include "umac/ibss/umac_ibss.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/connection/umac_connection.h"

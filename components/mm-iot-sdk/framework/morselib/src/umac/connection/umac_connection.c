@@ -1782,6 +1782,27 @@ static void invoke_link_callback(struct umac_data *umacd,
     }
 }
 
+/* Public link-state signal used by interface modes that don't go through the
+ * STA connection FSM (currently: IBSS). Fires both the global link callback
+ * and the per-vif state callback so mmhalow's netif transitions to connected
+ * state when IBSS comes up. The vif slot used for per-vif lookup is AP — IBSS
+ * piggybacks the AP per-vif data slot. */
+void umac_connection_signal_link_state(struct umac_data *umacd,
+                                       enum mmwlan_vif vif,
+                                       enum mmwlan_link_state state)
+{
+    struct umac_connection_data *data = umac_data_get_connection(umacd);
+    struct mmwlan_vif_state vif_state = {
+        .vif = vif,
+        .link_state = state,
+    };
+    (void)umac_interface_invoke_vif_state_cb(umacd, &vif_state);
+    if (data->link_callback != NULL)
+    {
+        data->link_callback(state, data->link_arg);
+    }
+}
+
 
 
 
