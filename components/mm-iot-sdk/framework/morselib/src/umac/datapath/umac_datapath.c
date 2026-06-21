@@ -172,7 +172,17 @@ static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmp
          * mgmt->sa, but the morse RX path sets mgmt->sa = mgmt->bssid (s1g_to_beacon
          * copies the single S1G address into both), so it is data-driven there too.
          * Revisit (#16) only if a future firmware surfaces peer beacons with a real
-         * per-node source_addr. */
+         * per-node source_addr.
+         *
+         * NOTE — this is also the IBSS-MERGE decision point. A beacon whose
+         * source_addr (= the foreign cell's BSSID) differs from ours is, in Linux,
+         * where ieee80211_rx_bss_info compares TSF and merges (higher TSF wins). We
+         * intentionally do NOT merge: the consuming product (Rimba) is a provisioned
+         * network with a pre-agreed BSSID, so there is only ever one cell and nothing
+         * to reconcile (decided 2026-06-20; backlog #4 out of scope). If a future
+         * deployment needs coordinator-free cell formation, the TSF (beacon
+         * time_stamp) and foreign BSSID (source_addr) needed for the tiebreak are
+         * both present here. */
         return;
     }
 
