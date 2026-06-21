@@ -2759,6 +2759,20 @@ static bool umac_datapath_tx_dequeue_frame_ibss(struct umac_data *umacd,
     return has_more;
 }
 
+/* IBSS frames allowed from a not-yet-known sender. IBSS has no association, so —
+ * like STA mode, not AP mode — S1G beacons must be allowed: otherwise the RX
+ * filter falls through to dot11_get_ta(), which for an S1G beacon reads the
+ * time_stamp field (addr2 offset) and mints a fresh phantom peer every beacon,
+ * flooding the peer table (#17, esp. a morse_driver node whose beacon SA=BSSID).
+ * Allowing S1G_BEACON routes beacons to umac_datapath_process_s1g_beacon, which
+ * does proper source_addr-based peer discovery (#16) and drops SA=BSSID. */
+static const uint16_t frames_allowed_pre_association_ibss[] = {
+    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
+    UINT16_MAX,
+};
+
 const struct umac_datapath_ops datapath_ops_ibss = {
     .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_ibss,
     .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_ibss,
@@ -2770,7 +2784,7 @@ const struct umac_datapath_ops datapath_ops_ibss = {
     .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_ibss,
     .construct_80211_data_header = umac_datapath_construct_80211_data_header_ibss,
     .get_sta_state = umac_datapath_get_state_ibss,
-    .frames_allowed_pre_association = frames_allowed_pre_association_ap_mode,
+    .frames_allowed_pre_association = frames_allowed_pre_association_ibss,
 };
 
 void umac_datapath_configure_ibss_mode(struct umac_data *umacd)
