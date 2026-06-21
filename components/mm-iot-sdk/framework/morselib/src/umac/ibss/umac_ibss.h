@@ -32,13 +32,20 @@ struct mmwlan_ibss_args
 {
     /** This node's interface MAC address (locally administered). */
     uint8_t if_addr[MMWLAN_MAC_ADDR_LEN];
-    /** Shared BSSID for the cell. All nodes in the cell must use the same value. */
+    /** Shared BSSID for the cell. All nodes in the cell must use the same value.
+     *  This is an *agreed/provisioned* BSSID, not a random one: there is no IBSS
+     *  TSF merge here. TSF merge (net/mac80211/ibss.c ieee80211_rx_bss_info, higher
+     *  TSF wins) only exists to coalesce *uncoordinated* cells that each rolled a
+     *  random BSSID; with a pre-shared BSSID there is always exactly one cell, so it
+     *  is intentionally omitted (the consuming product, Rimba, is a provisioned
+     *  network — decided 2026-06-20). */
     uint8_t bssid[MMWLAN_MAC_ADDR_LEN];
     /** SSID bytes. */
     uint8_t ssid[MMWLAN_SSID_MAXLEN];
     /** SSID length (1..MMWLAN_SSID_MAXLEN). */
     uint8_t ssid_len;
-    /** true to CREATE a new cell; false to JOIN an existing one. */
+    /** true to CREATE a new cell; false to JOIN an existing one. Caller decides the
+     *  role (no auto create-else-join scan, since the BSSID is pre-agreed). */
     bool create;
     /** S1G channel number (e.g. 27 for US 915.5 MHz 1 MHz). Must exist in the
      *  current regulatory domain's channel list. */
