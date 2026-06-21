@@ -155,13 +155,24 @@ static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmp
 
     if (!umac_connection_addr_matches_bssid(umacd, s1g_header->source_addr))
     {
-        /* In IBSS a peer's beacon carries source_addr = the peer's own MAC (not the
-         * BSSID). Add it as a peer — passive beacon discovery, mirroring Linux
-         * ieee80211_ibss_rx_bss_info. (#16: the stock handler dropped these as
-         * "another AP", so IBSS peers were only discovered once they sent data,
-         * leaving the mesh incomplete. get-or-create handles zero/multicast; we
-         * don't receive our own beacon.) */
-        (void)umac_ibss_get_or_create_peer_stad(s1g_header->source_addr);
+        /* Do NOT mint a peer from a beacon. IBSS peer discovery is data-driven
+         * (umac_datapath_lookup_stad_by_peer_addr_ibss on a data frame's real TA);
+         * beacons cannot identify peers on this hardware/firmware:
+         *
+         *   - MORSE HARDWARE / FIRMWARE DEPENDENT (mm6108.mbin 1.17.6): the firmware
+         *     does not surface same-cell peer beacons to the host, so a peer ESP32's
+         *     beacon never reaches this handler at all (verified on-air: 0 beacons
+         *     from a 2nd ESP32 here, while the cell formed fine over data frames).
+         *   - A Linux/morse_driver node's S1G beacon carries source_addr = BSSID, not
+         *     the sender's MAC (morse_dot11ah_beacon_to_s1g, SW-4741). So even the
+         *     beacons that ARE surfaced can't identify the sender; minting from one
+         *     just creates a junk "peer" == the BSSID.
+         *
+         * This matches Linux in practice: net/mac80211/ibss.c discovers peers from
+         * mgmt->sa, but the morse RX path sets mgmt->sa = mgmt->bssid (s1g_to_beacon
+         * copies the single S1G address into both), so it is data-driven there too.
+         * Revisit (#16) only if a future firmware surfaces peer beacons with a real
+         * per-node source_addr. */
         return;
     }
 
