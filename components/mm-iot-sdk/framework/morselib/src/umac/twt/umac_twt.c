@@ -10,8 +10,13 @@
 #include "umac/interface/umac_interface.h"
 #include "umac/ies/twt_ie.h"
 #include "dot11/dot11.h"
+#include "dot11/dot11_frames.h"
 #include "mmlog.h"
 #include <string.h>
+
+/* S1G unprotected action codes for TWT (mirror Linux WLAN_S1G_TWT_SETUP/TEARDOWN). */
+#define UMAC_S1G_ACTION_TWT_SETUP    (6)
+#define UMAC_S1G_ACTION_TWT_TEARDOWN (7)
 
 static uint32_t umac_twt_calculate_wake_duration(uint32_t wake_duration)
 {
@@ -586,4 +591,50 @@ void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *s
     MMLOG_INF("TWT responder: freed agreement slot %d for "
               "%02x:%02x:%02x:%02x:%02x:%02x\n", slot,
               sta_addr[0], sta_addr[1], sta_addr[2], sta_addr[3], sta_addr[4], sta_addr[5]);
+}
+
+void umac_twt_responder_handle_action(struct umac_data *umacd, struct umac_sta_data *stad,
+                                      const uint8_t *frame, size_t frame_len)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->responder || stad == NULL || frame == NULL)
+    {
+        return;
+    }
+    const struct dot11_action *act = (const struct dot11_action *)frame;
+    /* Need at least the fixed header + category + action_code. */
+    if (frame_len < sizeof(*act) + 1 ||
+        act->field.category != DOT11_ACTION_CATEGORY_S1G_UNPROTECTED)
+    {
+        return;
+    }
+    uint8_t action_code = act->field.action_details[0];
+    const uint8_t *addr = umac_sta_data_peek_peer_addr(stad);
+    if (addr == NULL)
+    {
+        return;
+    }
+
+    switch (action_code)
+    {
+        case UMAC_S1G_ACTION_TWT_TEARDOWN:
+            /* Explicit teardown: free this STA's agreement. The per-STA table holds one
+             * agreement per STA, so the teardown flow id is implicit (mirror morse_driver
+             * morse_mac_process_rx_twt_mgmt, which removes the agreement on teardown). */
+            MMLOG_INF("TWT responder: teardown action from "
+                      "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                      addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+            umac_twt_responder_free_agreement(umacd, addr);
+            break;
+
+        case UMAC_S1G_ACTION_TWT_SETUP:
+            /* Mid-session TWT setup via action frame (vs the assoc-IE path) would need a
+             * TWT Setup response action frame built + transmitted back to the STA; not yet
+             * implemented. The assoc-IE path covers the common requester flow. */
+            MMLOG_INF("TWT responder: mid-session TWT-Setup action frame (unhandled)\n");
+            break;
+
+        default:
+            break;
+    }
 }

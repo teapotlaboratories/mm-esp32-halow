@@ -168,6 +168,13 @@ void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr
  * table does not leak slots as leaves come and go (mirrors Linux freeing the sta's TWT). */
 void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *sta_addr);
 
+/* RX hook (S1G unprotected action frame from @stad): handle a TWT Teardown (free the
+ * STA's agreement) — mirrors morse_driver morse_mac_process_rx_twt_mgmt for the
+ * action-frame path. (Mid-session TWT Setup action frames are recognised but not yet
+ * negotiated; the assoc-IE path covers the common requester flow.) */
+void umac_twt_responder_handle_action(struct umac_data *umacd, struct umac_sta_data *stad,
+                                      const uint8_t *frame, size_t frame_len);
+
 
 enum mmwlan_status umac_twt_add_configuration(struct umac_data *umacd,
                                               const struct mmwlan_twt_config_args *twt_config_args);

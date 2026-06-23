@@ -254,6 +254,13 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
             umac_supp_process_mgmt_frame(umacd, rxbufview);
             break;
 
+        case DOT11_ACTION_CATEGORY_S1G_UNPROTECTED:
+            /* TWT Setup/Teardown action frames (AP responder). */
+            umac_twt_responder_handle_action(umacd, stad,
+                                             mmpkt_get_data_start(rxbufview),
+                                             mmpkt_get_data_length(rxbufview));
+            break;
+
         default:
             MMLOG_WRN("Unsupported Action Category: %u\n", frame->field.category);
             break;
