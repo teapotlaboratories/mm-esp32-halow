@@ -311,6 +311,13 @@ void ie_s1g_capabilities_build_ap(struct umac_data *umacd, struct consbuf *buf)
             DOT11_S1G_CAP_INFO_8_SET_TWT_REQUESTER_SUPPORT(ie->s1g_capabilities_information[8],
                                                            true);
         }
+        /* AP advertises TWT responder support so a requesting STA includes its TWT
+         * setup request (mirror morse_driver mac.c:1275 S1G_CAP8_TWT_RESPOND). */
+        if (MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), TWT_RESPONDER))
+        {
+            DOT11_S1G_CAP_INFO_8_SET_TWT_RESPONDER_SUPPORT(ie->s1g_capabilities_information[8],
+                                                           true);
+        }
 
 
 

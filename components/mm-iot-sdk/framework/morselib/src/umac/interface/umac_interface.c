@@ -135,8 +135,17 @@ static void umac_interface_init_vif(struct umac_data *umacd,
     if (type & UMAC_INTERFACE_STA)
     {
         mmdrv_set_listen_interval_sleep(vif_id, umac_config_get_listen_interval(umacd));
-        umac_twt_init_vif(umacd, &vif_id);
+        umac_twt_init_vif(umacd, &vif_id, false);   /* STA = TWT requester */
         umac_interface_configure_control_response_out_1mhz(umacd);
+    }
+    if (type & UMAC_INTERFACE_AP)
+    {
+        /* AP = TWT responder. Mirror morse_driver morse_twt_init_vif: enable only when
+         * the firmware reports responder capability (responder is default-on for AP). */
+        if (MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), TWT_RESPONDER))
+        {
+            umac_twt_init_vif(umacd, &vif_id, true);
+        }
     }
 }
 

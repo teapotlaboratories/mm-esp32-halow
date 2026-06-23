@@ -119,7 +119,7 @@ struct MM_PACKED umac_twt_agreement_data
 void umac_twt_init(struct umac_data *umacd);
 
 
-void umac_twt_init_vif(struct umac_data *umacd, uint16_t *vif_id);
+void umac_twt_init_vif(struct umac_data *umacd, uint16_t *vif_id, bool is_responder);
 
 
 void umac_twt_deinit_vif(struct umac_data *umacd, uint16_t *vif_id);
@@ -136,6 +136,26 @@ enum mmwlan_status umac_twt_process_ie(struct umac_data *umacd, const struct dot
 
 
 enum mmwlan_status umac_twt_install_pending_agreements(struct umac_data *umacd, bool is_reinstall);
+
+
+/* --- TWT responder (AP), mirrors morse_driver's driver-level handling -----------
+ * The AP parses a STA's TWT request from a received (re)assoc-request, accepts
+ * REQUEST/SUGGEST (rejects DEMAND/GROUPING), inserts the accept IE into the
+ * (re)assoc-response, and installs the agreement to firmware once the STA is
+ * authorized. Single-STA scope (agreements[0] + responder_peer). */
+
+/* RX hook (assoc-req): parse + accept the STA's TWT request, stash the agreement. */
+void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
+                                         const uint8_t *frame, size_t frame_len);
+
+/* TX hook (assoc-resp): if @frame is a (re)assoc-resp to the accepted STA, serialise
+ * the responder TWT IE into @out (cap @out_cap); returns the IE length or 0. */
+size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
+                                            const uint8_t *frame, size_t frame_len,
+                                            uint8_t *out, size_t out_cap);
+
+/* Install hook (STA authorized): program the firmware with the accepted agreement. */
+void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr);
 
 
 enum mmwlan_status umac_twt_add_configuration(struct umac_data *umacd,
