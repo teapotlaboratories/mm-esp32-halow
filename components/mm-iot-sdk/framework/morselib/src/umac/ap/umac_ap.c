@@ -880,6 +880,15 @@ bool umac_ap_set_stad_sleep_state(struct umac_sta_data *stad, bool asleep)
     if (!asleep)
     {
         ap_traffic_bitmap_clear_aid_bit(data->bitmap, aid);
+        /* The STA just woke (e.g. its TWT service period opened). Flush any buffered
+         * downlink to it NOW, while it is awake, instead of waiting for the next
+         * beacon/DTIM. Without this, frames buffered while the STA dozed are not
+         * delivered within the (short) SP and the STA times out. Mirrors the
+         * group-addressed release in umac_ap_get_beacon(). */
+        if (umac_sta_data_get_queued_len(stad))
+        {
+            umac_core_evt_wake(umacd);
+        }
     }
     else if (umac_sta_data_get_queued_len(stad))
     {

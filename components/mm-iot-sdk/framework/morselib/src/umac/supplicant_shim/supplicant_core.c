@@ -12,6 +12,7 @@
 #include "umac_supp_shim_private.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/interface/umac_interface.h"
+#include "umac/twt/umac_twt.h"
 
 #if MMLOG_LEVEL < MMLOG_LEVEL_ERR
 #define WPA_LOG_LEVEL (MSG_ERROR + 1)
@@ -390,6 +391,10 @@ void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxb
     MMOSAL_DEV_ASSERT(!(data->ap_driver_ctx && data->sta_driver_ctx));
     if (data->ap_driver_ctx != NULL)
     {
+        /* TWT responder: parse + accept a STA's TWT request from its (re)assoc-request
+         * before hostapd handles it (mirror morse_driver morse_mac_process_rx_twt_mgmt). */
+        umac_twt_responder_handle_assoc_req(umacd, wpa_event_data.rx_mgmt.frame,
+                                            wpa_event_data.rx_mgmt.frame_len);
         umac_supp_event(data->ap_driver_ctx, EVENT_RX_MGMT, &wpa_event_data);
     }
     if (data->sta_driver_ctx != NULL)

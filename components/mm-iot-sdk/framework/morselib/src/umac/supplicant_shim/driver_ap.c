@@ -27,6 +27,7 @@
 #include "umac/ies/ssid.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/stats/umac_stats.h"
+#include "umac/twt/umac_twt.h"
 #include "umac/wnm_sleep/umac_wnm_sleep.h"
 #include "umac/ies/s1g_capabilities.h"
 
@@ -269,6 +270,12 @@ int mmwpas_sta_set_flags(void *priv,
     enum mmwlan_status status = umac_ap_update_sta(umacd, &sta_info);
     if (status == MMWLAN_SUCCESS)
     {
+        /* TWT responder: install the accepted agreement to firmware once the STA is
+         * authorized (mirror morse_driver mac.c:5024 install-on-AUTHORIZED). */
+        if (total_flags & WPA_STA_AUTHORIZED)
+        {
+            umac_twt_responder_install(umacd, addr);
+        }
         return 0;
     }
     else
@@ -436,7 +443,15 @@ static int mmwpas_send_mlme(void *priv,
 {
     struct umac_data *umacd = (struct umac_data *)priv;
 
-    struct mmpkt *tx_pkt = umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID7, 0, data_len);
+    /* TWT responder: if this is a (re)assoc-response to an accepted STA, append the
+     * accept TWT IE (mirror morse_driver mac.c:1861 IE insertion on assoc-resp TX).
+     * Allocate with room for it so there is no tailroom issue. */
+    uint8_t twt_ie[24];
+    size_t twt_ie_len =
+        umac_twt_responder_build_response_ie(umacd, data, data_len, twt_ie, sizeof(twt_ie));
+
+    struct mmpkt *tx_pkt =
+        umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID7, 0, data_len + twt_ie_len);
     if (tx_pkt == NULL)
     {
         MMLOG_INF("Failed to allocate mgmt frame (len %u)\n", data_len);
@@ -445,6 +460,10 @@ static int mmwpas_send_mlme(void *priv,
 
     struct mmpktview *tx_pktview = mmpkt_open(tx_pkt);
     mmpkt_append_data(tx_pktview, data, data_len);
+    if (twt_ie_len > 0)
+    {
+        mmpkt_append_data(tx_pktview, twt_ie, twt_ie_len);
+    }
     mmpkt_close(&tx_pktview);
     umac_datapath_tx_mgmt_frame_ap(umacd, tx_pkt, NULL);
 
