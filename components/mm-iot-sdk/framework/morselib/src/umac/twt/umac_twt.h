@@ -24,7 +24,12 @@
 
 #define TWT_WAKE_INTERVAL_EXPONENT_MAX_VAL (31)
 
-#define UMAC_TWT_NUM_AGREEMENTS (1)
+/* Requester (STA) uses slot 0. Responder (AP) uses this as a per-STA agreement table:
+ * one slot per associated STA that negotiated TWT, keyed by responder_peers[] (see
+ * umac_twt_data.h). Sized to the AP's max-STA cap so every associable leaf can hold TWT
+ * (mirrors Linux morse_driver, which keeps TWT per-STA); the responder logs and rejects
+ * only if it ever overflows. ~46 B/slot, so the full table is ~1 KB. */
+#define UMAC_TWT_NUM_AGREEMENTS MMWLAN_AP_MAX_STAS_LIMIT
 
 
 enum umac_twt_cmd_type
@@ -142,7 +147,9 @@ enum mmwlan_status umac_twt_install_pending_agreements(struct umac_data *umacd, 
  * The AP parses a STA's TWT request from a received (re)assoc-request, accepts
  * REQUEST/SUGGEST (rejects DEMAND/GROUPING), inserts the accept IE into the
  * (re)assoc-response, and installs the agreement to firmware once the STA is
- * authorized. Single-STA scope (agreements[0] + responder_peer). */
+ * authorized. Per-STA: each TWT-requesting STA gets its own slot in agreements[]
+ * keyed by responder_peers[] (up to UMAC_TWT_NUM_AGREEMENTS), freed on STA leave —
+ * mirrors morse_driver keeping a per-STA agreement (Linux stores it on the sta). */
 
 /* RX hook (assoc-req): parse + accept the STA's TWT request, stash the agreement. */
 void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
@@ -156,6 +163,10 @@ size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
 
 /* Install hook (STA authorized): program the firmware with the accepted agreement. */
 void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr);
+
+/* STA-leave hook: free the agreement slot owned by @sta_addr (deauth/disassoc), so the
+ * table does not leak slots as leaves come and go (mirrors Linux freeing the sta's TWT). */
+void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *sta_addr);
 
 
 enum mmwlan_status umac_twt_add_configuration(struct umac_data *umacd,

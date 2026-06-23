@@ -386,6 +386,41 @@ static const uint8_t *umac_twt_assoc_req_ies(const uint8_t *frame, size_t frame_
     return frame + fixed;
 }
 
+/* Find the responder agreement slot owned by @addr, or -1. A slot is owned iff it is
+ * non-EMPTY and its responder_peers[] entry matches @addr. */
+static int umac_twt_responder_slot_for_peer(struct umac_twt_data *data, const uint8_t *addr)
+{
+    int i;
+    for (i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state != UMAC_TWT_AGREEMENT_STATE_EMPTY &&
+            memcmp(data->responder_peers[i], addr, MMWLAN_MAC_ADDR_LEN) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Pick a slot for @sa: reuse the STA's existing slot (re-negotiation) if it has one,
+ * else the first EMPTY slot; -1 if the table is full. */
+static int umac_twt_responder_alloc_slot(struct umac_twt_data *data, const uint8_t *sa)
+{
+    int i = umac_twt_responder_slot_for_peer(data, sa);
+    if (i >= 0)
+    {
+        return i;
+    }
+    for (i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state == UMAC_TWT_AGREEMENT_STATE_EMPTY)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
                                          const uint8_t *frame, size_t frame_len)
 {
@@ -419,9 +454,20 @@ void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
         return;
     }
 
+    /* Allocate this STA's slot: reuse its slot on re-negotiation, else a free one;
+     * reject (drop the IE -> implicit reject) if the per-STA table is full. */
+    int slot = umac_twt_responder_alloc_slot(data, sa);
+    if (slot < 0)
+    {
+        MMLOG_WRN("TWT responder: agreement table full (%u slots), rejecting "
+                  "%02x:%02x:%02x:%02x:%02x:%02x\n", UMAC_TWT_NUM_AGREEMENTS,
+                  sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
+        return;
+    }
+
     /* Build the accepted agreement from the request, params as-is (Linux policy):
      * copy the request fields, set setup command to ACCEPT, clear the request bit. */
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
     memset(agr, 0, sizeof(*agr));
     agr->control            = twt_ie->control;
     agr->params.req_type    = twt_ie->request_type;
@@ -437,8 +483,9 @@ void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
     DOT11_TWT_REQUEST_TYPE_FIELD_SET_SETUP_COMMAND(agr->params.req_type,
                                                    DOT11_TWT_SETUP_CMD_ACCEPT);
     agr->state = UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION;
-    memcpy(data->responder_peer, sa, MMWLAN_MAC_ADDR_LEN);
-    MMLOG_INF("TWT responder: accepted agreement for %02x:%02x:%02x:%02x:%02x:%02x\n",
+    memcpy(data->responder_peers[slot], sa, MMWLAN_MAC_ADDR_LEN);
+    MMLOG_INF("TWT responder: accepted agreement (slot %d) for "
+              "%02x:%02x:%02x:%02x:%02x:%02x\n", slot,
               sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
 }
 
@@ -464,10 +511,14 @@ size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
         return 0;
     }
 
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
-    if (agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION ||
-        memcmp(hdr->addr1, data->responder_peer, MMWLAN_MAC_ADDR_LEN) != 0 ||
-        out_cap < sizeof(struct dot11_ie_twt))
+    /* Find the agreement for the STA this (re)assoc-response is addressed to (addr1). */
+    int slot = umac_twt_responder_slot_for_peer(data, hdr->addr1);
+    if (slot < 0 || out_cap < sizeof(struct dot11_ie_twt))
+    {
+        return 0;
+    }
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
+    if (agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION)
     {
         return 0;
     }
@@ -491,13 +542,17 @@ size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
 void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr)
 {
     struct umac_twt_data *data = umac_data_get_twt(umacd);
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
-    if (!data->responder ||
-        agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION ||
-        memcmp(sta_addr, data->responder_peer, MMWLAN_MAC_ADDR_LEN) != 0)
+    if (!data->responder)
     {
         return;
     }
+    int slot = umac_twt_responder_slot_for_peer(data, sta_addr);
+    if (slot < 0 ||
+        data->agreements[slot].state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION)
+    {
+        return;
+    }
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
     /* Try to install the agreement to the firmware (MORSE_CMD_ID_TWT_AGREEMENT_INSTALL).
      * NOTE: the embedded mm6108 firmware (verified 1.17.6 AND 1.17.8 .mbin) gates cmd 0x26
      * to interface_type==STA and returns 0xffff8000 for an AP vif — so this fails on an AP.
@@ -506,8 +561,29 @@ void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr
      * AP buffers the dozing STA's downlink (umac_ap PS path) and flushes it when the STA
      * wakes at its SP (the flush-on-wake in umac_ap_set_stad_sleep_state). So TWT leaf
      * power-save works on this firmware *without* the firmware install. (This mirrors the
-     * Linux driver, whose firmware install is gated the same way; it also serves host-side.) */
-    (void)umac_twt_install_pending_agreements(umacd, false);
+     * Linux driver, whose firmware install is gated the same way; it also serves host-side.)
+     * Install only THIS STA's slot (not the bulk installer) so multi-STA slots are independent. */
+    (void)umac_twt_install_agreement(data, slot, agr);
     /* Mark the agreement installed regardless: host-side serving is what delivers traffic. */
     agr->state = UMAC_TWT_AGREEMENT_STATE_INSTALLED;
+}
+
+void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *sta_addr)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->responder)
+    {
+        return;
+    }
+    int slot = umac_twt_responder_slot_for_peer(data, sta_addr);
+    if (slot < 0)
+    {
+        return;
+    }
+    /* state EMPTY is enum value 0, so the memset frees the slot. */
+    memset(&data->agreements[slot], 0, sizeof(data->agreements[slot]));
+    memset(data->responder_peers[slot], 0, MMWLAN_MAC_ADDR_LEN);
+    MMLOG_INF("TWT responder: freed agreement slot %d for "
+              "%02x:%02x:%02x:%02x:%02x:%02x\n", slot,
+              sta_addr[0], sta_addr[1], sta_addr[2], sta_addr[3], sta_addr[4], sta_addr[5]);
 }

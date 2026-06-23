@@ -16,11 +16,13 @@ struct umac_twt_data
 
     bool responder;
 
-    /* Responder (AP): the STA MAC that the pending/installed agreement in
-     * agreements[0] belongs to (single-STA bench scope; Linux keeps a per-STA list). */
-    uint8_t responder_peer[MMWLAN_MAC_ADDR_LEN];
-
     struct umac_twt_agreement_data agreements[UMAC_TWT_NUM_AGREEMENTS];
+
+    /* Responder (AP): owner STA MAC for each agreement slot above (parallel to
+     * agreements[]). responder_peers[i] is valid iff agreements[i].state != EMPTY.
+     * Mirrors morse_driver keeping a per-STA agreement; a vif is either requester
+     * or responder, so the requester (which only uses slot 0) leaves this unused. */
+    uint8_t responder_peers[UMAC_TWT_NUM_AGREEMENTS][MMWLAN_MAC_ADDR_LEN];
 
     struct mmwlan_twt_config_args twt_config;
 };
