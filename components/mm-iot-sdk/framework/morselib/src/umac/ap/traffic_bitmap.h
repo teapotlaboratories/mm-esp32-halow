@@ -8,7 +8,15 @@
 #include "common/common.h"
 
 
-#define MAX_SUPPORTED_AID    64
+/*
+ * 128 == two S1G TIM blocks (each block covers 64 AIDs). The single-block
+ * value was 64. Raising this lets the AP support up to 127 associated STAs
+ * (AID 1..127); the S1G TIM partial-virtual-bitmap encoder in s1g_tim.c
+ * (ie_s1g_tim_build) already emits multiple blocks generically, so only the
+ * bitmap storage size and the PVB-length tripwire assert there change with it.
+ * Stays < 512 so all AIDs remain in TIM page 0 (no page-slice handling needed).
+ */
+#define MAX_SUPPORTED_AID    128
 #define S1G_BITMAP_SUBBLOCKS ((MAX_SUPPORTED_AID + 7) / 8)
 MM_STATIC_ASSERT((MAX_SUPPORTED_AID >> 3) == S1G_BITMAP_SUBBLOCKS, "");
 

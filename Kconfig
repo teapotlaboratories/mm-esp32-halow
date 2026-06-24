@@ -31,4 +31,36 @@ menu "Wi-Fi HaLow Connection Manager"
             is disabled by default due to the extra functionality increasing the
             flash and ram requirements by a non inconsequential amount.
 
+    config HALOW_AP_MAX_STAS
+        int "Max stations the HaLow AP will accept"
+        default 20
+        range 1 127
+        help
+            Hard ceiling on associated stations for the HaLow AP (overrides the
+            morselib default of 20). Each STA costs ~912 B of host RAM for its
+            umac_sta_data plus per-STA buffers (see HALOW_STA_DATA_IN_PSRAM); the
+            per-vif TWT agreement table is sized to this too. At high counts enable
+            HALOW_STA_DATA_IN_PSRAM so this state comes from PSRAM, not internal SRAM.
+
+            Upper bound 127: morselib's S1G TIM now spans two partial-virtual-bitmap
+            blocks (MAX_SUPPORTED_AID = 128 in traffic_bitmap.h; the s1g_tim.c encoder
+            emits multiple blocks), so valid AIDs are 1..127. Values >20 are
+            experimental (untested by the vendor); 100 is the deliberately exercised
+            high-STA target for this build.
+
+    config HALOW_STA_DATA_IN_PSRAM
+        bool "Allocate per-STA AP state in PSRAM"
+        default n
+        help
+            Route per-STA AP state to PSRAM (MALLOC_CAP_SPIRAM) instead of internal
+            SRAM. Covers both (a) each associated station's umac_sta_data (~912 B,
+            heap) and (b) the per-vif TWT agreement table inside umac_data (the
+            agreements[]/responder_peers[] arrays, sized to HALOW_AP_MAX_STAS) which is
+            otherwise static .bss in internal SRAM. By default umac_sta_data stays in
+            internal SRAM (below SPIRAM_MALLOC_ALWAYSINTERNAL) and the TWT table is
+            .bss, both of which bound how many STAs fit. Enable this when
+            HALOW_AP_MAX_STAS is large so this state comes from the (much larger) PSRAM
+            pool. Allocation is strict PSRAM with no internal-SRAM fallback. Requires
+            CONFIG_SPIRAM.
+
 endmenu

@@ -5,6 +5,12 @@
 
 #include "umac_data.h"
 #include "umac_data_private.h"
+#if defined(ESP_PLATFORM)
+#include "sdkconfig.h"
+#if defined(CONFIG_HALOW_STA_DATA_IN_PSRAM) && CONFIG_HALOW_STA_DATA_IN_PSRAM
+#include "esp_heap_caps.h"
+#endif
+#endif
 #include "umac/umac_root_data.h"
 #include "umac/ap/umac_ap_data.h"
 #include "umac/config/umac_config_data.h"
@@ -32,7 +38,11 @@ static struct umac_data
     struct umac_scan_data scan;
     struct mmwlan_stats_umac_data stats;
     struct umac_supp_shim_data supp_shim;
-    struct umac_twt_data twt;
+    /* Heap pointer, not embedded: the per-STA TWT agreement table inside
+     * (agreements[UMAC_TWT_NUM_AGREEMENTS] + responder_peers[]) scales with the AP's
+     * max-STA cap, so keeping it inline would grow this static .bss object by the cap.
+     * Allocated in umac_data_init() (PSRAM when CONFIG_HALOW_STA_DATA_IN_PSRAM). */
+    struct umac_twt_data *twt;
     struct umac_root_data root;
     struct umac_wnm_sleep_data wnm_sleep;
     struct umac_offload_data offload;
@@ -124,7 +134,7 @@ struct umac_supp_shim_data *umac_data_get_supp_shim(struct umac_data *umacd)
 struct umac_twt_data *umac_data_get_twt(struct umac_data *umacd)
 {
     UMAC_DATA_SANITY_CHECK(umacd);
-    return &umacd->twt;
+    return umacd->twt;
 }
 
 struct umac_root_data *umac_data_get_root(struct umac_data *umacd)
@@ -201,12 +211,24 @@ struct umac_ap_sta_data *umac_sta_data_get_ap(struct umac_sta_data *stad)
 void umac_data_init(void)
 {
     memset(&umac_data, 0, sizeof(umac_data));
+#if defined(CONFIG_HALOW_STA_DATA_IN_PSRAM) && CONFIG_HALOW_STA_DATA_IN_PSRAM
+    /* Strictly PSRAM (no internal-SRAM fallback), matching umac_sta_data_alloc(): the
+     * TWT agreement table is the largest STA-scaled block, so a large HALOW_AP_MAX_STAS
+     * must not consume internal SRAM. Freed via mmosal_free -> heap_caps_free. */
+    umac_data.twt = (struct umac_twt_data *)heap_caps_calloc(
+        1, sizeof(*umac_data.twt), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    umac_data.twt = (struct umac_twt_data *)mmosal_calloc(1, sizeof(*umac_data.twt));
+#endif
+    MMOSAL_ASSERT(umac_data.twt != NULL);
     umac_data.root.is_initialised = true;
 }
 
 void umac_data_deinit(void)
 {
     umac_data.root.is_initialised = false;
+    mmosal_free(umac_data.twt);
+    umac_data.twt = NULL;
 }
 
 bool umac_data_is_initialised(struct umac_data *umacd)
@@ -227,7 +249,15 @@ struct umac_sta_data *umac_sta_data_alloc_static(struct umac_data *umacd)
 
 struct umac_sta_data *umac_sta_data_alloc(struct umac_data *umacd)
 {
+#if defined(CONFIG_HALOW_STA_DATA_IN_PSRAM) && CONFIG_HALOW_STA_DATA_IN_PSRAM
+    /* Per-STA state in PSRAM (Kconfig) so a large CONFIG_HALOW_AP_MAX_STAS fits without
+     * exhausting internal SRAM. Freed via mmosal_free -> vPortFree -> heap_caps_free, which
+     * handles any caps region, so the free path needs no change. */
+    struct umac_sta_data *stad =
+        (struct umac_sta_data *)heap_caps_calloc(1, sizeof(*stad), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
     struct umac_sta_data *stad = (struct umac_sta_data *)mmosal_calloc(1, sizeof(*stad));
+#endif
     if (stad != NULL)
     {
         stad->umacd = umacd;

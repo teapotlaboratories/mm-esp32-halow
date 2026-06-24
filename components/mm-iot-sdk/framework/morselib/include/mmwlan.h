@@ -41,6 +41,11 @@
 
 #include "mmpkt.h"
 
+/* On ESP-IDF, pull in Kconfig so CONFIG_HALOW_* (e.g. the AP STA limit) is visible here. */
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -2238,8 +2243,14 @@ enum mmwlan_status mmwlan_dpp_stop(void);
 /** Default limit of connected stations */
 #define MMWLAN_DEFAULT_AP_MAX_STAS (4)
 
-/** Maximum limit of connected stations */
+/** Maximum limit of connected stations. Configurable via Kconfig (CONFIG_HALOW_AP_MAX_STAS)
+ *  on ESP-IDF; defaults to the vendor's tested ceiling of 20 elsewhere. The per-vif TWT
+ *  agreement table (UMAC_TWT_NUM_AGREEMENTS) is sized to this. */
+#if defined(CONFIG_HALOW_AP_MAX_STAS)
+#define MMWLAN_AP_MAX_STAS_LIMIT (CONFIG_HALOW_AP_MAX_STAS)
+#else
 #define MMWLAN_AP_MAX_STAS_LIMIT (20)
+#endif
 
 /**
  * Enumeration of STA states.
