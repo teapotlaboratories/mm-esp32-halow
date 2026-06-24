@@ -601,6 +601,15 @@ void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *s
     {
         return;
     }
+    /* Only free a fully-INSTALLED agreement. hostapd calls sta_remove transiently during
+     * (re)association cleanup, when the slot is still PENDING_INSTALLATION (just accepted by
+     * handle_assoc_req, assoc-response not yet built). Freeing it then would drop the ACCEPT
+     * IE and the STA would never establish TWT. A real departure happens post-authorization,
+     * when the slot is INSTALLED — that is the only case we free. */
+    if (data->agreements[slot].state != UMAC_TWT_AGREEMENT_STATE_INSTALLED)
+    {
+        return;
+    }
     /* state EMPTY is enum value 0, so the memset frees the slot. */
     memset(&data->agreements[slot], 0, sizeof(data->agreements[slot]));
     memset(data->responder_peers[slot], 0, MMWLAN_MAC_ADDR_LEN);

@@ -539,8 +539,12 @@ static int mmwpas_sta_remove(void *priv, const u8 *addr)
 {
     struct umac_data *umacd = (struct umac_data *)priv;
     MMLOG_INF("Rem STA " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(addr));
-    /* Free this STA's TWT agreement slot (if any) so the per-STA table doesn't leak as
-     * leaves come and go (mirror Linux freeing the sta's TWT on removal). */
+    /* Free this STA's TWT agreement on departure so the per-STA table doesn't leak. NOTE:
+     * hostapd also calls sta_remove transiently during (re)association cleanup, which would
+     * wipe the slot handle_assoc_req just set (state PENDING_INSTALLATION) before the
+     * assoc-response is built — losing the ACCEPT IE so the STA never establishes TWT.
+     * umac_twt_responder_free_agreement only frees an INSTALLED agreement, so the transient
+     * assoc-time removal is ignored and only a real (post-authorized) departure frees it. */
     umac_twt_responder_free_agreement(umacd, addr);
     enum mmwlan_status status = umac_ap_remove_sta(umacd, addr);
     if (status == MMWLAN_SUCCESS)
