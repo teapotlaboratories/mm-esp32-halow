@@ -427,13 +427,13 @@ void ie_s1g_tim_build(struct consbuf *buf,
 
     uint8_t pvb[MAX_SUPPORTED_PVB_LEN] = {};
     /*
-     * 20 == two TIM blocks (MAX_SUPPORTED_AID 128); was 10 for a single block.
-     * The block loop below is already generic over MAX_ENCODED_BLOCKS, so this
-     * assert is only a tripwire: if MAX_SUPPORTED_AID changes again, re-confirm
-     * the per-block offset (5-bit field, <=31) and bitmap_control page index
-     * still hold before bumping this value.
+     * 40 == four TIM blocks (MAX_SUPPORTED_AID 256); was 10 (one block) then
+     * 20 (two). The block loop below is already generic over MAX_ENCODED_BLOCKS,
+     * so this assert is only a tripwire: if MAX_SUPPORTED_AID changes again,
+     * re-confirm the per-block offset (5-bit field, <=31; blocks 0..3 used here)
+     * and bitmap_control page index still hold before bumping this value.
      */
-    MM_STATIC_ASSERT(MAX_SUPPORTED_PVB_LEN == 20, "Review the TIM logic if changing this limit");
+    MM_STATIC_ASSERT(MAX_SUPPORTED_PVB_LEN == 40, "Review the TIM logic if changing this limit");
 
     size_t pvb_len = 0;
 

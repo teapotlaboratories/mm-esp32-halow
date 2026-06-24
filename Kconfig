@@ -34,7 +34,7 @@ menu "Wi-Fi HaLow Connection Manager"
     config HALOW_AP_MAX_STAS
         int "Max stations the HaLow AP will accept"
         default 20
-        range 1 127
+        range 1 255
         help
             Hard ceiling on associated stations for the HaLow AP (overrides the
             morselib default of 20). Each STA costs ~912 B of host RAM for its
@@ -42,11 +42,13 @@ menu "Wi-Fi HaLow Connection Manager"
             per-vif TWT agreement table is sized to this too. At high counts enable
             HALOW_STA_DATA_IN_PSRAM so this state comes from PSRAM, not internal SRAM.
 
-            Upper bound 127: morselib's S1G TIM now spans two partial-virtual-bitmap
-            blocks (MAX_SUPPORTED_AID = 128 in traffic_bitmap.h; the s1g_tim.c encoder
-            emits multiple blocks), so valid AIDs are 1..127. Values >20 are
-            experimental (untested by the vendor); 100 is the deliberately exercised
-            high-STA target for this build.
+            Upper bound 255: morselib's S1G TIM spans four partial-virtual-bitmap
+            blocks (MAX_SUPPORTED_AID = 256 in traffic_bitmap.h; the s1g_tim.c encoder
+            emits multiple blocks), so valid AIDs are 1..255. 255 is also the ceiling
+            of the public uint8_t mmwlan_ap_args.max_stas field; going higher needs
+            that widened to uint16_t. Values >20 are experimental (untested by the
+            vendor) and the MM6108 firmware's true concurrent-STA capacity is its own
+            (unpublished) limit; 255 is exercised here only as a build/structural test.
 
     config HALOW_STA_DATA_IN_PSRAM
         bool "Allocate per-STA AP state in PSRAM"
