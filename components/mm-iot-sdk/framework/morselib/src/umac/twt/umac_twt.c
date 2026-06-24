@@ -10,8 +10,15 @@
 #include "umac/interface/umac_interface.h"
 #include "umac/ies/twt_ie.h"
 #include "dot11/dot11.h"
+#include "dot11/dot11_frames.h"
+#include "umac/frames/action.h"
+#include "umac/datapath/umac_datapath.h"
 #include "mmlog.h"
 #include <string.h>
+
+/* S1G unprotected action codes for TWT (mirror Linux WLAN_S1G_TWT_SETUP/TEARDOWN). */
+#define UMAC_S1G_ACTION_TWT_SETUP    (6)
+#define UMAC_S1G_ACTION_TWT_TEARDOWN (7)
 
 static uint32_t umac_twt_calculate_wake_duration(uint32_t wake_duration)
 {
@@ -386,6 +393,104 @@ static const uint8_t *umac_twt_assoc_req_ies(const uint8_t *frame, size_t frame_
     return frame + fixed;
 }
 
+/* Find the responder agreement slot owned by @addr, or -1. A slot is owned iff it is
+ * non-EMPTY and its responder_peers[] entry matches @addr. */
+static int umac_twt_responder_slot_for_peer(struct umac_twt_data *data, const uint8_t *addr)
+{
+    int i;
+    for (i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state != UMAC_TWT_AGREEMENT_STATE_EMPTY &&
+            memcmp(data->responder_peers[i], addr, MMWLAN_MAC_ADDR_LEN) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Pick a slot for @sa: reuse the STA's existing slot (re-negotiation) if it has one,
+ * else the first EMPTY slot; -1 if the table is full. */
+static int umac_twt_responder_alloc_slot(struct umac_twt_data *data, const uint8_t *sa)
+{
+    int i = umac_twt_responder_slot_for_peer(data, sa);
+    if (i >= 0)
+    {
+        return i;
+    }
+    for (i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state == UMAC_TWT_AGREEMENT_STATE_EMPTY)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Fill a dot11_ie_twt from a stored (already ACCEPT-form) agreement. */
+static void umac_twt_responder_fill_ie(const struct umac_twt_agreement_data *agr,
+                                       struct dot11_ie_twt *ie)
+{
+    memset(ie, 0, sizeof(*ie));
+    ie->header.element_id = DOT11_IE_TWT;
+    ie->header.length     = sizeof(*ie) - sizeof(ie->header);
+    ie->control           = agr->control;
+    ie->request_type      = agr->params.req_type;
+    ie->twt               = agr->params.twt;
+    ie->min_twt_duration  = agr->params.min_twt_dur;
+    ie->mantissa          = agr->params.mantissa;
+    ie->channel           = agr->params.channel;
+}
+
+/* Apply the accept policy to a received TWT request IE from @sa and, if accepted,
+ * allocate/refresh that STA's slot in ACCEPT form. Returns the slot index, or -1 if
+ * rejected (DEMAND/GROUPING) or the table is full. Shared by the assoc-IE path and the
+ * mid-session TWT-Setup action-frame path. */
+static int umac_twt_responder_accept_ie(struct umac_twt_data *data,
+                                        const struct dot11_ie_twt *twt_ie, const uint8_t *sa)
+{
+    /* Accept REQUEST and SUGGEST; reject DEMAND and GROUPING (mirror
+     * morse_twt_enter_state_consider_*). */
+    uint16_t setup_cmd = dot11_twt_request_type_field_get_setup_command(twt_ie->request_type);
+    if (setup_cmd != DOT11_TWT_SETUP_CMD_REQUEST && setup_cmd != DOT11_TWT_SETUP_CMD_SUGGEST)
+    {
+        MMLOG_INF("TWT responder: setup_cmd %u not REQUEST/SUGGEST, rejecting\n", setup_cmd);
+        return -1;
+    }
+
+    /* Reuse the STA's slot on re-negotiation, else a free one; -1 if the table is full. */
+    int slot = umac_twt_responder_alloc_slot(data, sa);
+    if (slot < 0)
+    {
+        MMLOG_WRN("TWT responder: agreement table full (%u slots), rejecting "
+                  "%02x:%02x:%02x:%02x:%02x:%02x\n", UMAC_TWT_NUM_AGREEMENTS,
+                  sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
+        return -1;
+    }
+
+    /* Build the accepted agreement: copy the request params as-is, set setup_cmd=ACCEPT
+     * and clear the request bit (mirror morse_twt_send_accept -> morse_twt_set_command).
+     * The ACCEPT-form agreement feeds both the response IE and the firmware install. */
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
+    memset(agr, 0, sizeof(*agr));
+    agr->control            = twt_ie->control;
+    agr->params.req_type    = twt_ie->request_type;
+    agr->params.twt         = twt_ie->twt;
+    agr->params.min_twt_dur = twt_ie->min_twt_duration;
+    agr->params.mantissa    = twt_ie->mantissa;
+    agr->params.channel     = twt_ie->channel;
+    DOT11_TWT_REQUEST_TYPE_FIELD_SET_REQUEST(agr->params.req_type, 0);
+    DOT11_TWT_REQUEST_TYPE_FIELD_SET_SETUP_COMMAND(agr->params.req_type,
+                                                   DOT11_TWT_SETUP_CMD_ACCEPT);
+    agr->state = UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION;
+    memcpy(data->responder_peers[slot], sa, MMWLAN_MAC_ADDR_LEN);
+    MMLOG_INF("TWT responder: accepted agreement (slot %d) for "
+              "%02x:%02x:%02x:%02x:%02x:%02x\n", slot,
+              sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
+    return slot;
+}
+
 void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
                                          const uint8_t *frame, size_t frame_len)
 {
@@ -409,37 +514,9 @@ void umac_twt_responder_handle_assoc_req(struct umac_data *umacd,
         return;
     }
 
-    /* Accept policy (mirror morse_twt_enter_state_consider_*): accept REQUEST and
-     * SUGGEST; reject DEMAND and GROUPING (we simply omit the response IE -> the STA
-     * sees no agreement, an implicit reject). */
-    uint16_t setup_cmd = dot11_twt_request_type_field_get_setup_command(twt_ie->request_type);
-    if (setup_cmd != DOT11_TWT_SETUP_CMD_REQUEST && setup_cmd != DOT11_TWT_SETUP_CMD_SUGGEST)
-    {
-        MMLOG_INF("TWT responder: setup_cmd %u not REQUEST/SUGGEST, rejecting\n", setup_cmd);
-        return;
-    }
-
-    /* Build the accepted agreement from the request, params as-is (Linux policy):
-     * copy the request fields, set setup command to ACCEPT, clear the request bit. */
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
-    memset(agr, 0, sizeof(*agr));
-    agr->control            = twt_ie->control;
-    agr->params.req_type    = twt_ie->request_type;
-    agr->params.twt         = twt_ie->twt;
-    agr->params.min_twt_dur = twt_ie->min_twt_duration;
-    agr->params.mantissa    = twt_ie->mantissa;
-    agr->params.channel     = twt_ie->channel;
-    /* Accept: setup_cmd=ACCEPT, clear the request bit (mirror morse_driver
-     * morse_twt_send_accept -> morse_twt_set_command). The same ACCEPT-form agreement
-     * feeds both the response IE and the firmware install (morse_twt_initialise_agreement),
-     * exactly as Linux does. */
-    DOT11_TWT_REQUEST_TYPE_FIELD_SET_REQUEST(agr->params.req_type, 0);
-    DOT11_TWT_REQUEST_TYPE_FIELD_SET_SETUP_COMMAND(agr->params.req_type,
-                                                   DOT11_TWT_SETUP_CMD_ACCEPT);
-    agr->state = UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION;
-    memcpy(data->responder_peer, sa, MMWLAN_MAC_ADDR_LEN);
-    MMLOG_INF("TWT responder: accepted agreement for %02x:%02x:%02x:%02x:%02x:%02x\n",
-              sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
+    /* Accept + stash the agreement; the ACCEPT IE is spliced into the assoc-response
+     * later by umac_twt_responder_build_response_ie. */
+    (void)umac_twt_responder_accept_ie(data, twt_ie, sa);
 }
 
 size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
@@ -464,40 +541,39 @@ size_t umac_twt_responder_build_response_ie(struct umac_data *umacd,
         return 0;
     }
 
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
-    if (agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION ||
-        memcmp(hdr->addr1, data->responder_peer, MMWLAN_MAC_ADDR_LEN) != 0 ||
-        out_cap < sizeof(struct dot11_ie_twt))
+    /* Find the agreement for the STA this (re)assoc-response is addressed to (addr1). */
+    int slot = umac_twt_responder_slot_for_peer(data, hdr->addr1);
+    if (slot < 0 || out_cap < sizeof(struct dot11_ie_twt))
+    {
+        return 0;
+    }
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
+    if (agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION)
     {
         return 0;
     }
 
-    struct dot11_ie_twt *ie = (struct dot11_ie_twt *)out;
-    memset(ie, 0, sizeof(*ie));
-    ie->header.element_id = DOT11_IE_TWT;
-    ie->header.length     = sizeof(*ie) - sizeof(ie->header);
-    ie->control           = agr->control;
-    ie->request_type      = agr->params.req_type;
-    ie->twt               = agr->params.twt;
-    ie->min_twt_duration  = agr->params.min_twt_dur;
-    ie->mantissa          = agr->params.mantissa;
-    ie->channel           = agr->params.channel;
-    /* The stored agreement is already ACCEPT-form (set in handle_assoc_req), so the IE
-     * carries setup_cmd=ACCEPT to the STA — same agreement as the firmware install. */
+    /* The stored agreement is already ACCEPT-form, so the IE carries setup_cmd=ACCEPT
+     * to the STA — same agreement as the firmware install. */
+    umac_twt_responder_fill_ie(agr, (struct dot11_ie_twt *)out);
     MMLOG_INF("TWT responder: inserting accept IE into assoc-resp\n");
-    return sizeof(*ie);
+    return sizeof(struct dot11_ie_twt);
 }
 
 void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr)
 {
     struct umac_twt_data *data = umac_data_get_twt(umacd);
-    struct umac_twt_agreement_data *agr = &data->agreements[0];
-    if (!data->responder ||
-        agr->state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION ||
-        memcmp(sta_addr, data->responder_peer, MMWLAN_MAC_ADDR_LEN) != 0)
+    if (!data->responder)
     {
         return;
     }
+    int slot = umac_twt_responder_slot_for_peer(data, sta_addr);
+    if (slot < 0 ||
+        data->agreements[slot].state != UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION)
+    {
+        return;
+    }
+    struct umac_twt_agreement_data *agr = &data->agreements[slot];
     /* Try to install the agreement to the firmware (MORSE_CMD_ID_TWT_AGREEMENT_INSTALL).
      * NOTE: the embedded mm6108 firmware (verified 1.17.6 AND 1.17.8 .mbin) gates cmd 0x26
      * to interface_type==STA and returns 0xffff8000 for an AP vif — so this fails on an AP.
@@ -506,8 +582,139 @@ void umac_twt_responder_install(struct umac_data *umacd, const uint8_t *sta_addr
      * AP buffers the dozing STA's downlink (umac_ap PS path) and flushes it when the STA
      * wakes at its SP (the flush-on-wake in umac_ap_set_stad_sleep_state). So TWT leaf
      * power-save works on this firmware *without* the firmware install. (This mirrors the
-     * Linux driver, whose firmware install is gated the same way; it also serves host-side.) */
-    (void)umac_twt_install_pending_agreements(umacd, false);
+     * Linux driver, whose firmware install is gated the same way; it also serves host-side.)
+     * Install only THIS STA's slot (not the bulk installer) so multi-STA slots are independent. */
+    (void)umac_twt_install_agreement(data, slot, agr);
     /* Mark the agreement installed regardless: host-side serving is what delivers traffic. */
     agr->state = UMAC_TWT_AGREEMENT_STATE_INSTALLED;
+}
+
+void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *sta_addr)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->responder)
+    {
+        return;
+    }
+    int slot = umac_twt_responder_slot_for_peer(data, sta_addr);
+    if (slot < 0)
+    {
+        return;
+    }
+    /* Only free a fully-INSTALLED agreement. hostapd calls sta_remove transiently during
+     * (re)association cleanup, when the slot is still PENDING_INSTALLATION (just accepted by
+     * handle_assoc_req, assoc-response not yet built). Freeing it then would drop the ACCEPT
+     * IE and the STA would never establish TWT. A real departure happens post-authorization,
+     * when the slot is INSTALLED — that is the only case we free. */
+    if (data->agreements[slot].state != UMAC_TWT_AGREEMENT_STATE_INSTALLED)
+    {
+        return;
+    }
+    /* state EMPTY is enum value 0, so the memset frees the slot. */
+    memset(&data->agreements[slot], 0, sizeof(data->agreements[slot]));
+    memset(data->responder_peers[slot], 0, MMWLAN_MAC_ADDR_LEN);
+    MMLOG_INF("TWT responder: freed agreement slot %d for "
+              "%02x:%02x:%02x:%02x:%02x:%02x\n", slot,
+              sta_addr[0], sta_addr[1], sta_addr[2], sta_addr[3], sta_addr[4], sta_addr[5]);
+}
+
+/* Build and TX a TWT Setup response action frame carrying the ACCEPT IE for @slot back
+ * to @stad (mid-session negotiation, mirroring morse_mac_send_twt_action_frame). */
+static void umac_twt_responder_tx_setup_response(struct umac_data *umacd,
+                                                 struct umac_sta_data *stad,
+                                                 uint8_t dialog_token, int slot)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    /* Action body: [category][action][dialog_token][TWT IE]. */
+    uint8_t buf[3 + sizeof(struct dot11_ie_twt)];
+    buf[0] = DOT11_ACTION_CATEGORY_S1G_UNPROTECTED;
+    buf[1] = UMAC_S1G_ACTION_TWT_SETUP;
+    buf[2] = dialog_token;
+    umac_twt_responder_fill_ie(&data->agreements[slot], (struct dot11_ie_twt *)&buf[3]);
+
+    struct frame_data_action params = {
+        .bssid            = umac_sta_data_peek_bssid(stad),
+        .dst_address      = umac_sta_data_peek_peer_addr(stad),
+        .src_address      = umac_interface_peek_mac_addr(stad),
+        .action_field     = buf,
+        .action_field_len = sizeof(buf),
+    };
+    enum mmwlan_status st =
+        umac_datapath_build_and_tx_mgmt_frame(stad, frame_action_build, &params);
+    if (st != MMWLAN_SUCCESS)
+    {
+        MMLOG_WRN("TWT responder: setup-response TX failed (%d)\n", st);
+        return;
+    }
+    /* No AUTHORIZED event mid-session, so install + mark INSTALLED here (fw install is
+     * gated off on an AP vif; host-side serving delivers traffic — same as the assoc
+     * path's responder_install). */
+    (void)umac_twt_install_agreement(data, slot, &data->agreements[slot]);
+    data->agreements[slot].state = UMAC_TWT_AGREEMENT_STATE_INSTALLED;
+    MMLOG_INF("TWT responder: sent TWT Setup ACCEPT (slot %d)\n", slot);
+}
+
+void umac_twt_responder_handle_action(struct umac_data *umacd, struct umac_sta_data *stad,
+                                      const uint8_t *frame, size_t frame_len)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->responder || stad == NULL || frame == NULL)
+    {
+        return;
+    }
+    const struct dot11_action *act = (const struct dot11_action *)frame;
+    /* Need at least the fixed header + category + action_code. */
+    if (frame_len < sizeof(*act) + 1 ||
+        act->field.category != DOT11_ACTION_CATEGORY_S1G_UNPROTECTED)
+    {
+        return;
+    }
+    uint8_t action_code = act->field.action_details[0];
+    const uint8_t *addr = umac_sta_data_peek_peer_addr(stad);
+    if (addr == NULL)
+    {
+        return;
+    }
+
+    switch (action_code)
+    {
+        case UMAC_S1G_ACTION_TWT_TEARDOWN:
+            /* Explicit teardown: free this STA's agreement. The per-STA table holds one
+             * agreement per STA, so the teardown flow id is implicit (mirror morse_driver
+             * morse_mac_process_rx_twt_mgmt, which removes the agreement on teardown). */
+            MMLOG_INF("TWT responder: teardown action from "
+                      "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                      addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+            umac_twt_responder_free_agreement(umacd, addr);
+            break;
+
+        case UMAC_S1G_ACTION_TWT_SETUP:
+        {
+            /* Mid-session setup: [category][action][dialog_token][TWT IE]. Accept it like
+             * the assoc-IE path, then TX a TWT Setup response action frame with the ACCEPT
+             * IE (mirror morse_mac_process_rx_twt_mgmt + morse_mac_send_twt_action_frame). */
+            const uint8_t *details = act->field.action_details;
+            if (frame_len < sizeof(*act) + 2 + sizeof(struct dot11_ie_twt))
+            {
+                MMLOG_WRN("TWT responder: setup action frame too short\n");
+                break;
+            }
+            uint8_t dialog_token = details[1];
+            const struct dot11_ie_twt *req_ie = (const struct dot11_ie_twt *)&details[2];
+            if (req_ie->header.element_id != DOT11_IE_TWT)
+            {
+                break;
+            }
+            int slot = umac_twt_responder_accept_ie(data, req_ie, addr);
+            if (slot < 0)
+            {
+                break; /* rejected or table full (accept_ie logged it) */
+            }
+            umac_twt_responder_tx_setup_response(umacd, stad, dialog_token, slot);
+            break;
+        }
+
+        default:
+            break;
+    }
 }
