@@ -1679,6 +1679,73 @@ enum mmwlan_status mmwlan_twt_add_configuration(
     return umac_twt_add_configuration(umacd, twt_config_args);
 }
 
+static void umac_twt_setup_request_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(evt);
+    umac_twt_requester_tx_setup(umacd);
+}
+
+static void umac_twt_teardown_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(evt);
+    umac_twt_requester_tx_teardown(umacd);
+}
+
+enum mmwlan_status mmwlan_twt_setup_request(const struct mmwlan_twt_config_args *twt_config_args)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+
+    if (!umac_data_is_initialised(umacd))
+    {
+        return MMWLAN_NOT_INITIALIZED;
+    }
+    /* Mid-session negotiation: the STA must already be associated. */
+    if (umac_connection_get_state(umacd) != MMWLAN_STA_CONNECTED)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+    if (twt_config_args->twt_min_wake_duration_us >= twt_config_args->twt_wake_interval_us)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    /* Stage the agreement (app context, as mmwlan_twt_add_configuration does), then TX the
+     * TWT-Setup action frame from the umac task (matching the responder's TX context). */
+    enum mmwlan_status status = umac_twt_add_configuration(umacd, twt_config_args);
+    if (status != MMWLAN_SUCCESS)
+    {
+        return status;
+    }
+
+    struct umac_evt evt = UMAC_EVT_INIT(umac_twt_setup_request_evt_handler);
+    if (!umac_core_evt_queue(umacd, &evt))
+    {
+        return MMWLAN_ERROR;
+    }
+    return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status mmwlan_twt_teardown(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+
+    if (!umac_data_is_initialised(umacd))
+    {
+        return MMWLAN_NOT_INITIALIZED;
+    }
+    if (umac_connection_get_state(umacd) != MMWLAN_STA_CONNECTED)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+
+    struct umac_evt evt = UMAC_EVT_INIT(umac_twt_teardown_evt_handler);
+    if (!umac_core_evt_queue(umacd, &evt))
+    {
+        return MMWLAN_ERROR;
+    }
+    return MMWLAN_SUCCESS;
+}
+
 static void umac_morse_stats_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
 {
     MM_UNUSED(umacd);

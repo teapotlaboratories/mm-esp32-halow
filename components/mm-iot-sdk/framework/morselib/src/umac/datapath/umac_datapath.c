@@ -255,8 +255,12 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
             break;
 
         case DOT11_ACTION_CATEGORY_S1G_UNPROTECTED:
-            /* TWT Setup/Teardown action frames (AP responder). */
+            /* TWT Setup/Teardown action frames. The AP responder and the STA requester
+             * each act on their own role; the other call is a no-op for the wrong role. */
             umac_twt_responder_handle_action(umacd, stad,
+                                             mmpkt_get_data_start(rxbufview),
+                                             mmpkt_get_data_length(rxbufview));
+            umac_twt_requester_handle_action(umacd,
                                              mmpkt_get_data_start(rxbufview),
                                              mmpkt_get_data_length(rxbufview));
             break;
