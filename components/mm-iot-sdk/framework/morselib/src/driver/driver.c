@@ -95,6 +95,53 @@ int mmprobe_rm_iface_raw(uint16_t vif_id)
     return mmdrv_rm_if(vif_id);
 }
 
+/* Probe: add an interface of the given firmware type, and on firmware success
+ * immediately remove the vif the firmware assigned — so the probe is repeatable
+ * across several types without exhausting interface slots. This isolates "type
+ * recognized?" from "slot available?". Mirrors mmprobe_add_iface_raw but reads
+ * resp.hdr.vif_id (as mmdrv_add_if does) to clean up after itself. */
+int mmprobe_iface_type_supported(uint32_t iface_type, uint32_t *fw_status_out)
+{
+    if (fw_status_out)
+    {
+        *fw_status_out = 0;
+    }
+
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    /* Locally-administered, unicast MAC distinct from the device MAC. */
+    static const uint8_t probe_addr[6] = { 0x02, 0x00, 0x00, 0xde, 0xad, 0xbf };
+
+    struct morse_cmd_resp_add_interface resp = { 0 };
+    struct morse_cmd_req_add_interface cmd = MORSE_COMMAND_INIT(cmd,
+                                                                MORSE_CMD_ID_ADD_INTERFACE,
+                                                                UNKNOWN_VIF_ID,
+                                                                .interface_type =
+                                                                    htole32(iface_type));
+    memcpy(cmd.addr.octet, probe_addr, sizeof(cmd.addr.octet));
+
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    uint32_t fw_status = (ret == 0) ? le32toh(resp.status) : 0;
+    if (fw_status_out)
+    {
+        *fw_status_out = fw_status;
+    }
+
+    /* Firmware accepted and assigned a vif — remove it so we leave no trace. */
+    if (ret == 0 && fw_status == 0)
+    {
+        (void)mmdrv_rm_if(le16toh(resp.hdr.vif_id));
+    }
+    return ret;
+}
+
 /* Probe: dump the firmware capability words this blob advertises. The
  * firmware_flags bitmap and morse_caps flags come straight off the chip's
  * host table during init, so this documents exactly what the loaded .mbin
