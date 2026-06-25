@@ -1401,6 +1401,28 @@ enum mmwlan_status mmwlan_twt_add_configuration(
     const struct mmwlan_twt_config_args *twt_config_args);
 
 /**
+ * Negotiate a TWT agreement mid-session via a TWT-Setup action frame (requester/STA).
+ *
+ * Unlike @ref mmwlan_twt_add_configuration (which negotiates in the (re)association IEs at
+ * join time), this sets up TWT *after* association without re-associating — the
+ * association-preserving way to establish or re-tune a schedule. The STA must already be
+ * connected. On the AP's accept, the agreement is installed automatically.
+ *
+ * @param twt_config_args TWT configuration arguments @ref mmwlan_twt_config_args.
+ * @return @ref MMWLAN_SUCCESS on success, else an appropriate error code.
+ */
+enum mmwlan_status mmwlan_twt_setup_request(const struct mmwlan_twt_config_args *twt_config_args);
+
+/**
+ * Tear down the STA's current TWT agreement mid-session via a TWT-Teardown action frame.
+ *
+ * Cancels the agreement without disassociating; the AP frees its side on receipt.
+ *
+ * @return @ref MMWLAN_SUCCESS on success, else an appropriate error code.
+ */
+enum mmwlan_status mmwlan_twt_teardown(void);
+
+/**
  * Gets the station's AID
  *
  * @return AID of station, or 0 if not associated

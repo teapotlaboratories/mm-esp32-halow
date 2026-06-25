@@ -175,6 +175,15 @@ void umac_twt_responder_free_agreement(struct umac_data *umacd, const uint8_t *s
 void umac_twt_responder_handle_action(struct umac_data *umacd, struct umac_sta_data *stad,
                                       const uint8_t *frame, size_t frame_len);
 
+/* TWT requester (STA): mid-session action-frame negotiation. _tx_setup TXes a TWT-Setup
+ * REQUEST action for the pending agreement; _tx_teardown TXes a TWT-Teardown and frees the
+ * local slot; _handle_action processes the AP's Setup-response (ACCEPT) and installs it.
+ * The TX functions run on the umac task (queued from the public mmwlan_twt_* APIs). */
+void umac_twt_requester_tx_setup(struct umac_data *umacd);
+void umac_twt_requester_tx_teardown(struct umac_data *umacd);
+void umac_twt_requester_handle_action(struct umac_data *umacd, const uint8_t *frame,
+                                      size_t frame_len);
+
 
 enum mmwlan_status umac_twt_add_configuration(struct umac_data *umacd,
                                               const struct mmwlan_twt_config_args *twt_config_args);

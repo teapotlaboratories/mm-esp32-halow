@@ -718,3 +718,170 @@ void umac_twt_responder_handle_action(struct umac_data *umacd, struct umac_sta_d
             break;
     }
 }
+
+/* --- TWT requester: mid-session action-frame negotiation (STA side) ---
+ * Mirrors morse_driver morse_mac_send_twt_action_frame (TX) + the requester half of
+ * morse_mac_process_rx_twt_mgmt (RX of the AP's accept). The STA configures an
+ * agreement (umac_twt_add_configuration), TXes a TWT-Setup action, and on the AP's
+ * accept response installs it to firmware (cmd 0x26, allowed on STA vifs). TX runs on
+ * the umac task (queued event), matching the responder's context. */
+
+void umac_twt_requester_tx_setup(struct umac_data *umacd)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->requester)
+    {
+        MMLOG_WRN("TWT setup action on a non-requester vif\n");
+        return;
+    }
+    /* add_configuration only *stored* the config; the assoc path builds the agreement via a
+     * CONFIGURE command (morse_twt_conf). For a mid-session action-frame setup we issue it
+     * here so there is a PENDING_RESPONSE agreement to negotiate. */
+    const struct mmwlan_twt_config_args *cfg = umac_twt_get_config(umacd);
+    uint8_t setup_cmd = DOT11_TWT_SETUP_CMD_REQUEST;
+    if (cfg->twt_setup_command == MMWLAN_TWT_SETUP_SUGGEST)
+    {
+        setup_cmd = DOT11_TWT_SETUP_CMD_SUGGEST;
+    }
+    else if (cfg->twt_setup_command == MMWLAN_TWT_SETUP_DEMAND)
+    {
+        setup_cmd = DOT11_TWT_SETUP_CMD_DEMAND;
+    }
+    struct umac_twt_command cmd = {
+        .type                 = UMAC_TWT_CMD_TYPE_CONFIGURE,
+        .wake_interval_us     = cfg->twt_wake_interval_us,
+        .min_wake_duration_us = cfg->twt_min_wake_duration_us,
+        .twt_setup_command    = setup_cmd,
+    };
+    if (umac_twt_handle_command(umacd, &cmd) != MMWLAN_SUCCESS)
+    {
+        MMLOG_WRN("TWT requester: mid-session configure failed\n");
+        return;
+    }
+    int slot = -1;
+    for (size_t i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state == UMAC_TWT_AGREEMENT_STATE_PENDING_RESPONSE)
+        {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0)
+    {
+        MMLOG_WRN("TWT requester: no pending agreement to set up\n");
+        return;
+    }
+    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
+    if (stad == NULL)
+    {
+        return;
+    }
+    /* Action body: [category][action][dialog_token][TWT request IE]. fill_ie copies the
+     * agreement's params, which carry the REQUEST/SUGGEST setup command for a requester. */
+    uint8_t buf[3 + sizeof(struct dot11_ie_twt)];
+    buf[0] = DOT11_ACTION_CATEGORY_S1G_UNPROTECTED;
+    buf[1] = UMAC_S1G_ACTION_TWT_SETUP;
+    buf[2] = 1; /* dialog token */
+    umac_twt_responder_fill_ie(&data->agreements[slot], (struct dot11_ie_twt *)&buf[3]);
+
+    struct frame_data_action params = {
+        .bssid            = umac_sta_data_peek_bssid(stad),
+        .dst_address      = umac_sta_data_peek_peer_addr(stad),
+        .src_address      = umac_interface_peek_mac_addr(stad),
+        .action_field     = buf,
+        .action_field_len = sizeof(buf),
+    };
+    enum mmwlan_status st =
+        umac_datapath_build_and_tx_mgmt_frame(stad, frame_action_build, &params);
+    if (st != MMWLAN_SUCCESS)
+    {
+        MMLOG_WRN("TWT requester: setup action TX failed (%d)\n", st);
+        return;
+    }
+    MMLOG_INF("TWT requester: sent TWT Setup REQUEST action (slot %d)\n", slot);
+}
+
+void umac_twt_requester_tx_teardown(struct umac_data *umacd)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->requester)
+    {
+        return;
+    }
+    int slot = -1;
+    for (size_t i = 0; i < UMAC_TWT_NUM_AGREEMENTS; i++)
+    {
+        if (data->agreements[i].state != UMAC_TWT_AGREEMENT_STATE_EMPTY)
+        {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0)
+    {
+        MMLOG_WRN("TWT requester: no agreement to tear down\n");
+        return;
+    }
+    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
+    if (stad == NULL)
+    {
+        return;
+    }
+    uint8_t flow_id =
+        dot11_twt_request_type_field_get_flow_identifier(data->agreements[slot].params.req_type);
+    /* Teardown action body: [category][action][TWT Flow field]. */
+    uint8_t buf[3];
+    buf[0] = DOT11_ACTION_CATEGORY_S1G_UNPROTECTED;
+    buf[1] = UMAC_S1G_ACTION_TWT_TEARDOWN;
+    buf[2] = flow_id;
+
+    struct frame_data_action params = {
+        .bssid            = umac_sta_data_peek_bssid(stad),
+        .dst_address      = umac_sta_data_peek_peer_addr(stad),
+        .src_address      = umac_interface_peek_mac_addr(stad),
+        .action_field     = buf,
+        .action_field_len = sizeof(buf),
+    };
+    (void)umac_datapath_build_and_tx_mgmt_frame(stad, frame_action_build, &params);
+    /* Free the local slot so a later setup can reuse it. The AP frees its side on RX of
+     * this teardown; firmware-side remove (cmd 0x27) is not wired here. */
+    data->agreements[slot].state = UMAC_TWT_AGREEMENT_STATE_EMPTY;
+    MMLOG_INF("TWT requester: sent TWT Teardown action (flow %u)\n", flow_id);
+}
+
+void umac_twt_requester_handle_action(struct umac_data *umacd, const uint8_t *frame,
+                                      size_t frame_len)
+{
+    struct umac_twt_data *data = umac_data_get_twt(umacd);
+    if (!data->requester || frame == NULL)
+    {
+        return;
+    }
+    const struct dot11_action *act = (const struct dot11_action *)frame;
+    if (frame_len < sizeof(*act) + 1 ||
+        act->field.category != DOT11_ACTION_CATEGORY_S1G_UNPROTECTED)
+    {
+        return;
+    }
+    /* The requester only acts on the AP's TWT-Setup *response*. */
+    if (act->field.action_details[0] != UMAC_S1G_ACTION_TWT_SETUP)
+    {
+        return;
+    }
+    /* [category][action][dialog_token][TWT IE (ACCEPT)]. */
+    if (frame_len < sizeof(*act) + 2 + sizeof(struct dot11_ie_twt))
+    {
+        return;
+    }
+    const struct dot11_ie_twt *ie = (const struct dot11_ie_twt *)&act->field.action_details[2];
+    if (ie->header.element_id != DOT11_IE_TWT)
+    {
+        return;
+    }
+    if (umac_twt_process_ie(umacd, ie) == MMWLAN_SUCCESS)
+    {
+        (void)umac_twt_install_pending_agreements(umacd, false);
+        MMLOG_INF("TWT requester: Setup response accepted, agreement installed\n");
+    }
+}
