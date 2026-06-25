@@ -304,6 +304,23 @@ int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_typ
 int mmprobe_add_iface_raw(uint32_t iface_type, uint32_t *fw_status_out);
 
 /**
+ * Probe: test whether the firmware recognizes an interface type, cleanly.
+ * Sends ADD_INTERFACE(iface_type); on firmware success it captures the
+ * assigned vif_id from the response and immediately REMOVES it, so the probe
+ * leaves no interface behind and can be repeated for several types without
+ * exhausting the firmware's interface slots. This isolates "is this type
+ * recognized?" from "is there a free interface slot?".
+ *
+ * @param iface_type      Firmware-protocol interface_type value to send.
+ * @param fw_status_out   If non-NULL and the transport completed, populated
+ *                        with the firmware's status code (0 == accepted).
+ *
+ * @returns 0 on transport success (fw_status_out holds the firmware verdict),
+ *          or a negative errno for transport-level failures.
+ */
+int mmprobe_iface_type_supported(uint32_t iface_type, uint32_t *fw_status_out);
+
+/**
  * Probe: log the firmware capability words (firmware_flags + morse_caps)
  * that the currently-loaded firmware advertised at init time.
  */
