@@ -39,6 +39,7 @@
 #include "umac/ies/ssid.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/interface/umac_interface_data.h"
+#include "umac/keys/umac_keys.h"
 #include "umac/mesh/umac_mesh.h"
 #include "umac/rc/umac_rc.h"
 #include "umac/regdb/umac_regdb.h"
@@ -313,6 +314,7 @@ struct mesh_peer
     enum mesh_plink_state state;
     uint8_t retries; /* Open retransmits (or holding ticks while HOLDING) */
     uint32_t last_rx_ms; /* last frame heard from this peer (mac80211 sta last_rx) */
+    struct umac_sta_data *stad; /* per-peer host stad: pairwise+group-RX keychain, seq/replay */
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
@@ -386,11 +388,53 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             {
                 p->llid = (uint16_t)mmhal_random_u32(1, 0xffff);
             } while (p->llid == 0);
+#if MMWLAN_MESH_SEC_PHASE1
+            /* Per-peer host stad (mirrors IBSS umac_ibss_get_or_create_peer_stad + adds the
+             * encryption setup): its AID selects the firmware key slot, peer_addr keys the unicast
+             * datapath lookup, and security != OPEN gates TX encryption. Keys install at ESTAB. */
+            p->stad = umac_sta_data_alloc(umac_data_get_umacd());
+            if (p->stad == NULL)
+            {
+                MMLOG_WRN("MESH peer stad alloc failed for " MM_MAC_ADDR_FMT "\n",
+                          MM_MAC_ADDR_VAL(mac));
+                p->used = false;
+                return NULL;
+            }
+            umac_keys_init(p->stad); /* active_key_lookup[*] = -1 */
+            umac_sta_data_set_vif_id(p->stad, mesh_ctx.vif_id);
+            umac_sta_data_set_aid(p->stad, p->aid);
+            umac_sta_data_set_bssid(p->stad, mesh_ctx.mesh_mac);
+            umac_sta_data_set_peer_addr(p->stad, mac);
+            umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+#endif
             return p;
         }
     }
     return NULL;
 }
+
+/* Release a peer slot, freeing its per-peer stad (heap; the common_stad is static — never freed). */
+static void mesh_peer_free(struct mesh_peer *peer)
+{
+#if MMWLAN_MESH_SEC_PHASE1
+    if (peer->stad != NULL)
+    {
+        mmosal_free(peer->stad);
+        peer->stad = NULL;
+    }
+#endif
+    peer->used = false;
+}
+
+#if MMWLAN_MESH_SEC_PHASE1
+/* The per-peer stad for a unicast peer (for the datapath unicast TX/RX key lookup), or NULL for an
+ * unknown/non-ESTAB peer so the caller falls back to the common (MBSS) stad. */
+struct umac_sta_data *umac_mesh_get_peer_stad(const uint8_t *addr)
+{
+    struct mesh_peer *p = mesh_peer_find(addr);
+    return (p != NULL && p->state == MESH_PLINK_ESTAB) ? p->stad : NULL;
+}
+#endif
 
 struct mesh_peering_params
 {
@@ -544,7 +588,7 @@ static void umac_mesh_plink_tick(void *arg1, void *arg2)
             if (++peer->retries >= MESH_PLINK_HOLDING_TICKS)
             {
                 umac_mesh_invalidate_paths_via(peer->mac); /* paths through this peer are dead */
-                peer->used = false; /* free; the next heard beacon re-opens */
+                mesh_peer_free(peer); /* the next heard beacon re-opens */
             }
             break;
 
@@ -559,7 +603,7 @@ static void umac_mesh_plink_tick(void *arg1, void *arg2)
                 MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " inactive %ums; link down\n",
                           MM_MAC_ADDR_VAL(peer->mac), (unsigned)(now - peer->last_rx_ms));
                 umac_mesh_invalidate_paths_via(peer->mac);
-                peer->used = false; /* free; the next heard beacon re-opens */
+                mesh_peer_free(peer); /* the next heard beacon re-opens */
             }
             break;
 
@@ -646,12 +690,21 @@ static const uint8_t mesh_p1_mgtk[16] = {
  * morse_driver maps a group key (no sta) to aid=0 (mac.c:5153) -> INSTALL_KEY{GTK, aid=0, idx=1}.
  * (The own IGTK is BIP, which morse handles in software (mac.c:5187), so it is NOT sent to FW.)
  * This is the step the AP path lacks — an AP installs one BSS GTK, not a per-node mesh group key. */
-static void umac_mesh_install_own_group_key(void)
+static void umac_mesh_install_common_keys(void)
 {
-    struct mmdrv_key_conf mgtk = { .is_pairwise = false, .tx_pn = 0, .length = 16, .key_idx = 1 };
-    memcpy(mgtk.key, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
-    int ret = mmdrv_install_key(mesh_ctx.vif_id, 0 /* aid 0 = own group TX key */, &mgtk);
-    printf("MESH-SEC own MGTK (group TX) aid=0 ret=%d\n", ret);
+    /* The common_stad drives ALL mesh TX (every mesh frame dequeues from it). Give it BOTH the group
+     * MGTK (broadcast TX, key_idx 1) and the pairwise MTK (unicast TX, key_idx 0) so the TX path sets
+     * Protected + the right key_idx; the firmware additionally holds per-peer copies at each peer's
+     * AID (installed at ESTAB) for the actual per-peer crypto. Static/shared keys -> one MTK/MGTK. */
+    struct umac_key mgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
+    memcpy(mgtk.key_data, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    enum mmwlan_status st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mgtk);
+    printf("MESH-SEC common MGTK (group TX) aid=0 st=%d\n", (int)st);
+
+    struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
+    memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
+    st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mtk);
+    printf("MESH-SEC common MTK (pairwise TX) aid=0 st=%d\n", (int)st);
 }
 
 /* Per-peer key install at ESTAB — mirrors hostap mesh_mpm_plink_estab (mesh_mpm.c:916-960).
@@ -670,12 +723,11 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
     };
     int ret;
 
-    /* Install our own MGTK (group TX, aid=0) on the FIRST ESTAB — deferred from mesh start
-     * (where it breaks open peering). Once per mesh session; subsequent peers reuse it. With
-     * the own group key + the peer's group RX key (below), broadcast/group frames encrypt. */
+    /* Install the common_stad TX keys (MGTK + MTK) on the FIRST ESTAB — deferred from mesh start
+     * (where the firmware key install breaks open peering). Once per mesh session. */
     if (!mesh_ctx.group_tx_key_installed)
     {
-        umac_mesh_install_own_group_key();
+        umac_mesh_install_common_keys();
         mesh_ctx.group_tx_key_installed = true;
     }
 
@@ -685,15 +737,19 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
         printf("MESH-SEC sta_state aid=%u state=%u ret=%d\n", peer->aid, seq[i], ret);
     }
 
-    struct mmdrv_key_conf mtk = { .is_pairwise = true, .tx_pn = 0, .length = 16, .key_idx = 0 };
-    memcpy(mtk.key, mesh_p1_mtk, sizeof(mesh_p1_mtk));
-    ret = mmdrv_install_key(vif, peer->aid, &mtk);
-    printf("MESH-SEC install MTK (pairwise) aid=%u ret=%d\n", peer->aid, ret);
+    /* MTK (pairwise) + peer MGTK (group RX) onto the PEER's stad. Its aid == peer->aid, so
+     * umac_keys_install_key populates the peer-stad keychain (so the unicast TX path sets Protected
+     * + selects the pairwise key) AND installs to firmware at peer->aid -- same slots as the old raw
+     * calls. The datapath maps the peer's address -> this stad (umac_mesh_get_peer_stad). */
+    struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
+    memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
+    enum mmwlan_status st = umac_keys_install_key(peer->stad, vif, &mtk);
+    printf("MESH-SEC install MTK (pairwise) aid=%u st=%d\n", peer->aid, (int)st);
 
-    struct mmdrv_key_conf mgtk = { .is_pairwise = false, .tx_pn = 0, .length = 16, .key_idx = 1 };
-    memcpy(mgtk.key, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
-    ret = mmdrv_install_key(vif, peer->aid, &mgtk);
-    printf("MESH-SEC install peer MGTK (group RX) aid=%u ret=%d\n", peer->aid, ret);
+    struct umac_key pmgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
+    memcpy(pmgtk.key_data, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    st = umac_keys_install_key(peer->stad, vif, &pmgtk);
+    printf("MESH-SEC install peer MGTK (group RX) aid=%u st=%d\n", peer->aid, (int)st);
 }
 #endif /* MMWLAN_MESH_SEC_PHASE1 */
 
@@ -1500,7 +1556,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " closed (state %u)\n", MM_MAC_ADDR_VAL(sa),
                   (unsigned)peer->state);
         umac_mesh_invalidate_paths_via(peer->mac); /* paths through this peer are dead */
-        peer->used = false;
+        mesh_peer_free(peer);
         return;
     }
 
@@ -1513,7 +1569,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " llid mismatch echo=0x%04x ours=0x%04x; closing\n",
                   MM_MAC_ADDR_VAL(sa), (unsigned)our_llid_echo, (unsigned)peer->llid);
         (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_CLOSE, peer, MESH_REASON_PEERING_CANCELLED);
-        peer->used = false;
+        mesh_peer_free(peer);
         return;
     }
 
@@ -1717,6 +1773,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
     {
         umac_sta_data_set_bssid(mesh_ctx.common_stad, mesh_ctx.mesh_mac);
         umac_sta_data_set_peer_addr(mesh_ctx.common_stad, mesh_ctx.mesh_mac);
+#if MMWLAN_MESH_SEC_PHASE1
+        /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB). */
+        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+#endif
     }
     umac_datapath_configure_mesh_mode(umacd);
 
@@ -1798,6 +1858,14 @@ enum mmwlan_status mmwlan_mesh_stop(void)
     (void)umac_core_cancel_timeout(umacd, umac_mesh_plink_tick, umacd, NULL);
     (void)mmdrv_cfg_mesh(mesh_ctx.vif_id, false, false); /* MESH_CONFIG(STOP) */
     mesh_ctx.active = false;
+    /* Free per-peer stads so they don't leak across stop/start (start re-memsets mesh_peers). */
+    for (size_t i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (mesh_peers[i].used)
+        {
+            mesh_peer_free(&mesh_peers[i]);
+        }
+    }
     umac_interface_remove(umacd, UMAC_INTERFACE_MESH);
     return MMWLAN_SUCCESS;
 }

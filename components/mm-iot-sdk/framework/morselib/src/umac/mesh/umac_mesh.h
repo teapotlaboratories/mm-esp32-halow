@@ -79,6 +79,10 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd);
  *  no mesh vif is active. Used by the mesh datapath ops. */
 struct umac_sta_data *umac_mesh_get_common_stad(void);
 
+/** The per-peer stad for an ESTAB unicast peer (its pairwise+group-RX keychain), or NULL so the
+ *  datapath falls back to the common stad. Used by the mesh unicast TX/RX stad lookups. */
+struct umac_sta_data *umac_mesh_get_peer_stad(const uint8_t *addr);
+
 /** Next monotonic mesh sequence number for the Mesh Control header (data path). */
 uint32_t umac_mesh_next_seqnum(void);
 
