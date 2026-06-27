@@ -292,7 +292,7 @@ enum mesh_plink_state
     MESH_PLINK_HOLDING,
 };
 
-#define MESH_MAX_PEERS (4)
+#define MESH_MAX_PEERS UMAC_MESH_MAX_PEERS
 
 /* Phase-1 mesh-security EXPERIMENT: install a static MTK/MGTK to prove the MM6108 firmware
  * accepts SET_STA_STATE + INSTALL_KEY on a MESH vif. Derived from the Linux MESH path (NOT the AP
@@ -433,6 +433,19 @@ struct umac_sta_data *umac_mesh_get_peer_stad(const uint8_t *addr)
 {
     struct mesh_peer *p = mesh_peer_find(addr);
     return (p != NULL && p->state == MESH_PLINK_ESTAB) ? p->stad : NULL;
+}
+
+/* The per-peer stad in mesh peer slot @p index, or NULL if empty / not yet ESTABLISHED. The mesh TX
+ * scheduler (umac_datapath_tx_dequeue_frame_mesh) iterates these to drain each established peer's
+ * per-peer TX queue, mirroring how umac_ap_get_next_sta_for_tx walks data->stas[]. */
+struct umac_sta_data *umac_mesh_peer_stad_at(size_t index)
+{
+    if (index >= MESH_MAX_PEERS)
+    {
+        return NULL;
+    }
+    struct mesh_peer *p = &mesh_peers[index];
+    return (p->used && p->state == MESH_PLINK_ESTAB) ? p->stad : NULL;
 }
 #endif
 
