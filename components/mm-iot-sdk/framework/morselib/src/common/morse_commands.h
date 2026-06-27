@@ -46,6 +46,11 @@ enum morse_cmd_id
     MORSE_CMD_ID_UPDATE_OUI_FILTER = 0x0034,
     MORSE_CMD_ID_IBSS_CONFIG = 0x0035,
     MORSE_CMD_ID_TWT_AGREEMENT_VALIDATE = 0x0036,
+    /* 802.11s mesh (values per morse_driver morse_commands.h). */
+    MORSE_CMD_ID_MESH_CONFIG = 0x0039,
+    MORSE_CMD_ID_BSS_BEACON_CONFIG = 0x003D,
+    MORSE_CMD_ID_BSSID_SET = 0x0052,
+    MORSE_CMD_ID_SET_MESH_CONFIG = 0xA018,
     MORSE_CMD_ID_HW_SCAN = 0x0044,
     MORSE_CMD_ID_SET_WHITELIST = 0x0045,
     MORSE_CMD_ID_ARP_PERIODIC_REFRESH = 0x0046,
@@ -345,6 +350,78 @@ struct MM_PACKED morse_cmd_resp_ibss_config
 {
     struct morse_cmd_header hdr;
     uint32_t status;
+};
+
+
+/* --- 802.11s mesh -------------------------------------------------------------
+ * Structs are byte-compatible with morse_driver morse_commands.h
+ * (morse_cmd_req_mesh_config / morse_cmd_req_set_mesh_config). */
+
+#define MORSE_CMD_MESH_ID_LEN_MAX (32)
+
+enum morse_cmd_mesh_config_opcode
+{
+    MORSE_CMD_MESH_CONFIG_OPCODE_START = 0,
+    MORSE_CMD_MESH_CONFIG_OPCODE_STOP = 1,
+};
+
+/* BSSID_SET (0x0052): set the vif's BSSID. For mesh the BSSID is the node's own MAC
+ * (mac80211 sets bss_conf.bssid = vif->addr for mesh). morse_driver sends this on
+ * BSS_CHANGED_BSSID; unlike IBSS (where the BSSID rides in IBSS_CONFIG), mesh needs it
+ * as a separate command before MESH_CONFIG. */
+struct MM_PACKED morse_cmd_req_bssid_set
+{
+    struct morse_cmd_header hdr;
+    uint8_t bssid[MORSE_CMD_MAC_ADDR_LEN];
+};
+
+/* BSS_BEACON_CONFIG (0x003D): enable/disable the firmware beacon timer. The Linux
+ * driver sends this on BSS_CHANGED_BEACON_ENABLED for beaconing vifs. */
+struct MM_PACKED morse_cmd_req_bss_beacon_config
+{
+    struct morse_cmd_header hdr;
+    uint8_t enable;
+};
+
+struct MM_PACKED morse_cmd_resp_bss_beacon_config
+{
+    struct morse_cmd_header hdr;
+    uint32_t status;
+    uint16_t interface_id;
+};
+
+/* MESH_CONFIG (0x0039): start/stop the mesh BSS + beaconing.
+ *
+ * MBCA (Mesh Beacon Collision Avoidance) config bits and defaults — values from
+ * morse_driver (mesh.h). When beaconing is enabled the firmware runs a TBTT-selection
+ * scan (mbss_start_scan_duration_ms) to pick a collision-free beacon slot, then starts
+ * generating beacon interrupts. mbca_config == 0 means *beaconless* mode, so it must be
+ * non-zero when enable_beaconing is set. */
+#define MORSE_MESH_MBCA_CFG_TBTT_SEL_ENABLE  (1u << 0)
+#define MORSE_MESH_MBCA_CFG_TBTT_ADJ_ENABLE  (1u << 1)
+#define MORSE_MESH_DEFAULT_MIN_BEACON_GAP_MS     (25)
+#define MORSE_MESH_DEFAULT_MBSS_SCAN_DURATION_MS (2048)
+#define MORSE_MESH_DEFAULT_TBTT_ADJ_INTERVAL_MS  (60000)
+
+struct MM_PACKED morse_cmd_req_mesh_config
+{
+    struct morse_cmd_header hdr;
+    uint8_t mesh_cfg_opcode;
+    uint8_t enable_beaconing;
+    uint8_t mbca_config;
+    uint8_t min_beacon_gap_ms;
+    uint16_t mbss_start_scan_duration_ms;
+    uint16_t tbtt_adj_timer_interval_ms;
+};
+
+/* SET_MESH_CONFIG (0xA018): mesh ID + peer-link limits + beaconless mode. */
+struct MM_PACKED morse_cmd_req_set_mesh_config
+{
+    struct morse_cmd_header hdr;
+    uint8_t mesh_id_len;
+    uint8_t mesh_id[MORSE_CMD_MESH_ID_LEN_MAX];
+    uint8_t mesh_beaconless_mode;
+    uint8_t max_plinks;
 };
 
 

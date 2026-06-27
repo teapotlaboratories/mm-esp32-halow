@@ -35,6 +35,8 @@ void umac_datapath_configure_ap_mode(struct umac_data *umacd);
 
 void umac_datapath_configure_ibss_mode(struct umac_data *umacd);
 
+void umac_datapath_configure_mesh_mode(struct umac_data *umacd);
+
 
 void umac_datapath_configure_scan_mode(struct umac_data *umacd);
 
@@ -164,6 +166,10 @@ enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,
                                                       uint32_t filter,
                                                       mmwlan_rx_frame_cb_t callback,
                                                       void *arg);
+
+enum mmwlan_status umac_datapath_register_monitor_cb(struct umac_data *umacd,
+                                                     mmwlan_monitor_rx_cb_t callback,
+                                                     void *arg);
 
 
 void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter);

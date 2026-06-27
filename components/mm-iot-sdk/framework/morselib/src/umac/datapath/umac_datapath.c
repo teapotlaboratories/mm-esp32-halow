@@ -29,6 +29,7 @@
 #include "umac/ba/umac_ba.h"
 #include "umac/twt/umac_twt.h"
 #include "umac/ibss/umac_ibss.h"
+#include "umac/mesh/umac_mesh.h"
 #include "umac/ies/mmie.h"
 #include "umac/frames/disassociation.h"
 #include "umac/frames/deauthentication.h"
@@ -155,7 +156,33 @@ static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmp
 
     if (!umac_connection_addr_matches_bssid(umacd, s1g_header->source_addr))
     {
-        /* Do NOT mint a peer from a beacon. IBSS peer discovery is data-driven
+        /* MESH: a foreign-BSSID S1G beacon is a peer's beacon. For 802.11s the mesh BSSID
+         * equals the sender's own MAC, so source_addr IS the peer's real address — verified
+         * on-air: a Linux/morse mesh node's S1G beacon reaches here with source_addr = its MAC.
+         * This is usable for peer discovery, unlike the STA/IBSS case below (where source_addr
+         * = BSSID != sender). Strip the optional S1G beacon fields to reach the IEs and let the
+         * mesh module match the Mesh ID and open a peer link. */
+        if (umac_mesh_is_active())
+        {
+            if (dot11_frame_control_get_next_tbtt_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_NEXT_TBTT_LEN);
+            }
+            if (dot11_frame_control_get_cssid_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_CSSID_LEN);
+            }
+            if (dot11_frame_control_get_ano_present(s1g_header->frame_control))
+            {
+                (void)mmpkt_remove_from_start(rxbufview, DOT11_ANO_LEN);
+            }
+            umac_mesh_handle_peer_beacon(s1g_header->source_addr,
+                                         mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            return;
+        }
+
+        /* STA/IBSS: do NOT mint a peer from a beacon. IBSS peer discovery is data-driven
          * (umac_datapath_lookup_stad_by_peer_addr_ibss on a data frame's real TA);
          * beacons cannot identify peers on this hardware/firmware:
          *
@@ -494,6 +521,15 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
     struct umac_8023_hdr header_8023 = { 0 };
+    bool mesh_ctrl_present = false;
+
+    /* Forced-topology test: drop mesh data frames whose immediate transmitter (TA) isn't an
+     * allowed neighbour, so a node only exchanges data via its chosen relay even though all
+     * bench nodes are in RF range. No-op when the allowlist is empty (normal operation). */
+    if (umac_mesh_is_active() && !umac_mesh_peer_allowed(dot11_get_ta(header)))
+    {
+        goto drop;
+    }
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -501,6 +537,9 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             (struct dot11_qos_ctrl *)mmpkt_remove_from_start(rxbufview, sizeof(*qos_control));
 
         MMOSAL_ASSERT(qos_control);
+
+        /* 802.11s "Mesh Control Present" (QoS Control bit 8): a Mesh Control header follows. */
+        mesh_ctrl_present = (le16toh(qos_control->field) & 0x0100u) != 0;
 
         if (!mm_mac_addr_is_multicast(dot11_get_ra(header)))
         {
@@ -613,6 +652,61 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     }
 
 
+    /* 802.11s: strip the Mesh Control header (between the MAC header and LLC/SNAP) so the
+     * LLC/SNAP + payload extraction below works. Length depends on the address-extension flags
+     * (mirrors net/mac80211): base 6 (flags, ttl, seqnum), +6 for AE_A4, +12 for AE_A5_A6. */
+    uint8_t mesh_ttl = 0;
+    uint32_t mesh_seqnum = 0;
+    if (mesh_ctrl_present)
+    {
+        const uint8_t *mctrl = (const uint8_t *)mmpkt_get_data_start(rxbufview);
+        uint32_t mctrl_len = 6;
+        if (mctrl != NULL)
+        {
+            mesh_ttl = mctrl[1];
+            mesh_seqnum = (uint32_t)mctrl[2] | ((uint32_t)mctrl[3] << 8) | ((uint32_t)mctrl[4] << 16) |
+                          ((uint32_t)mctrl[5] << 24);
+            uint8_t ae = mctrl[0] & 0x03u;
+            if (ae == 0x01u)
+            {
+                mctrl_len += 6;
+            }
+            else if (ae == 0x02u)
+            {
+                mctrl_len += 12;
+            }
+        }
+        (void)mmpkt_remove_from_start(rxbufview, mctrl_len);
+    }
+
+    /* MESH forwarding (ESP as an intermediate hop). The buffer is now [LLC/SNAP][payload].
+     *  - Group-addressed (bcast/mcast, e.g. ARP): re-broadcast through the mesh (dedup via RMC)
+     *    AND deliver locally.
+     *  - Unicast whose mesh DA isn't us: relay toward the next hop (fresh copy), don't deliver. */
+    if (mesh_ctrl_present)
+    {
+        const uint8_t *mesh_da = dot11_get_da(header);
+        const uint8_t *mesh_sa = dot11_get_sa_data(data_hdr);
+        if (mm_mac_addr_is_multicast(mesh_da))
+        {
+            if (umac_mesh_handle_group_data(mesh_sa, mesh_ttl, mesh_seqnum,
+                                            mmpkt_get_data_start(rxbufview),
+                                            mmpkt_get_data_length(rxbufview)))
+            {
+                goto drop; /* duplicate / our own echo — don't deliver again */
+            }
+            /* fresh group frame: re-broadcast done; fall through to local delivery */
+        }
+        else if (!umac_interface_addr_matches_mac_addr(stad, mesh_da))
+        {
+            MMLOG_INF("MESH relay " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT "\n",
+                      MM_MAC_ADDR_VAL(mesh_sa), MM_MAC_ADDR_VAL(mesh_da));
+            (void)umac_mesh_forward_data(mesh_da, mesh_sa, mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            goto drop;
+        }
+    }
+
     llc_ethertype = umac_datapath_get_llc_ethertype(rxbufview);
     if (!llc_ethertype)
     {
@@ -627,16 +721,16 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);
 
-
     enum mmwlan_vif vif = MMWLAN_VIF_UNSPECIFIED;
     if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA) != UMAC_INTERFACE_VIF_ID_INVALID)
     {
         vif = MMWLAN_VIF_STA;
     }
-    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC) !=
+    else if (umac_interface_get_vif_id(
+                 umacd, UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC | UMAC_INTERFACE_MESH) !=
              UMAC_INTERFACE_VIF_ID_INVALID)
     {
-        /* IBSS reuses the AP per-vif slot for state/ext-cb registration. */
+        /* IBSS and MESH reuse the AP per-vif slot for state/ext-cb registration. */
         vif = MMWLAN_VIF_AP;
     }
     else
@@ -1290,6 +1384,26 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
 
     frame_ver_type_subtype = dot11_frame_control_get_ver_type_subtype(header->frame_control);
 
+    /* Promiscuous monitor tap: deliver every frame the firmware surfaces to a registered
+     * monitor callback, before any address/BSSID filtering below discards it. This is how a
+     * monitor/sniffer build observes foreign-BSSID beacons (mesh/IBSS/AP) and probe frames. */
+    {
+        struct umac_datapath_data *mon = umac_data_get_datapath(umacd);
+        if (mon->monitor_cb != NULL)
+        {
+            struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
+            const struct mmdrv_rx_metadata *rx_md = mmdrv_get_rx_metadata(rxbuf);
+            const struct mmwlan_monitor_rx_info info = {
+                .buf = mmpkt_get_data_start(rxbufview),
+                .buf_len = mmpkt_get_data_length(rxbufview),
+                .freq_100khz = rx_md->freq_100khz,
+                .rssi_dbm = rx_md->rssi,
+                .bw_mhz = rx_md->bw_mhz,
+            };
+            mon->monitor_cb(&info, mon->monitor_cb_arg);
+        }
+    }
+
     if (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, CTRL, RTS))
     {
 
@@ -1300,6 +1414,17 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
 
     if (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
     {
+        /* DIAG (mesh P2): count EVERY S1G beacon the firmware delivers to the host,
+         * before any host-side filter — answers "does the firmware surface peer beacons?" */
+        {
+            static uint32_t s1g_bcn_diag;
+            if ((++s1g_bcn_diag % 20u) == 1u)
+            {
+                MMLOG_DBG("S1Gbcn diag #%u filtered=%d\n", (unsigned)s1g_bcn_diag,
+                          (int)umac_datapath_filter_all_beacons(umacd));
+            }
+        }
+
         if (umac_datapath_filter_all_beacons(umacd))
         {
             MMLOG_VRB("Dropping beacon.\n");
@@ -1768,6 +1893,20 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         mmpkt_prepend_data(txbufview, snap_802_1h, sizeof(snap_802_1h));
     }
 
+    /* 802.11s Mesh Control header — sits between the QoS Control field and the payload
+     * (mirrors net/mac80211 ieee80211_new_mesh_header; verified against an on-air capture).
+     * 6 bytes for a locally-originated frame, no address extension: Mesh Flags=0, TTL, seqnum.
+     * The QoS "Mesh Control Present" bit is set below. */
+    if (umac_mesh_is_active())
+    {
+        uint8_t mesh_ctrl[6];
+        mesh_ctrl[0] = 0;  /* Mesh Flags: no address extension */
+        mesh_ctrl[1] = 31; /* Mesh TTL (dot11MeshTTL default) */
+        uint32_t mesh_sn = htole32(umac_mesh_next_seqnum());
+        memcpy(&mesh_ctrl[2], &mesh_sn, sizeof(mesh_sn));
+        mmpkt_prepend_data(txbufview, mesh_ctrl, sizeof(mesh_ctrl));
+    }
+
     const uint8_t *ra = dot11_get_ra(&(data_hdr.base));
     if (mm_mac_addr_is_zero(ra))
     {
@@ -1817,6 +1956,16 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
 
     qos_ctrl.field = (uint16_t)(tid & DOT11_MASK_QC_TID);
+    if (umac_mesh_is_active())
+    {
+        qos_ctrl.field |= 0x0100u; /* Mesh Control Present (802.11s QoS Control bit 8) */
+        if (is_multicast)
+        {
+            /* Ack Policy "No Ack" (bits 5-6 = 01) — group-addressed frames are never acked,
+             * matching mac80211's QoS ack policy for a multicast RA. */
+            qos_ctrl.field |= 0x0020u;
+        }
+    }
 
     if (key_len == UMAC_KEY_AES_256_LEN)
     {
@@ -2555,6 +2704,16 @@ enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,
     return MMWLAN_SUCCESS;
 }
 
+enum mmwlan_status umac_datapath_register_monitor_cb(struct umac_data *umacd,
+                                                     mmwlan_monitor_rx_cb_t callback,
+                                                     void *arg)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->monitor_cb_arg = arg;
+    data->monitor_cb = callback;
+    return MMWLAN_SUCCESS;
+}
+
 
 static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_sta_mode(
     struct umac_data *umacd,
@@ -2824,6 +2983,141 @@ void umac_datapath_configure_ibss_mode(struct umac_data *umacd)
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     data->ops = &datapath_ops_ibss;
     MMLOG_INF("Datapath configured for IBSS mode\n");
+}
+
+/* --- MESH datapath ops -----------------------------------------------------
+ * 802.11s mesh is association-less and self-beaconing, like IBSS, so the datapath
+ * plumbing mirrors the IBSS ops: the "common" stad (the MBSS) backs broadcast/mgmt
+ * TX. Generic helpers (get_state, sleep, pause, enqueue, data-header) are shared with
+ * IBSS/STA; the mesh-specific bits are the common-stad lookups and the mgmt-frame RX
+ * handler, which routes ACTION frames to the Mesh Peering Management code. */
+static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_mesh(struct umac_data *umacd,
+                                                                         const uint8_t *addr)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(addr); /* per-peer stads arrive with MPM; until then the MBSS stad serves */
+    return umac_mesh_get_common_stad();
+}
+
+static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(
+    struct umac_data *umacd, const uint8_t *addr)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(addr);
+    return umac_mesh_get_common_stad();
+}
+
+static bool umac_datapath_tx_dequeue_frame_mesh(struct umac_data *umacd,
+                                                struct umac_sta_data **stad_ptr,
+                                                struct mmpkt **txbuf_ptr)
+{
+    MM_UNUSED(umacd);
+    MMOSAL_ASSERT(stad_ptr && txbuf_ptr);
+    *stad_ptr = NULL;
+    *txbuf_ptr = NULL;
+
+    struct umac_sta_data *stad = umac_mesh_get_common_stad();
+    if (stad == NULL || umac_sta_data_is_paused(stad))
+    {
+        return false;
+    }
+
+    MMOSAL_TASK_ENTER_CRITICAL();
+    *txbuf_ptr = umac_sta_data_pop_pkt(stad);
+    bool has_more = umac_sta_data_get_queued_len(stad);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    if (*txbuf_ptr != NULL)
+    {
+        *stad_ptr = stad;
+    }
+    return has_more;
+}
+
+/* Build the 802.11 header for a mesh data frame, mirroring net/mac80211 (ieee80211_build_hdr,
+ * MESH_POINT). Verified against an on-air capture (docs worklog 2026-06-26): QoS Data, with a
+ * Mesh Control header (inserted in the TX path) and the QoS "Mesh Control Present" bit set.
+ *  - Group-addressed (bcast/mcast): 3-address, fromDS=1. A1=DA, A2=TA(us), A3=mesh-SA(us).
+ *  - Unicast to a peer: 4-address, toDS=fromDS=1. A1=next-hop, A2=us, A3=mesh-DA, A4=mesh-SA(us).
+ * Single-hop only for now: next hop == final destination (the directly-peered node); HWMP
+ * path selection for multi-hop is a later step. */
+static void umac_datapath_construct_80211_data_header_mesh(struct umac_sta_data *stad,
+                                                           const struct umac_8023_hdr *hdr_8023,
+                                                           struct dot11_data_hdr *data_hdr)
+{
+    uint16_t frame_control = DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
+                             DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE;
+    uint8_t our_mac[DOT11_MAC_ADDR_LEN];
+    umac_interface_get_mac_addr(stad, our_mac);
+
+    if (mm_mac_addr_is_multicast(hdr_8023->dest_addr))
+    {
+        frame_control |= DOT11_MASK_FC_FROM_DS;
+        mac_addr_copy(data_hdr->base.addr1, hdr_8023->dest_addr);
+        mac_addr_copy(data_hdr->base.addr2, our_mac);
+        mac_addr_copy(data_hdr->base.addr3, our_mac);
+    }
+    else
+    {
+        frame_control |= DOT11_MASK_FC_TO_DS | DOT11_MASK_FC_FROM_DS;
+        /* RA = the HWMP next hop toward the destination. If no path is resolved yet, fall back
+         * to direct (correct for a directly-peered dest) and kick off path discovery so a
+         * multi-hop path resolves for subsequent frames. */
+        uint8_t next_hop[DOT11_MAC_ADDR_LEN];
+        if (!umac_mesh_lookup_next_hop(hdr_8023->dest_addr, next_hop))
+        {
+            mac_addr_copy(next_hop, hdr_8023->dest_addr);
+            umac_mesh_start_discovery(hdr_8023->dest_addr);
+        }
+        mac_addr_copy(data_hdr->base.addr1, next_hop);            /* RA = next hop */
+        mac_addr_copy(data_hdr->base.addr2, our_mac);             /* TA = us */
+        mac_addr_copy(data_hdr->base.addr3, hdr_8023->dest_addr); /* mesh DA (final dest) */
+        /* mesh SA = the 802.3 source. For originated frames this is our (synced) MAC; for a
+         * FORWARDED frame (re-injected with the original src) it preserves the true origin. */
+        mac_addr_copy(data_hdr->addr4, hdr_8023->src_addr);
+    }
+    data_hdr->base.frame_control = htole16(frame_control);
+}
+
+static void umac_datapath_process_rx_mgmt_frame_mesh(struct umac_data *umacd,
+                                                     struct umac_sta_data *stad,
+                                                     struct mmpktview *rxbufview)
+{
+    MM_UNUSED(stad);
+    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    uint16_t subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+    if (subtype == DOT11_FC_SUBTYPE_ACTION)
+    {
+        umac_mesh_handle_action(umacd, rxbufview);
+    }
+}
+
+/* Mesh peering uses ACTION frames pre-association; allow them (and beacons) through. */
+static const uint16_t frames_allowed_pre_association_mesh[] = {
+    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
+    UINT16_MAX,
+};
+
+static const struct umac_datapath_ops datapath_ops_mesh = {
+    .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_mesh,
+    .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_mesh,
+    .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_mesh,
+    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_sta,
+    .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
+    .is_stad_tx_paused = umac_sta_data_is_paused,
+    .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
+    .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_mesh,
+    .construct_80211_data_header = umac_datapath_construct_80211_data_header_mesh,
+    .get_sta_state = umac_datapath_get_state_ibss,
+    .frames_allowed_pre_association = frames_allowed_pre_association_mesh,
+};
+
+void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
+{
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->ops = &datapath_ops_mesh;
+    MMLOG_INF("Datapath configured for MESH mode\n");
 }
 
 void umac_datapath_configure_scan_mode(struct umac_data *umacd)

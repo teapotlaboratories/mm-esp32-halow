@@ -177,6 +177,17 @@ bool umac_interface_type_is_compatible_with_active(struct umac_interface_data *d
         return false;
     }
 
+    /* MESH is likewise exclusive with every other active type. */
+    if ((data->active_interface_types & UMAC_INTERFACE_MESH) && type != UMAC_INTERFACE_MESH)
+    {
+        return false;
+    }
+    if ((type & UMAC_INTERFACE_MESH) &&
+        (data->active_interface_types & ~(uint16_t)UMAC_INTERFACE_MESH))
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -246,6 +257,10 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
         else if (type == UMAC_INTERFACE_ADHOC)
         {
             drv_if_type = MMDRV_INTERFACE_TYPE_ADHOC;
+        }
+        else if (type == UMAC_INTERFACE_MESH)
+        {
+            drv_if_type = MMDRV_INTERFACE_TYPE_MESH;
         }
         else
         {

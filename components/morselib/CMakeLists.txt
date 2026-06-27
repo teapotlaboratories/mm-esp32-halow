@@ -27,6 +27,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/core/umac_evtq.c
     ${ROOT_DIR}/src/umac/core/umac_timeout.c
     ${ROOT_DIR}/src/umac/ibss/umac_ibss.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh.c
     ${ROOT_DIR}/src/umac/data/umac_data.c
     ${ROOT_DIR}/src/umac/data/umac_sta_data.c
     ${ROOT_DIR}/src/umac/datapath/datapath_defrag.c
