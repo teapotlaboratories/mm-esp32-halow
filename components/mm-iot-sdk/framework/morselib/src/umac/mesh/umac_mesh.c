@@ -44,6 +44,15 @@
 #include "umac/rc/umac_rc.h"
 #include "umac/regdb/umac_regdb.h"
 
+/* hostap crypto, reached via the exported mmint_* ABI. The morse symbol mangler renames hostap's
+ * internal sha256_prf -> mmint_sha256_prf and crypto_get_random -> mmint_crypto_get_random
+ * (hostap_morse_common.h) so they don't clash; declared here rather than pulling in hostap
+ * src/crypto headers (which drag utils/common.h type clashes into morselib). Used for the AMPE
+ * per-pair MTK/AEK derivation (mesh_rsn.c mesh_rsn_derive_mtk/_aek) and the peering nonces. */
+extern int mmint_sha256_prf(const uint8_t *key, size_t key_len, const char *label,
+                            const uint8_t *data, size_t data_len, uint8_t *buf, size_t buf_len);
+extern int mmint_crypto_get_random(void *buf, size_t len);
+
 /* 802.11s element IDs (per IEEE 802.11). */
 #define DOT11_IE_MESH_CONFIGURATION (113)
 #define DOT11_IE_MESH_ID            (114)
@@ -315,6 +324,14 @@ struct mesh_peer
     uint8_t retries; /* Open retransmits (or holding ticks while HOLDING) */
     uint32_t last_rx_ms; /* last frame heard from this peer (mac80211 sta last_rx) */
     struct umac_sta_data *stad; /* per-peer host stad: pairwise+group-RX keychain, seq/replay */
+    /* AMPE key material (P2). my_nonce is generated once per (re)alloc and carried in our Open/Confirm;
+     * peer_nonce is learned from the peer's. At ESTAB the per-pair MTK + AEK are derived from them
+     * (mesh_rsn.c). aek is derived in P2b to validate the 64-byte-PMK path; used by the AES-SIV MIC in P2d. */
+    uint8_t my_nonce[32];
+    uint8_t peer_nonce[32];
+    bool peer_nonce_valid;
+    uint8_t mtk[16]; /* derived per-pair pairwise key (replaces the static mesh_p1_mtk) */
+    uint8_t aek[32]; /* derived AMPE encryption key (P2d AES-SIV) */
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
@@ -406,6 +423,9 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             umac_sta_data_set_bssid(p->stad, mesh_ctx.mesh_mac);
             umac_sta_data_set_peer_addr(p->stad, mac);
             umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+            /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
+             * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
+            mmint_crypto_get_random(p->my_nonce, sizeof(p->my_nonce));
 #endif
             return p;
         }
@@ -456,6 +476,7 @@ struct mesh_peering_params
     uint16_t llid;
     uint16_t plid;   /* echoed peer id; included for Confirm (and Close if non-zero) */
     uint16_t reason; /* Close only */
+    const uint8_t *my_nonce; /* P2b: 32-byte local AMPE nonce carried on Open/Confirm (NULL = omit) */
 };
 
 static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf, void *params)
@@ -520,6 +541,16 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
         v = htole16(p->reason);
         consbuf_append(buf, (const uint8_t *)&v, sizeof(v));
     }
+
+    /* P2b AMPE nonce carrier — throwaway scaffolding, replaced by the real AES-SIV AMPE element (139)
+     * in P2d. A vendor-specific IE (221) holding our 32-byte local nonce, on Open + Confirm only, so
+     * the peer can derive the matching per-pair MTK. Marker OUI 'RIM' + type 0x01. */
+    if (!is_close && p->my_nonce != NULL)
+    {
+        const uint8_t nonce_ie_hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32, 'R', 'I', 'M', 0x01 };
+        consbuf_append(buf, nonce_ie_hdr, sizeof(nonce_ie_hdr));
+        consbuf_append(buf, p->my_nonce, 32);
+    }
 }
 
 static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh_peer *peer,
@@ -537,6 +568,7 @@ static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh
         .llid = peer->llid,
         .plid = peer->plid,
         .reason = reason,
+        .my_nonce = peer->my_nonce, /* build_peering omits it on Close */
     };
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_peering, &params);
     if (frame == NULL)
@@ -697,6 +729,20 @@ static const uint8_t mesh_p1_mgtk[16] = {
     0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00
 };
 
+/* P2 (AMPE) static PMK — identical on every node so a static-PMK ESP mesh derives matching per-pair
+ * MTKs/AEKs (P3 replaces this with the SAE-negotiated PMK). The MTK derivation hashes 32 bytes of it;
+ * the AEK derivation hashes 64 (PMK || 32 zero bytes), mirroring hostap's sizeof(sae->pmk) =
+ * SAE_MAX_PMK_LEN=64 with pmk[32..63]==0 for group 19 — see mesh_derive_mtk/_aek below. */
+static const uint8_t mesh_p2_pmk[32] = {
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf
+};
+/* Selected AKM Suite = SAE (00-0F-AC:8), big-endian like hostap RSN_SELECTOR_PUT. Mesh always
+ * advertises SAE here even on a static PMK (do NOT substitute a PSK AKM). */
+static const uint8_t mesh_ampe_akm_sae[4] = { 0x00, 0x0f, 0xac, 0x08 };
+
 /* Own TX group key — mirrors hostap __mesh_rsn_auth_init (mesh_rsn.c:216-231): at mesh START
  * each node installs its OWN MGTK once, keyed to the group so it can encrypt its broadcast/group
  * TX. Linux: wpa_drv_set_key(addr=broadcast, key_idx=1, set_tx=1, KEY_FLAG_GROUP_TX_DEFAULT);
@@ -718,6 +764,83 @@ static void umac_mesh_install_common_keys(void)
     memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
     st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mtk);
     printf("MESH-SEC common MTK (pairwise TX) aid=0 st=%d\n", (int)st);
+}
+
+/* Order two equal-length byte strings by memcmp into (min, max) — the convention mesh_rsn.c uses for
+ * the nonce + MAC KDF inputs so both ends agree on the context regardless of which side is local. */
+static void mesh_order_minmax(const uint8_t *a, const uint8_t *b, size_t len,
+                              const uint8_t **min, const uint8_t **max)
+{
+    if (memcmp(a, b, len) < 0)
+    {
+        *min = a;
+        *max = b;
+    }
+    else
+    {
+        *min = b;
+        *max = a;
+    }
+}
+
+/* Derive the per-pair MTK, byte-exact with hostap mesh_rsn_derive_mtk (mesh_rsn.c):
+ *   MTK = sha256_prf(PMK[32], "Temporal Key Derivation",
+ *           min(myNonce,peerNonce) || max(..) || min(myLID,peerLID) || max(..) [LE16 each]
+ *           || AKM(SAE) || min(myMAC,peerMAC) || max(..))  -> 16 bytes (CCMP key len).
+ * Nonces + MACs ordered by memcmp; LIDs ordered NUMERICALLY and serialized little-endian (WPA_PUT_LE16). */
+static void mesh_derive_mtk(struct mesh_peer *peer)
+{
+    uint8_t ctx[2 * 32 + 2 * 2 + 4 + 2 * 6]; /* 84 */
+    uint8_t *p = ctx;
+    const uint8_t *min, *max;
+
+    mesh_order_minmax(peer->my_nonce, peer->peer_nonce, 32, &min, &max);
+    memcpy(p, min, 32);
+    p += 32;
+    memcpy(p, max, 32);
+    p += 32;
+
+    uint16_t lo = (peer->llid < peer->plid) ? peer->llid : peer->plid;
+    uint16_t hi = (peer->llid < peer->plid) ? peer->plid : peer->llid;
+    *p++ = (uint8_t)(lo & 0xff);
+    *p++ = (uint8_t)(lo >> 8);
+    *p++ = (uint8_t)(hi & 0xff);
+    *p++ = (uint8_t)(hi >> 8);
+
+    memcpy(p, mesh_ampe_akm_sae, 4);
+    p += 4;
+
+    mesh_order_minmax(mesh_ctx.mesh_mac, peer->mac, 6, &min, &max);
+    memcpy(p, min, 6);
+    p += 6;
+    memcpy(p, max, 6);
+
+    mmint_sha256_prf(mesh_p2_pmk, sizeof(mesh_p2_pmk), "Temporal Key Derivation",
+                     ctx, sizeof(ctx), peer->mtk, sizeof(peer->mtk));
+}
+
+/* Derive the AEK, byte-exact with hostap mesh_rsn_derive_aek (mesh_rsn.c):
+ *   AEK = sha256_prf(PMK64, "AEK Derivation", AKM(SAE) || min(myMAC,peerMAC) || max(..)) -> 32 bytes.
+ * CRITICAL: the key is the 64-byte SAE pmk buffer (PMK[32] || 32 zeros), NOT 32 — hostap passes
+ * sizeof(sta->sae->pmk)=SAE_MAX_PMK_LEN=64 (vs SAE_PMK_LEN=32 for the MTK). Mixing the two breaks it. */
+static void mesh_derive_aek(struct mesh_peer *peer)
+{
+    uint8_t ctx[4 + 2 * 6]; /* 16 */
+    uint8_t *p = ctx;
+    const uint8_t *min, *max;
+
+    memcpy(p, mesh_ampe_akm_sae, 4);
+    p += 4;
+    mesh_order_minmax(mesh_ctx.mesh_mac, peer->mac, 6, &min, &max);
+    memcpy(p, min, 6);
+    p += 6;
+    memcpy(p, max, 6);
+
+    uint8_t pmk64[64];
+    memcpy(pmk64, mesh_p2_pmk, 32);
+    memset(pmk64 + 32, 0, 32);
+    mmint_sha256_prf(pmk64, sizeof(pmk64), "AEK Derivation",
+                     ctx, sizeof(ctx), peer->aek, sizeof(peer->aek));
 }
 
 /* Per-peer key install at ESTAB — mirrors hostap mesh_mpm_plink_estab (mesh_mpm.c:916-960).
@@ -754,8 +877,21 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
      * umac_keys_install_key populates the peer-stad keychain (so the unicast TX path sets Protected
      * + selects the pairwise key) AND installs to firmware at peer->aid -- same slots as the old raw
      * calls. The datapath maps the peer's address -> this stad (umac_mesh_get_peer_stad). */
+    /* Derive the per-pair MTK + AEK from the exchanged nonces (P2b). Both ends order min/max
+     * identically (memcmp nonces/MACs, numeric LIDs) so they agree on the key. peer_nonce must be
+     * learned from the peer's Open/Confirm by now (set in umac_mesh_handle_action). */
+    if (!peer->peer_nonce_valid)
+    {
+        printf("MESH-SEC WARN aid=%u: ESTAB without peer nonce — MTK will mismatch\n", peer->aid);
+    }
+    mesh_derive_mtk(peer);
+    mesh_derive_aek(peer);
+    printf("MESH-SEC derive aid=%u nonce_ok=%d mtk=%02x%02x%02x%02x aek=%02x%02x%02x%02x\n",
+           peer->aid, peer->peer_nonce_valid, peer->mtk[0], peer->mtk[1], peer->mtk[2], peer->mtk[3],
+           peer->aek[0], peer->aek[1], peer->aek[2], peer->aek[3]);
+
     struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
-    memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
+    memcpy(mtk.key_data, peer->mtk, sizeof(peer->mtk));
     enum mmwlan_status st = umac_keys_install_key(peer->stad, vif, &mtk);
     printf("MESH-SEC install MTK (pairwise) aid=%u st=%d\n", peer->aid, (int)st);
 
@@ -803,11 +939,13 @@ void mmwlan_mesh_send_test_action(void)
      * (umac_mesh_handle_action). Kept as a no-op for ABI compatibility. */
 }
 
-/* Locate the Mesh Peering Management element (117) in an action body and read its
- * link ids. Returns false if absent/malformed. *peer_plid = the sender's link id;
- * *our_llid_echo = the peer-link-id field (0 if not present). */
+/* Parse a peering action body: read the Mesh Peering Management element (117) link ids, and (P2b)
+ * locate the AMPE nonce carrier (vendor IE 221 'RIM'/type 1). Returns false if the MPM IE is
+ * absent/malformed. *peer_plid = the sender's link id; *our_llid_echo = the peer-link-id field
+ * (0 if absent); *peer_nonce_out = a pointer into @p body at the 32-byte peer nonce, or NULL. */
 static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_t action,
-                                  uint16_t *peer_plid, uint16_t *our_llid_echo)
+                                  uint16_t *peer_plid, uint16_t *our_llid_echo,
+                                  const uint8_t **peer_nonce_out)
 {
     /* Skip the fixed fields: Open=Capability(2); Confirm=Capability(2)+AID(2); Close=0. */
     uint32_t off;
@@ -824,6 +962,11 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
         off = 2; /* close: category + action only */
     }
 
+    bool found_mpm = false;
+    if (peer_nonce_out != NULL)
+    {
+        *peer_nonce_out = NULL;
+    }
     while (off + 2 <= body_len)
     {
         uint8_t id = body[off];
@@ -837,11 +980,17 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
             const uint8_t *p = &body[off + 2]; /* protocol(2), local-link-id(2)[, peer-link-id(2)] */
             *peer_plid = (uint16_t)(p[2] | (p[3] << 8));
             *our_llid_echo = (len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
-            return true;
+            found_mpm = true;
+        }
+        else if (peer_nonce_out != NULL && id == DOT11_IE_VENDOR_SPECIFIC && len == 4 + 32 &&
+                 body[off + 2] == 'R' && body[off + 3] == 'I' && body[off + 4] == 'M' &&
+                 body[off + 5] == 0x01)
+        {
+            *peer_nonce_out = &body[off + 6]; /* the 32-byte AMPE nonce */
         }
         off += 2 + len;
     }
-    return false;
+    return found_mpm;
 }
 
 /* --- HWMP path selection (minimal target behaviour) ------------------------
@@ -1540,7 +1689,9 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
 
     uint16_t peer_plid = 0;
     uint16_t our_llid_echo = 0;
-    const bool have_ie = mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo);
+    const uint8_t *peer_nonce = NULL;
+    const bool have_ie =
+        mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo, &peer_nonce);
     if (!have_ie && action != WLAN_SP_MESH_PEERING_CLOSE)
     {
         MMLOG_WRN("MESH peering from " MM_MAC_ADDR_FMT " action=%u: no Peering Mgmt IE\n",
@@ -1591,6 +1742,14 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     peer->plid = peer_plid;
     peer->retries = 0;
     peer->last_rx_ms = mmosal_get_time_ms();
+#if MMWLAN_MESH_SEC_PHASE1
+    /* Learn the peer's AMPE nonce (carried on Open/Confirm) before ESTAB derives the per-pair MTK. */
+    if (peer_nonce != NULL)
+    {
+        memcpy(peer->peer_nonce, peer_nonce, sizeof(peer->peer_nonce));
+        peer->peer_nonce_valid = true;
+    }
+#endif
 
     switch (peer->state)
     {
