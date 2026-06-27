@@ -23,6 +23,7 @@
 #include "common/consbuf.h"
 #include "common/mac_address.h"
 #include "common/morse_commands.h"
+#include <stdio.h> /* TEMP(debug): printf for MESH-SEC returns (morselib MMLOG isn't on the ESP console) */
 #include "mmdrv.h"
 #include "mmhal_wlan.h"
 #include "mmlog.h"
@@ -291,12 +292,23 @@ enum mesh_plink_state
 
 #define MESH_MAX_PEERS (4)
 
+/* Phase-1 mesh-security EXPERIMENT: install a static MTK/MGTK to prove the MM6108 firmware
+ * accepts SET_STA_STATE + INSTALL_KEY on a MESH vif. Derived from the Linux MESH path (NOT the AP
+ * association flow): own group key at start = hostap __mesh_rsn_auth_init (mesh_rsn.c:216-231);
+ * per-peer keys at ESTAB = mesh_mpm_plink_estab (mesh_mpm.c:916-960); the firmware command mapping
+ * is morse_driver mac.c set_key/sta_state. See docs/mesh-ap/rimba-mesh-security-codemap.md. Keys
+ * are FIXED/shared, not AMPE/SAE-derived — P2 (AMPE) + P3 (SAE) replace them. 0 = restore open mesh. */
+#ifndef MMWLAN_MESH_SEC_PHASE1
+#define MMWLAN_MESH_SEC_PHASE1 (1)
+#endif
+
 struct mesh_peer
 {
     bool used;
     uint8_t mac[MMWLAN_MAC_ADDR_LEN];
     uint16_t llid; /* our local link id for this peer */
     uint16_t plid; /* the peer's link id */
+    uint16_t aid;  /* firmware station AID for this peer (index+1; AP gets this from hostapd) */
     enum mesh_plink_state state;
     uint8_t retries; /* Open retransmits (or holding ticks while HOLDING) */
     uint32_t last_rx_ms; /* last frame heard from this peer (mac80211 sta last_rx) */
@@ -363,6 +375,10 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             p->used = true;
             mac_addr_copy(p->mac, mac);
             p->state = MESH_PLINK_LISTEN;
+            /* AID = pool index + 1 (non-zero; AID 0 is the group key). Linux mesh assigns the
+             * peer AID in wpa_supplicant (hostapd_get_aid, mesh_mpm.c:798); morselib has no
+             * supplicant, so we self-assign from the fixed peer pool (platform divergence). */
+            p->aid = (uint16_t)(i + 1);
             p->last_rx_ms = mmosal_get_time_ms();
             /* A non-zero local link id, generated per peer (mac80211 mesh_plink_open). */
             do
@@ -609,6 +625,67 @@ static void umac_mesh_link_up_once(void)
     umac_connection_signal_link_state(umac_data_get_umacd(), MMWLAN_VIF_AP, MMWLAN_LINK_UP);
     MMLOG_INF("MESH link up (first peer established)\n");
 }
+
+#if MMWLAN_MESH_SEC_PHASE1
+/* Phase-1 static test keys: a fixed 128-bit MTK + MGTK, identical on every node so a
+ * static-key ESP mesh still interoperates. NOT secure (no per-pair derivation) — this only
+ * exercises the firmware key-install path. */
+static const uint8_t mesh_p1_mtk[16] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+};
+static const uint8_t mesh_p1_mgtk[16] = {
+    0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
+    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00
+};
+
+/* Own TX group key — mirrors hostap __mesh_rsn_auth_init (mesh_rsn.c:216-231): at mesh START
+ * each node installs its OWN MGTK once, keyed to the group so it can encrypt its broadcast/group
+ * TX. Linux: wpa_drv_set_key(addr=broadcast, key_idx=1, set_tx=1, KEY_FLAG_GROUP_TX_DEFAULT);
+ * morse_driver maps a group key (no sta) to aid=0 (mac.c:5153) -> INSTALL_KEY{GTK, aid=0, idx=1}.
+ * (The own IGTK is BIP, which morse handles in software (mac.c:5187), so it is NOT sent to FW.)
+ * This is the step the AP path lacks — an AP installs one BSS GTK, not a per-node mesh group key. */
+static void umac_mesh_install_own_group_key(void)
+{
+    struct mmdrv_key_conf mgtk = { .is_pairwise = false, .tx_pn = 0, .length = 16, .key_idx = 1 };
+    memcpy(mgtk.key, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    int ret = mmdrv_install_key(mesh_ctx.vif_id, 0 /* aid 0 = own group TX key */, &mgtk);
+    printf("MESH-SEC own MGTK (group TX) aid=0 ret=%d\n", ret);
+}
+
+/* Per-peer key install at ESTAB — mirrors hostap mesh_mpm_plink_estab (mesh_mpm.c:916-960).
+ * Linux drives the peer sta up to AUTHORIZED via SET_STATION plink-state; morse_driver forwards
+ * one SET_STA_STATE per transition but FILTERS NOTEXIST/NONE (mac.c:4813), so AUTH is the first
+ * firmware command and the station is created there. Keys install once the peer is AUTHORIZED:
+ *   - MTK  pairwise, key_idx 0, aid=peer  (mesh_mpm.c:928 KEY_FLAG_PAIRWISE_RX_TX -> PTK)
+ *   - MGTK group RX, key_idx 1, aid=peer  (mesh_mpm.c:938 KEY_FLAG_GROUP_RX     -> GTK)
+ * The peer IGTK (mesh_mpm.c:945) is BIP -> software on morse (mac.c:5187), not sent to FW.
+ * Logs every return so we can confirm the firmware accepts these on a MESH vif (the -116 question). */
+static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
+{
+    uint16_t vif = mesh_ctx.vif_id;
+    static const enum morse_sta_state seq[] = {
+        MORSE_STA_AUTHENTICATED, MORSE_STA_ASSOCIATED, MORSE_STA_AUTHORIZED
+    };
+    int ret;
+
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+    {
+        ret = mmdrv_update_sta_state(vif, peer->aid, peer->mac, seq[i]);
+        printf("MESH-SEC sta_state aid=%u state=%u ret=%d\n", peer->aid, seq[i], ret);
+    }
+
+    struct mmdrv_key_conf mtk = { .is_pairwise = true, .tx_pn = 0, .length = 16, .key_idx = 0 };
+    memcpy(mtk.key, mesh_p1_mtk, sizeof(mesh_p1_mtk));
+    ret = mmdrv_install_key(vif, peer->aid, &mtk);
+    printf("MESH-SEC install MTK (pairwise) aid=%u ret=%d\n", peer->aid, ret);
+
+    struct mmdrv_key_conf mgtk = { .is_pairwise = false, .tx_pn = 0, .length = 16, .key_idx = 1 };
+    memcpy(mgtk.key, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    ret = mmdrv_install_key(vif, peer->aid, &mgtk);
+    printf("MESH-SEC install peer MGTK (group RX) aid=%u ret=%d\n", peer->aid, ret);
+}
+#endif /* MMWLAN_MESH_SEC_PHASE1 */
 
 void mmwlan_mesh_peer_open(const uint8_t *peer_mac)
 {
@@ -1469,6 +1546,9 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
             peer->state = MESH_PLINK_ESTAB;
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
+#if MMWLAN_MESH_SEC_PHASE1
+            umac_mesh_peer_secure_estab(peer);
+#endif
         }
         else if (action == WLAN_SP_MESH_PEERING_OPEN)
         {
@@ -1483,6 +1563,9 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
             peer->state = MESH_PLINK_ESTAB;
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
+#if MMWLAN_MESH_SEC_PHASE1
+            umac_mesh_peer_secure_estab(peer);
+#endif
         }
         break;
 
@@ -1671,6 +1754,15 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
     MMLOG_INF("MESH up on chan %u, Mesh ID \"%.*s\" BSSID " MM_MAC_ADDR_FMT "\n",
               args->s1g_chan_num, (int)args->mesh_id_len, (const char *)args->mesh_id,
               MM_MAC_ADDR_VAL(mesh_ctx.mesh_mac));
+
+#if MMWLAN_MESH_SEC_PHASE1
+    /* NOTE: hostap installs the own MGTK here at mesh start (__mesh_rsn_auth_init, mesh_rsn.c:266),
+     * but Linux peering is AMPE-PROTECTED from the start. With morselib's OPEN MPM, installing a
+     * group key before peering flips the firmware to expect protected frames and the unprotected
+     * peering Open/Confirm get dropped -> no ESTAB (proven: PHASE1=1 fails to peer, PHASE1=0 peers,
+     * same clear channel). So we DEFER the own-MGTK to the first ESTAB (umac_mesh_peer_secure_estab),
+     * a forced divergence from Linux that only resolves once AMPE-protected peering lands (P2). */
+#endif
 
     /* P1 is beacon-only: do NOT signal link-up. Bringing the netif up makes lwIP
      * immediately TX (IPv6 RS / mDNS) through the mesh vif, but the mesh DATA path
