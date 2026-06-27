@@ -102,6 +102,12 @@ bool umac_datapath_process(struct umac_data *umacd);
 
 enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struct mmpkt *txbuf);
 
+/* Send a pre-built mesh group-addressed data frame, CCMP-encrypting it under the stad's GROUP key
+ * (the forwarder's own MGTK) when security != OPEN. Used by the mesh group-forward re-broadcast so a
+ * forwarded multicast is encrypted on every hop (umac_datapath_tx_mgmt_frame leaves data frames
+ * plaintext — its encryption is for robust management frames only). */
+enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf);
+
 
 enum mmwlan_status umac_datapath_tx_mgmt_frame_ap(struct umac_data *umacd,
                                                   struct mmpkt *txbuf,
