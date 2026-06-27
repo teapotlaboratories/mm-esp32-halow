@@ -1691,7 +1691,10 @@ bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t s
         if (frame != NULL)
         {
             mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
-            (void)umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
+            /* Encrypt the re-broadcast under our own MGTK (group key on the common stad) — a forwarded
+             * multicast must be protected on every hop, like mac80211. umac_datapath_tx_mgmt_frame
+             * would leave it plaintext (its encryption is for robust mgmt frames only). */
+            (void)umac_datapath_tx_mesh_group_frame(mesh_ctx.common_stad, frame);
         }
     }
     return false; /* fresh — deliver locally too */

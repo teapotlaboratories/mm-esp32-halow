@@ -2295,6 +2295,75 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     return MMWLAN_SUCCESS;
 }
 
+/* Send a pre-built mesh GROUP-addressed (broadcast/multicast) data frame — the re-broadcast of a
+ * forwarded group frame (umac_mesh_handle_group_data). umac_datapath_tx_mgmt_frame can't be reused:
+ * its encryption path is for robust *management* frames (PMF/pairwise) and it overwrites the tx
+ * metadata, so a forwarded data frame goes out in the clear. This applies the *data-path* rule
+ * instead — when the stad's security != OPEN, encrypt under the GROUP key (the forwarder's own MGTK
+ * on the common stad) so a forwarded multicast is CCMP-protected on every hop, mirroring how
+ * net/mac80211 re-encrypts a forwarded mesh group frame with the local MGTK on re-TX. The 802.11
+ * header + Mesh Control + payload are already built (umac_mesh_build_rebcast); the firmware inserts
+ * the CCMP header for HW_ENC frames. */
+enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    enum mmwlan_status status;
+    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    struct mmpktview *txbufview = mmpkt_open(txbuf);
+    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(txbufview);
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+
+    DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
+                                               sta_data->tx_seq_num_spaces[MMDRV_SEQ_NUM_BASELINE]++);
+
+    int key_id = -1;
+    if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN)
+    {
+        key_id = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_GROUP);
+        if (key_id >= 0)
+        {
+            header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+        }
+        else
+        {
+            MMLOG_WRN("MESH group forward: no group key installed, sending in the clear\n");
+        }
+    }
+
+    tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    if (key_id >= 0)
+    {
+        tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+        tx_metadata->key_idx = key_id;
+        umac_keys_increment_tx_seq(stad, key_id);
+    }
+    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->aid = umac_sta_data_get_aid(stad);
+    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+
+    uint16_t pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
+    uint32_t timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
+    status = umac_datapath_wait_for_tx_ready_(data, timeout_ms, pause_mask);
+    if (status != MMWLAN_SUCCESS)
+    {
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
+    umac_stats_update_last_tx_time(umacd);
+
+    mmpkt_close(&txbufview);
+    if (mmdrv_tx_frame(txbuf, true) < 0)
+    {
+        return MMWLAN_ERROR;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
 void umac_datapath_handle_tx_status(struct umac_data *umacd, struct mmpkt *mmpkt)
 {
     struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
