@@ -77,6 +77,9 @@ struct umac_mesh_context
     /* "Common" stad represents the MBSS for broadcast/multicast + mgmt TX (mirrors the
      * IBSS common stad). Per-peer stads are added with MPM peering. */
     struct umac_sta_data *common_stad;
+    /* P2c: this node's own MGTK — generated once at mesh start (mac80211 __mesh_rsn_auth_init), used
+     * as the group-TX key on the common stad and advertised to each peer in our Open. */
+    uint8_t own_mgtk[16];
 };
 
 /* Single interface is supported, so a file-static context is sufficient. */
@@ -332,6 +335,11 @@ struct mesh_peer
     bool peer_nonce_valid;
     uint8_t mtk[16]; /* derived per-pair pairwise key (replaces the static mesh_p1_mtk) */
     uint8_t aek[32]; /* derived AMPE encryption key (P2d AES-SIV) */
+    /* P2c: the peer's own MGTK (its group-TX key), learned from its Open, installed as our group-RX
+     * key for this peer so we can decrypt its broadcast/multicast (replaces the static mesh_p1_mgtk). */
+    uint8_t peer_mgtk[16];
+    uint8_t peer_mgtk_rsc[8];
+    bool peer_mgtk_valid;
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
@@ -477,6 +485,7 @@ struct mesh_peering_params
     uint16_t plid;   /* echoed peer id; included for Confirm (and Close if non-zero) */
     uint16_t reason; /* Close only */
     const uint8_t *my_nonce; /* P2b: 32-byte local AMPE nonce carried on Open/Confirm (NULL = omit) */
+    const uint8_t *my_mgtk;  /* P2c: 16-byte own MGTK carried on Open only (NULL = omit, e.g. Confirm) */
 };
 
 static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf, void *params)
@@ -542,14 +551,28 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
         consbuf_append(buf, (const uint8_t *)&v, sizeof(v));
     }
 
-    /* P2b AMPE nonce carrier — throwaway scaffolding, replaced by the real AES-SIV AMPE element (139)
-     * in P2d. A vendor-specific IE (221) holding our 32-byte local nonce, on Open + Confirm only, so
-     * the peer can derive the matching per-pair MTK. Marker OUI 'RIM' + type 0x01. */
+    /* P2b/P2c AMPE carrier — throwaway scaffolding, replaced by the real AES-SIV AMPE element (139)
+     * in P2d. A vendor-specific IE (221, marker 'RIM') holding our 32-byte AMPE nonce, and on Open
+     * also our 16-byte MGTK + 8-byte RSC (GTKdata is Open-only, like AMPE). type 1 = nonce only
+     * (Confirm); type 2 = nonce + GTKdata (Open). */
     if (!is_close && p->my_nonce != NULL)
     {
-        const uint8_t nonce_ie_hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32, 'R', 'I', 'M', 0x01 };
-        consbuf_append(buf, nonce_ie_hdr, sizeof(nonce_ie_hdr));
-        consbuf_append(buf, p->my_nonce, 32);
+        const bool is_open = (p->action == WLAN_SP_MESH_PEERING_OPEN);
+        if (is_open && p->my_mgtk != NULL)
+        {
+            const uint8_t hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32 + 16 + 8, 'R', 'I', 'M', 0x02 };
+            const uint8_t rsc[8] = { 0 }; /* P2c bring-up: own MGTK PN starts at 0 */
+            consbuf_append(buf, hdr, sizeof(hdr));
+            consbuf_append(buf, p->my_nonce, 32);
+            consbuf_append(buf, p->my_mgtk, 16);
+            consbuf_append(buf, rsc, sizeof(rsc));
+        }
+        else
+        {
+            const uint8_t hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32, 'R', 'I', 'M', 0x01 };
+            consbuf_append(buf, hdr, sizeof(hdr));
+            consbuf_append(buf, p->my_nonce, 32);
+        }
     }
 }
 
@@ -569,6 +592,7 @@ static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh
         .plid = peer->plid,
         .reason = reason,
         .my_nonce = peer->my_nonce, /* build_peering omits it on Close */
+        .my_mgtk = mesh_ctx.own_mgtk, /* build_peering emits it on Open only */
     };
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_peering, &params);
     if (frame == NULL)
@@ -717,16 +741,12 @@ static void umac_mesh_link_up_once(void)
 }
 
 #if MMWLAN_MESH_SEC_PHASE1
-/* Phase-1 static test keys: a fixed 128-bit MTK + MGTK, identical on every node so a
- * static-key ESP mesh still interoperates. NOT secure (no per-pair derivation) — this only
- * exercises the firmware key-install path. */
+/* Phase-1 static MTK — still the common stad's pairwise key (key_idx 0), a vestigial fallback for the
+ * unicast-to-unknown-peer error path; real unicast uses the per-pair derived MTK on the per-peer stad
+ * (P2b). The static MGTK is gone — group keys are now per-node (own_mgtk TX, peer_mgtk RX) in P2c. */
 static const uint8_t mesh_p1_mtk[16] = {
     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
     0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
-};
-static const uint8_t mesh_p1_mgtk[16] = {
-    0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
-    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00
 };
 
 /* P2 (AMPE) static PMK — identical on every node so a static-PMK ESP mesh derives matching per-pair
@@ -756,9 +776,10 @@ static void umac_mesh_install_common_keys(void)
      * Protected + the right key_idx; the firmware additionally holds per-peer copies at each peer's
      * AID (installed at ESTAB) for the actual per-peer crypto. Static/shared keys -> one MTK/MGTK. */
     struct umac_key mgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
-    memcpy(mgtk.key_data, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    memcpy(mgtk.key_data, mesh_ctx.own_mgtk, sizeof(mesh_ctx.own_mgtk)); /* P2c: this node's own MGTK */
     enum mmwlan_status st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mgtk);
-    printf("MESH-SEC common MGTK (group TX) aid=0 st=%d\n", (int)st);
+    printf("MESH-SEC common MGTK (group TX) aid=0 mgtk=%02x%02x%02x%02x st=%d\n",
+           mesh_ctx.own_mgtk[0], mesh_ctx.own_mgtk[1], mesh_ctx.own_mgtk[2], mesh_ctx.own_mgtk[3], (int)st);
 
     struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
     memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
@@ -895,10 +916,21 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
     enum mmwlan_status st = umac_keys_install_key(peer->stad, vif, &mtk);
     printf("MESH-SEC install MTK (pairwise) aid=%u st=%d\n", peer->aid, (int)st);
 
+    /* Install the peer's own MGTK (learned from its Open) as our group-RX key for this peer, so its
+     * broadcast/multicast decrypts under the peer's key (P2c). RX routes a group frame to the
+     * transmitter's per-peer stad (lookup_stad_by_peer_addr_mesh by TA). */
+    if (!peer->peer_mgtk_valid)
+    {
+        printf("MESH-SEC WARN aid=%u: ESTAB without peer MGTK — its group frames won't decrypt\n",
+               peer->aid);
+    }
     struct umac_key pmgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
-    memcpy(pmgtk.key_data, mesh_p1_mgtk, sizeof(mesh_p1_mgtk));
+    memcpy(pmgtk.key_data, peer->peer_mgtk, sizeof(peer->peer_mgtk));
+    /* rx_seq (replay counter) left zeroed: P2c advertises RSC=0 (own MGTK PN starts at 0 when sent in
+     * the Open, before group TX begins). Applying a non-zero RSC is deferred with the real AMPE in P2d. */
     st = umac_keys_install_key(peer->stad, vif, &pmgtk);
-    printf("MESH-SEC install peer MGTK (group RX) aid=%u st=%d\n", peer->aid, (int)st);
+    printf("MESH-SEC install peer MGTK (group RX) aid=%u mgtk=%02x%02x%02x%02x st=%d\n", peer->aid,
+           peer->peer_mgtk[0], peer->peer_mgtk[1], peer->peer_mgtk[2], peer->peer_mgtk[3], (int)st);
 }
 #endif /* MMWLAN_MESH_SEC_PHASE1 */
 
@@ -939,13 +971,14 @@ void mmwlan_mesh_send_test_action(void)
      * (umac_mesh_handle_action). Kept as a no-op for ABI compatibility. */
 }
 
-/* Parse a peering action body: read the Mesh Peering Management element (117) link ids, and (P2b)
- * locate the AMPE nonce carrier (vendor IE 221 'RIM'/type 1). Returns false if the MPM IE is
- * absent/malformed. *peer_plid = the sender's link id; *our_llid_echo = the peer-link-id field
- * (0 if absent); *peer_nonce_out = a pointer into @p body at the 32-byte peer nonce, or NULL. */
+/* Parse a peering action body: read the Mesh Peering Management element (117) link ids, and (P2b/P2c)
+ * the AMPE carrier (vendor IE 221 'RIM'): type 1 = 32-byte nonce (Confirm), type 2 = nonce + 16-byte
+ * MGTK + 8-byte RSC (Open). Returns false if the MPM IE is absent/malformed. *peer_plid = the sender's
+ * link id; *our_llid_echo = the peer-link-id field (0 if absent); *peer_nonce_out / *peer_mgtk_out =
+ * pointers into @p body at the 32-byte nonce / 16-byte MGTK, or NULL. */
 static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_t action,
                                   uint16_t *peer_plid, uint16_t *our_llid_echo,
-                                  const uint8_t **peer_nonce_out)
+                                  const uint8_t **peer_nonce_out, const uint8_t **peer_mgtk_out)
 {
     /* Skip the fixed fields: Open=Capability(2); Confirm=Capability(2)+AID(2); Close=0. */
     uint32_t off;
@@ -967,6 +1000,10 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
     {
         *peer_nonce_out = NULL;
     }
+    if (peer_mgtk_out != NULL)
+    {
+        *peer_mgtk_out = NULL;
+    }
     while (off + 2 <= body_len)
     {
         uint8_t id = body[off];
@@ -982,11 +1019,15 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
             *our_llid_echo = (len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
             found_mpm = true;
         }
-        else if (peer_nonce_out != NULL && id == DOT11_IE_VENDOR_SPECIFIC && len == 4 + 32 &&
-                 body[off + 2] == 'R' && body[off + 3] == 'I' && body[off + 4] == 'M' &&
-                 body[off + 5] == 0x01)
+        else if (peer_nonce_out != NULL && id == DOT11_IE_VENDOR_SPECIFIC && len >= 4 + 32 &&
+                 body[off + 2] == 'R' && body[off + 3] == 'I' && body[off + 4] == 'M')
         {
             *peer_nonce_out = &body[off + 6]; /* the 32-byte AMPE nonce */
+            /* type 2 (Open) additionally carries MGTK(16) + RSC(8) right after the nonce. */
+            if (body[off + 5] == 0x02 && len == 4 + 32 + 16 + 8 && peer_mgtk_out != NULL)
+            {
+                *peer_mgtk_out = &body[off + 6 + 32]; /* 16-byte MGTK (RSC follows at +16) */
+            }
         }
         off += 2 + len;
     }
@@ -1690,8 +1731,9 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     uint16_t peer_plid = 0;
     uint16_t our_llid_echo = 0;
     const uint8_t *peer_nonce = NULL;
-    const bool have_ie =
-        mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo, &peer_nonce);
+    const uint8_t *peer_mgtk = NULL;
+    const bool have_ie = mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo,
+                                               &peer_nonce, &peer_mgtk);
     if (!have_ie && action != WLAN_SP_MESH_PEERING_CLOSE)
     {
         MMLOG_WRN("MESH peering from " MM_MAC_ADDR_FMT " action=%u: no Peering Mgmt IE\n",
@@ -1743,11 +1785,18 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     peer->retries = 0;
     peer->last_rx_ms = mmosal_get_time_ms();
 #if MMWLAN_MESH_SEC_PHASE1
-    /* Learn the peer's AMPE nonce (carried on Open/Confirm) before ESTAB derives the per-pair MTK. */
+    /* Learn the peer's AMPE nonce (Open/Confirm) before ESTAB derives the per-pair MTK, and (Open
+     * only) the peer's own MGTK + RSC, installed as our group-RX key for this peer at ESTAB. */
     if (peer_nonce != NULL)
     {
         memcpy(peer->peer_nonce, peer_nonce, sizeof(peer->peer_nonce));
         peer->peer_nonce_valid = true;
+    }
+    if (peer_mgtk != NULL)
+    {
+        memcpy(peer->peer_mgtk, peer_mgtk, sizeof(peer->peer_mgtk));
+        memcpy(peer->peer_mgtk_rsc, peer_mgtk + 16, sizeof(peer->peer_mgtk_rsc));
+        peer->peer_mgtk_valid = true;
     }
 #endif
 
@@ -1948,6 +1997,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
 #if MMWLAN_MESH_SEC_PHASE1
         /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB). */
         umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+        /* P2c: generate this node's own MGTK once per mesh session, before any peering Open carries
+         * it (mac80211 __mesh_rsn_auth_init). The install onto the common stad stays deferred to first
+         * ESTAB (umac_mesh_install_common_keys) — a group key at start breaks OPEN peering (P1 gotcha). */
+        mmint_crypto_get_random(mesh_ctx.own_mgtk, sizeof(mesh_ctx.own_mgtk));
 #endif
     }
     umac_datapath_configure_mesh_mode(umacd);
