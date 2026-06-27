@@ -54,6 +54,7 @@ struct umac_mesh_context
 {
     bool active;
     bool link_up;        /* netif signalled up (after first peer ESTAB) */
+    bool group_tx_key_installed; /* P1: own MGTK (group TX) installed at first ESTAB (deferred from start) */
     uint8_t mesh_mac[6]; /* our MAC: SA and BSSID in beacons */
     uint8_t mesh_id[MORSE_CMD_MESH_ID_LEN_MAX];
     uint8_t mesh_id_len;
@@ -668,6 +669,15 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
         MORSE_STA_AUTHENTICATED, MORSE_STA_ASSOCIATED, MORSE_STA_AUTHORIZED
     };
     int ret;
+
+    /* Install our own MGTK (group TX, aid=0) on the FIRST ESTAB — deferred from mesh start
+     * (where it breaks open peering). Once per mesh session; subsequent peers reuse it. With
+     * the own group key + the peer's group RX key (below), broadcast/group frames encrypt. */
+    if (!mesh_ctx.group_tx_key_installed)
+    {
+        umac_mesh_install_own_group_key();
+        mesh_ctx.group_tx_key_installed = true;
+    }
 
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
