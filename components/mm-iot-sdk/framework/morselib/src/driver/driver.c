@@ -662,6 +662,10 @@ int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_typ
             if_type = MORSE_CMD_INTERFACE_TYPE_ADHOC;
             break;
 
+        case MMDRV_INTERFACE_TYPE_MESH:
+            if_type = MORSE_CMD_INTERFACE_TYPE_MESH;
+            break;
+
         default:
             return -EINVAL;
     }
@@ -953,6 +957,102 @@ int mmdrv_cfg_ibss(uint16_t vif_id,
     memcpy(cmd.ibss_bssid, bssid, sizeof(cmd.ibss_bssid));
 
     return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
+}
+
+/* SET_MESH_CONFIG (0xA018) — mirror morse_driver morse_cmd_set_mesh_config. */
+int mmdrv_set_mesh_config(uint16_t vif_id,
+                          const uint8_t *mesh_id,
+                          uint8_t mesh_id_len,
+                          bool beaconless_mode,
+                          uint8_t max_plinks)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+    if (mesh_id_len > MORSE_CMD_MESH_ID_LEN_MAX)
+    {
+        return -EINVAL;
+    }
+
+    struct morse_cmd_req_set_mesh_config cmd = MORSE_COMMAND_INIT(cmd,
+                                                                  MORSE_CMD_ID_SET_MESH_CONFIG,
+                                                                  vif_id,
+                                                                  .mesh_id_len = mesh_id_len,
+                                                                  .mesh_beaconless_mode =
+                                                                      beaconless_mode ? 1 : 0,
+                                                                  .max_plinks = max_plinks);
+    memcpy(cmd.mesh_id, mesh_id, mesh_id_len);
+
+    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
+}
+
+/* BSSID_SET (0x0052) — set the vif's BSSID. Mirrors morse_driver morse_cmd_set_bssid. */
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_req_bssid_set cmd =
+        MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_BSSID_SET, vif_id);
+    memcpy(cmd.bssid, bssid, sizeof(cmd.bssid));
+
+    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 0);
+}
+
+/* BSS_BEACON_CONFIG (0x003D) — enable/disable the firmware beacon timer. Mirrors
+ * morse_driver morse_cmd_config_beacon_timer. */
+int mmdrv_config_beacon_timer(uint16_t vif_id, bool enable)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_resp_bss_beacon_config resp = { 0 };
+    struct morse_cmd_req_bss_beacon_config cmd = MORSE_COMMAND_INIT(cmd,
+                                                                    MORSE_CMD_ID_BSS_BEACON_CONFIG,
+                                                                    vif_id,
+                                                                    .enable = enable ? 1 : 0);
+
+    return morse_cmd_tx(&driver_data, (struct morse_cmd_resp *)&resp,
+                        (struct morse_cmd_req *)&cmd, sizeof(resp), 0);
+}
+
+/* MESH_CONFIG (0x0039) — mirror morse_driver morse_cmd_cfg_mesh. MBCA is left
+ * disabled (config 0, zero gaps) for now; that is also what the driver sends when
+ * MBCA TBTT selection/adjustment is off. */
+int mmdrv_cfg_mesh(uint16_t vif_id, bool start, bool enable_beaconing)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_req_mesh_config cmd = MORSE_COMMAND_INIT(cmd,
+                                                              MORSE_CMD_ID_MESH_CONFIG,
+                                                              vif_id,
+                                                              .mesh_cfg_opcode =
+                                                                  start ?
+                                                                      MORSE_CMD_MESH_CONFIG_OPCODE_START :
+                                                                      MORSE_CMD_MESH_CONFIG_OPCODE_STOP);
+
+    /* Mirror morse_cmd_cfg_mesh: when beaconing, hand the firmware its MBCA config and
+     * timing defaults so it runs the TBTT-selection scan and starts beaconing. mbca_config
+     * must be non-zero here (zero == beaconless mode), else the firmware wedges. */
+    if (enable_beaconing)
+    {
+        cmd.enable_beaconing = 1;
+        cmd.mbca_config = MORSE_MESH_MBCA_CFG_TBTT_SEL_ENABLE;
+        cmd.min_beacon_gap_ms = MORSE_MESH_DEFAULT_MIN_BEACON_GAP_MS;
+        cmd.mbss_start_scan_duration_ms = htole16(MORSE_MESH_DEFAULT_MBSS_SCAN_DURATION_MS);
+        cmd.tbtt_adj_timer_interval_ms = htole16(MORSE_MESH_DEFAULT_TBTT_ADJ_INTERVAL_MS);
+    }
+
+    /* Generous timeout: the firmware runs a ~2 s MBSS start scan before responding. */
+    return morse_cmd_tx(&driver_data, NULL, (struct morse_cmd_req *)&cmd, 0, 5000);
 }
 
 int mmdrv_update_sta_state(uint16_t vif_id,

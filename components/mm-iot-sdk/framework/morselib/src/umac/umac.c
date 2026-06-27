@@ -2012,6 +2012,12 @@ enum mmwlan_status mmwlan_register_rx_frame_cb(uint32_t filter,
     return umac_datapath_register_rx_frame_cb(umacd, filter, callback, arg);
 }
 
+enum mmwlan_status mmwlan_register_monitor_cb(mmwlan_monitor_rx_cb_t callback, void *arg)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    return umac_datapath_register_monitor_cb(umacd, callback, arg);
+}
+
 enum mmwlan_status mmwlan_get_serialized_umac_stats(uint8_t *buf, size_t *len)
 {
     struct umac_data *umacd = umac_data_get_umacd();

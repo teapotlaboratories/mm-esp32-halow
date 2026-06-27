@@ -74,6 +74,11 @@ struct umac_datapath_data
 
     uint32_t rx_frame_filter;
 
+    /* Promiscuous monitor callback: fires for every RX frame before filtering. */
+    mmwlan_monitor_rx_cb_t monitor_cb;
+
+    void *monitor_cb_arg;
+
     const struct umac_datapath_ops *ops;
 };
 

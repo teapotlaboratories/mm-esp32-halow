@@ -301,6 +301,49 @@ enum mmwlan_status mmwlan_register_rx_frame_cb(uint32_t filter,
                                                void *arg);
 
 /**
+ * Information about a frame delivered to the promiscuous monitor callback.
+ */
+struct mmwlan_monitor_rx_info
+{
+    /** Pointer to the raw received 802.11 frame (header onwards). */
+    const uint8_t *buf;
+    /** Length of @c buf in bytes. */
+    uint32_t buf_len;
+    /** Frequency at which the frame was received (in 100 kHz). */
+    uint16_t freq_100khz;
+    /** RSSI of the received frame, in dBm. */
+    int16_t rssi_dbm;
+    /** Bandwidth in MHz at which the frame was received. */
+    uint8_t bw_mhz;
+};
+
+/**
+ * Promiscuous monitor callback prototype.
+ *
+ * Invoked for @em every 802.11 frame the firmware delivers to the host, at the datapath
+ * RX entry point, @em before any address/BSSID filtering or upper-MAC handling. Unlike
+ * @ref mmwlan_rx_frame_cb_t (which fires only for management sub-types matching a filter,
+ * and only after the normal datapath has accepted the frame), this surfaces all frames the
+ * firmware hands up — including foreign-BSSID beacons that the datapath would otherwise
+ * discard. This is what a monitor/sniffer build uses.
+ *
+ * @warning Advanced use only. Keep work to an absolute minimum, do not modify the buffer,
+ * and do not call any mmwlan API from within the callback. The buffer is only valid for the
+ * duration of the call.
+ */
+typedef void (*mmwlan_monitor_rx_cb_t)(const struct mmwlan_monitor_rx_info *info, void *arg);
+
+/**
+ * Register (or clear) the promiscuous monitor callback.
+ *
+ * @param callback Callback to invoke for every received frame, or @c NULL to clear.
+ * @param arg      Opaque argument passed through to the callback.
+ *
+ * @return MMWLAN_SUCCESS.
+ */
+enum mmwlan_status mmwlan_register_monitor_cb(mmwlan_monitor_rx_cb_t callback, void *arg);
+
+/**
  * Retrieve UMAC statistics in serialized (TLV) form.
  *
  * @param buf   Buffer to serialize into.

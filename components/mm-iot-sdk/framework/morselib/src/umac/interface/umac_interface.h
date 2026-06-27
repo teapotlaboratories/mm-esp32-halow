@@ -30,8 +30,12 @@ enum umac_interface_type
      *  with STA/SCAN/AP. */
     UMAC_INTERFACE_ADHOC = 16,
 
+    /** 802.11s mesh interface. Like IBSS the host self-beacons with no
+     *  association; mutually exclusive with everything else. */
+    UMAC_INTERFACE_MESH = 32,
+
     UMAC_INTERFACE_ALL = (UMAC_INTERFACE_NONE | UMAC_INTERFACE_SCAN | UMAC_INTERFACE_STA |
-                          UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC),
+                          UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC | UMAC_INTERFACE_MESH),
 };
 
 

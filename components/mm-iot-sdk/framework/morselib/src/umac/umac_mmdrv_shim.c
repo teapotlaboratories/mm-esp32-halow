@@ -7,6 +7,7 @@
 #include "mmlog.h"
 #include "umac/ap/umac_ap.h"
 #include "umac/ibss/umac_ibss.h"
+#include "umac/mesh/umac_mesh.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/connection/umac_connection.h"
@@ -211,6 +212,10 @@ struct mmpkt *mmdrv_host_get_beacon(void)
     if (umac_ibss_is_active())
     {
         return umac_ibss_get_beacon(umacd);
+    }
+    if (umac_mesh_is_active())
+    {
+        return umac_mesh_get_beacon(umacd);
     }
     return umac_ap_get_beacon(umacd);
 }

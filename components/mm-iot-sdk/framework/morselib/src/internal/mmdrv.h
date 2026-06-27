@@ -269,7 +269,57 @@ enum mmdrv_interface_type
     MMDRV_INTERFACE_TYPE_AP = 2,
     /** An IBSS / ad-hoc interface */
     MMDRV_INTERFACE_TYPE_ADHOC = 4,
+    /** An 802.11s mesh interface */
+    MMDRV_INTERFACE_TYPE_MESH = 5,
 };
+
+/**
+ * Configure mesh ID / peer-link limits (SET_MESH_CONFIG, 0xA018).
+ *
+ * @param vif_id            VIF ID of the mesh interface.
+ * @param mesh_id           Mesh ID (equivalent to SSID).
+ * @param mesh_id_len       Length of @p mesh_id (<= MORSE_CMD_MESH_ID_LEN_MAX).
+ * @param beaconless_mode   Non-zero to disable self-beaconing.
+ * @param max_plinks        Maximum number of mesh peer links.
+ *
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_set_mesh_config(uint16_t vif_id,
+                          const uint8_t *mesh_id,
+                          uint8_t mesh_id_len,
+                          bool beaconless_mode,
+                          uint8_t max_plinks);
+
+/**
+ * Start or stop the mesh BSS (MESH_CONFIG, 0x0039).
+ *
+ * @param vif_id            VIF ID of the mesh interface.
+ * @param start             True to start the mesh BSS, false to stop it.
+ * @param enable_beaconing  True to have the firmware generate beacons.
+ *
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_cfg_mesh(uint16_t vif_id, bool start, bool enable_beaconing);
+
+/**
+ * Enable/disable the firmware beacon timer (BSS_BEACON_CONFIG, 0x003D).
+ *
+ * @param vif_id   VIF ID.
+ * @param enable   True to enable the firmware beacon timer.
+ *
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_config_beacon_timer(uint16_t vif_id, bool enable);
+
+/**
+ * Set the vif's BSSID (BSSID_SET, 0x0052).
+ *
+ * @param vif_id   VIF ID.
+ * @param bssid    BSSID (MMWLAN_MAC_ADDR_LEN bytes).
+ *
+ * @returns 0 on success or an appropriate error code.
+ */
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t *bssid);
 
 /**
  * Add an interface.
