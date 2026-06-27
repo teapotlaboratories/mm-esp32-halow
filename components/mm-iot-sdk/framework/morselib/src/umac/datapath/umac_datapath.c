@@ -2995,8 +2995,14 @@ static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_mesh(struct 
                                                                          const uint8_t *addr)
 {
     MM_UNUSED(umacd);
-    MM_UNUSED(addr); /* per-peer stads arrive with MPM; until then the MBSS stad serves */
-    return umac_mesh_get_common_stad();
+    /* Unicast RX from a peer -> that peer's stad (its pairwise/group-RX keychain + replay state);
+     * broadcast/multicast/zero -> the common (MBSS) stad. Mirrors the IBSS per-peer lookup. */
+    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
+    {
+        return umac_mesh_get_common_stad();
+    }
+    struct umac_sta_data *peer = umac_mesh_get_peer_stad(addr);
+    return (peer != NULL) ? peer : umac_mesh_get_common_stad();
 }
 
 static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(
@@ -3004,6 +3010,10 @@ static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(
 {
     MM_UNUSED(umacd);
     MM_UNUSED(addr);
+    /* All mesh TX is queued on (and dequeued from, umac_datapath_tx_dequeue_frame_mesh) the common
+     * stad — like IBSS. The common stad holds BOTH the pairwise MTK and group MGTK, so the TX path
+     * encrypts unicast (PAIRWISE) and broadcast (GROUP) from here; the firmware additionally has the
+     * per-peer key copies at each peer's AID. Per-peer stads are used only for RX (lookup_by_peer). */
     return umac_mesh_get_common_stad();
 }
 
