@@ -3009,12 +3009,42 @@ static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(
     struct umac_data *umacd, const uint8_t *addr)
 {
     MM_UNUSED(umacd);
-    MM_UNUSED(addr);
-    /* All mesh TX is queued on (and dequeued from, umac_datapath_tx_dequeue_frame_mesh) the common
-     * stad — like IBSS. The common stad holds BOTH the pairwise MTK and group MGTK, so the TX path
-     * encrypts unicast (PAIRWISE) and broadcast (GROUP) from here; the firmware additionally has the
-     * per-peer key copies at each peer's AID. Per-peer stads are used only for RX (lookup_by_peer). */
-    return umac_mesh_get_common_stad();
+    /* Unicast to an established peer -> that peer's stad, so the frame is queued on the peer's TX
+     * queue and encrypted under the peer's per-pair MTK (its AID key slot); the TX scheduler
+     * (umac_datapath_tx_dequeue_frame_mesh) drains each peer's queue in turn. Broadcast/multicast/
+     * zero -> the common (MBSS) stad (group MGTK). Mirrors the RX lookup above and the AP per-STA
+     * model; an unknown / not-yet-ESTAB unicast dest falls back to the common stad.
+     * Single-hop: the dest is the directly-peered next hop. The MTK is per *link* (next hop), not per
+     * final DA, so HWMP multi-hop needs a next-hop resolve here too — a later step (see
+     * umac_datapath_construct_80211_data_header_mesh). */
+    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
+    {
+        return umac_mesh_get_common_stad();
+    }
+    struct umac_sta_data *peer = umac_mesh_get_peer_stad(addr);
+    return (peer != NULL) ? peer : umac_mesh_get_common_stad();
+}
+
+/* Pick the next mesh stad with queued TX work: the common (MBSS) stad first (broadcast/mgmt + group
+ * MGTK), then each established peer's stad (per-pair unicast MTK). Pure (no side effects) so the
+ * dequeue can call it twice — once to choose, once to recompute has_more. Mirrors
+ * umac_ap_get_next_sta_for_tx walking data->stas[]. */
+static struct umac_sta_data *mesh_get_next_tx_stad(void)
+{
+    struct umac_sta_data *stad = umac_mesh_get_common_stad();
+    if (stad != NULL && !umac_sta_data_is_paused(stad) && umac_sta_data_get_queued_len(stad))
+    {
+        return stad;
+    }
+    for (size_t ii = 0; ii < UMAC_MESH_MAX_PEERS; ii++)
+    {
+        stad = umac_mesh_peer_stad_at(ii);
+        if (stad != NULL && !umac_sta_data_is_paused(stad) && umac_sta_data_get_queued_len(stad))
+        {
+            return stad;
+        }
+    }
+    return NULL;
 }
 
 static bool umac_datapath_tx_dequeue_frame_mesh(struct umac_data *umacd,
@@ -3026,20 +3056,23 @@ static bool umac_datapath_tx_dequeue_frame_mesh(struct umac_data *umacd,
     *stad_ptr = NULL;
     *txbuf_ptr = NULL;
 
-    struct umac_sta_data *stad = umac_mesh_get_common_stad();
-    if (stad == NULL || umac_sta_data_is_paused(stad))
-    {
-        return false;
-    }
-
+    /* Scan + pop + recompute has_more under one critical section so a concurrent enqueue can't make
+     * the multi-queue view inconsistent across the scan (the common stad plus each peer's queue). */
     MMOSAL_TASK_ENTER_CRITICAL();
-    *txbuf_ptr = umac_sta_data_pop_pkt(stad);
-    bool has_more = umac_sta_data_get_queued_len(stad);
-    MMOSAL_TASK_EXIT_CRITICAL();
-    if (*txbuf_ptr != NULL)
+    struct umac_sta_data *stad = mesh_get_next_tx_stad();
+    if (stad != NULL)
     {
-        *stad_ptr = stad;
+        *txbuf_ptr = umac_sta_data_pop_pkt(stad);
+        if (*txbuf_ptr != NULL)
+        {
+            *stad_ptr = stad;
+        }
     }
+    /* has_more = any eligible stad still holds a queued frame after this pop. Re-scan rather than
+     * inspect just `stad`: returning only this stad's depth would stall the other peers' queues
+     * (mesh has no single queued-frame counter like the AP's num_pkts_queued). */
+    bool has_more = (mesh_get_next_tx_stad() != NULL);
+    MMOSAL_TASK_EXIT_CRITICAL();
     return has_more;
 }
 

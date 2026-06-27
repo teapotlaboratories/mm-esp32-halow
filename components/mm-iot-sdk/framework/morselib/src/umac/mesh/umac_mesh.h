@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "mmwlan.h"
@@ -79,9 +80,20 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd);
  *  no mesh vif is active. Used by the mesh datapath ops. */
 struct umac_sta_data *umac_mesh_get_common_stad(void);
 
+/** Maximum number of mesh peer links — the single source of truth for the per-peer stad arrays
+ *  (MESH_MAX_PEERS in umac_mesh.c is defined from this). The mesh TX scheduler iterates
+ *  [0, UMAC_MESH_MAX_PEERS) over umac_mesh_peer_stad_at(). */
+#define UMAC_MESH_MAX_PEERS (4)
+
 /** The per-peer stad for an ESTAB unicast peer (its pairwise+group-RX keychain), or NULL so the
  *  datapath falls back to the common stad. Used by the mesh unicast TX/RX stad lookups. */
 struct umac_sta_data *umac_mesh_get_peer_stad(const uint8_t *addr);
+
+/** The per-peer stad in mesh peer slot @p index, or NULL if that slot is empty or the peer is not
+ *  yet ESTABLISHED. Lets the mesh TX scheduler enumerate established peers' per-peer TX queues
+ *  (umac_datapath_tx_dequeue_frame_mesh) without exposing the mesh_peers[] table. @p index in
+ *  [0, UMAC_MESH_MAX_PEERS); out of range returns NULL. */
+struct umac_sta_data *umac_mesh_peer_stad_at(size_t index);
 
 /** Next monotonic mesh sequence number for the Mesh Control header (data path). */
 uint32_t umac_mesh_next_seqnum(void);
