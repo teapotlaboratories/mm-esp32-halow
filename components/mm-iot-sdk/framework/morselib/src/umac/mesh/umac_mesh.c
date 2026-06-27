@@ -23,7 +23,6 @@
 #include "common/consbuf.h"
 #include "common/mac_address.h"
 #include "common/morse_commands.h"
-#include <stdio.h> /* TEMP(debug): printf for MESH-SEC returns (morselib MMLOG isn't on the ESP console) */
 #include "mmdrv.h"
 #include "mmhal_wlan.h"
 #include "mmlog.h"
@@ -778,13 +777,12 @@ static void umac_mesh_install_common_keys(void)
     struct umac_key mgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
     memcpy(mgtk.key_data, mesh_ctx.own_mgtk, sizeof(mesh_ctx.own_mgtk)); /* P2c: this node's own MGTK */
     enum mmwlan_status st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mgtk);
-    printf("MESH-SEC common MGTK (group TX) aid=0 mgtk=%02x%02x%02x%02x st=%d\n",
-           mesh_ctx.own_mgtk[0], mesh_ctx.own_mgtk[1], mesh_ctx.own_mgtk[2], mesh_ctx.own_mgtk[3], (int)st);
+    MMLOG_DBG("MESH-SEC: own MGTK (group TX) installed on common stad, st=%d\n", (int)st);
 
     struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
     memcpy(mtk.key_data, mesh_p1_mtk, sizeof(mesh_p1_mtk));
     st = umac_keys_install_key(mesh_ctx.common_stad, mesh_ctx.vif_id, &mtk);
-    printf("MESH-SEC common MTK (pairwise TX) aid=0 st=%d\n", (int)st);
+    MMLOG_DBG("MESH-SEC: common-stad fallback MTK (pairwise TX) installed, st=%d\n", (int)st);
 }
 
 /* Order two equal-length byte strings by memcmp into (min, max) — the convention mesh_rsn.c uses for
@@ -891,7 +889,7 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
         ret = mmdrv_update_sta_state(vif, peer->aid, peer->mac, seq[i]);
-        printf("MESH-SEC sta_state aid=%u state=%u ret=%d\n", peer->aid, seq[i], ret);
+        MMLOG_DBG("MESH-SEC: sta_state aid=%u state=%u ret=%d\n", peer->aid, seq[i], ret);
     }
 
     /* MTK (pairwise) + peer MGTK (group RX) onto the PEER's stad. Its aid == peer->aid, so
@@ -903,34 +901,32 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
      * learned from the peer's Open/Confirm by now (set in umac_mesh_handle_action). */
     if (!peer->peer_nonce_valid)
     {
-        printf("MESH-SEC WARN aid=%u: ESTAB without peer nonce — MTK will mismatch\n", peer->aid);
+        MMLOG_WRN("MESH-SEC: aid=%u ESTAB without peer nonce — MTK will mismatch\n", peer->aid);
     }
     mesh_derive_mtk(peer);
     mesh_derive_aek(peer);
-    printf("MESH-SEC derive aid=%u nonce_ok=%d mtk=%02x%02x%02x%02x aek=%02x%02x%02x%02x\n",
-           peer->aid, peer->peer_nonce_valid, peer->mtk[0], peer->mtk[1], peer->mtk[2], peer->mtk[3],
-           peer->aek[0], peer->aek[1], peer->aek[2], peer->aek[3]);
+    MMLOG_DBG("MESH-SEC: derived per-pair MTK + AEK for aid=%u (nonce_ok=%d)\n", peer->aid,
+              peer->peer_nonce_valid);
 
     struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
     memcpy(mtk.key_data, peer->mtk, sizeof(peer->mtk));
     enum mmwlan_status st = umac_keys_install_key(peer->stad, vif, &mtk);
-    printf("MESH-SEC install MTK (pairwise) aid=%u st=%d\n", peer->aid, (int)st);
+    MMLOG_DBG("MESH-SEC: install MTK (pairwise) aid=%u st=%d\n", peer->aid, (int)st);
 
     /* Install the peer's own MGTK (learned from its Open) as our group-RX key for this peer, so its
      * broadcast/multicast decrypts under the peer's key (P2c). RX routes a group frame to the
      * transmitter's per-peer stad (lookup_stad_by_peer_addr_mesh by TA). */
     if (!peer->peer_mgtk_valid)
     {
-        printf("MESH-SEC WARN aid=%u: ESTAB without peer MGTK — its group frames won't decrypt\n",
-               peer->aid);
+        MMLOG_WRN("MESH-SEC: aid=%u ESTAB without peer MGTK — its group frames won't decrypt\n",
+                  peer->aid);
     }
     struct umac_key pmgtk = { .key_id = 1, .key_type = UMAC_KEY_TYPE_GROUP, .key_len = 16 };
     memcpy(pmgtk.key_data, peer->peer_mgtk, sizeof(peer->peer_mgtk));
     /* rx_seq (replay counter) left zeroed: P2c advertises RSC=0 (own MGTK PN starts at 0 when sent in
      * the Open, before group TX begins). Applying a non-zero RSC is deferred with the real AMPE in P2d. */
     st = umac_keys_install_key(peer->stad, vif, &pmgtk);
-    printf("MESH-SEC install peer MGTK (group RX) aid=%u mgtk=%02x%02x%02x%02x st=%d\n", peer->aid,
-           peer->peer_mgtk[0], peer->peer_mgtk[1], peer->peer_mgtk[2], peer->peer_mgtk[3], (int)st);
+    MMLOG_DBG("MESH-SEC: install peer MGTK (group RX) aid=%u st=%d\n", peer->aid, (int)st);
 }
 #endif /* MMWLAN_MESH_SEC_PHASE1 */
 
