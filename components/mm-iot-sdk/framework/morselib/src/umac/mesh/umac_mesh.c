@@ -956,13 +956,7 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
     };
     int ret;
 
-    /* Install the common_stad TX keys (MGTK + MTK) on the FIRST ESTAB — deferred from mesh start
-     * (where the firmware key install breaks open peering). Once per mesh session. */
-    if (!mesh_ctx.group_tx_key_installed)
-    {
-        umac_mesh_install_common_keys();
-        mesh_ctx.group_tx_key_installed = true;
-    }
+    /* The common_stad TX keys (own MGTK + MTK) are installed at mesh start now (P2d.4), not here. */
 
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
@@ -2194,12 +2188,14 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
               MM_MAC_ADDR_VAL(mesh_ctx.mesh_mac));
 
 #if MMWLAN_MESH_SEC_PHASE1
-    /* NOTE: hostap installs the own MGTK here at mesh start (__mesh_rsn_auth_init, mesh_rsn.c:266),
-     * but Linux peering is AMPE-PROTECTED from the start. With morselib's OPEN MPM, installing a
-     * group key before peering flips the firmware to expect protected frames and the unprotected
-     * peering Open/Confirm get dropped -> no ESTAB (proven: PHASE1=1 fails to peer, PHASE1=0 peers,
-     * same clear channel). So we DEFER the own-MGTK to the first ESTAB (umac_mesh_peer_secure_estab),
-     * a forced divergence from Linux that only resolves once AMPE-protected peering lands (P2). */
+    /* P2d.4: install the own MGTK (group TX) + common keys here at mesh start, matching hostap
+     * __mesh_rsn_auth_init (mesh_rsn.c:266) now that peering is AMPE-protected from the first Open
+     * (P2d.2). In P1 this was deferred to first-ESTAB because installing a group key flipped the
+     * firmware to drop the (then unprotected) peering Open/Confirm. NOTE the AMPE action frames are
+     * still 802.11-unprotected (the AMPE MIC is in the IE, not CCMP), so this may still regress on the
+     * MM6108 — verified on bench; revert to the deferral if peering no longer reaches ESTAB. */
+    umac_mesh_install_common_keys();
+    mesh_ctx.group_tx_key_installed = true;
 #endif
 
     /* P1 is beacon-only: do NOT signal link-up. Bringing the netif up makes lwIP
