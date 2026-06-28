@@ -303,6 +303,15 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 /* This (Morse CONFIG_IEEE80211AH=1) build uses the fixed 6-byte AAD[2] window (mesh_rsn.c
  * MESH_RSN_FRAME_MIC_OFFSET) — the first 6 bytes of the action body — not the variable upstream form. */
 #define MESH_RSN_FRAME_MIC_OFFSET (6)
+/* #16 (S1G<->11n AMPE-AAD canonicalisation): hostap MICs over the 11n frame the morse driver
+ * reconstructs on RX (morse_dot11ah_s1g_to_11n_rx_packet) — for a Mesh Peering OPEN the driver strips
+ * the S1G-caps vendor IE and force-inserts a legacy Supported Rates IE (EID 1, len 8) as the FIRST IE,
+ * so hostap's body[4:5] = 01 08. Our on-air S1G OPEN has the S1G-caps vendor IE first (body[4:5]=dd 0e).
+ * Since the 6-byte AMPE AAD window covers body[4:5], we substitute the 11n bytes (01 08) into the AAD —
+ * on BOTH TX and RX, gated to OPEN — so every node binds the SIV to hostap's canonical 11n AAD. CONFIRM's
+ * window is all fixed fields (cat,action,cap,AID) so its body[4:5] is the AID, NOT an IE — no substitution
+ * (the gate is essential). CLOSE carries no MIC. */
+#define WLAN_EID_SUPP_RATES (1)
 /* selected_pairwise_suite in the AMPE element = CCMP (00-0F-AC:4), big-endian. NOT the SAE AKM. */
 #define RSN_CIPHER_SUITE_CCMP_BE  { 0x00, 0x0f, 0xac, 0x04 }
 
@@ -710,6 +719,14 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
              * Copy the 6 bytes locally so they survive the consbuf and match the RX swap exactly. */
             uint8_t aad2[MESH_RSN_FRAME_MIC_OFFSET];
             memcpy(aad2, (const uint8_t *)hdr + sizeof(*hdr), MESH_RSN_FRAME_MIC_OFFSET);
+            /* #16: bind the SIV to the 11n body the peer's driver reconstructs on RX — for OPEN the first
+             * IE becomes the synthesized legacy Supported Rates (01 08), not our on-air S1G vendor IE
+             * (dd 0e). Symmetric with the RX swap; gated to OPEN (CONFIRM's body[4:5] is the AID). */
+            if (is_open)
+            {
+                aad2[4] = WLAN_EID_SUPP_RATES;
+                aad2[5] = 8;
+            }
             const uint8_t *aad[3] = { mesh_ctx.mesh_mac, p->da, aad2 };
             const size_t aad_len[3] = { 6, 6, MESH_RSN_FRAME_MIC_OFFSET };
             /* out[2..17] = 16-byte SIV tag (the MIC IE body); out[18..] = ciphertext of the element. */
@@ -1601,8 +1618,17 @@ static bool mesh_process_ampe(struct mesh_peer *peer, const uint8_t *body, uint3
     {
         return false;
     }
-    /* AAD (fixed-6, SWAPPED vs TX): {TA=peer(sa), RA=us, first 6 action-body bytes}. */
-    const uint8_t *aad[3] = { sa, mesh_ctx.mesh_mac, body };
+    /* AAD (fixed-6, SWAPPED vs TX): {TA=peer(sa), RA=us, first 6 action-body bytes}. #16: canonicalise the
+     * OPEN body[4:5] to the 11n Supported Rates EID+len (01 08) the peer's driver reconstructs — see the
+     * WLAN_EID_SUPP_RATES note. Copy first (never mutate the RX frame); CONFIRM's window is the AID, skip. */
+    uint8_t aad2[MESH_RSN_FRAME_MIC_OFFSET];
+    memcpy(aad2, body, MESH_RSN_FRAME_MIC_OFFSET);
+    if (action == WLAN_SP_MESH_PEERING_OPEN)
+    {
+        aad2[4] = WLAN_EID_SUPP_RATES;
+        aad2[5] = 8;
+    }
+    const uint8_t *aad[3] = { sa, mesh_ctx.mesh_mac, aad2 };
     const size_t aad_len[3] = { 6, 6, MESH_RSN_FRAME_MIC_OFFSET };
     if (mmint_aes_siv_decrypt(peer->aek, sizeof(peer->aek), crypt, crypt_len, 3, aad, aad_len,
                               ampe_buf) != 0)
