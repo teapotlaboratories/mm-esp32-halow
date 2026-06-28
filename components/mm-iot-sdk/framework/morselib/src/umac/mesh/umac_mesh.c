@@ -51,6 +51,14 @@
 extern int mmint_sha256_prf(const uint8_t *key, size_t key_len, const char *label,
                             const uint8_t *data, size_t data_len, uint8_t *buf, size_t buf_len);
 extern int mmint_crypto_get_random(void *buf, size_t len);
+/* AES-SIV (RFC 5297) — the AMPE peering MIC (mesh_rsn.c mesh_rsn_protect_frame/_process_ampe).
+ * aes-siv.c + aes-ctr.c are compiled into the hostap lib; return 0 = OK, non-zero = verify fail. */
+extern int mmint_aes_siv_encrypt(const uint8_t *key, size_t key_len, const uint8_t *pw, size_t pwlen,
+                                 size_t num_elem, const uint8_t *addr[], const size_t *len,
+                                 uint8_t *out);
+extern int mmint_aes_siv_decrypt(const uint8_t *key, size_t key_len, const uint8_t *iv_crypt,
+                                 size_t iv_c_len, size_t num_elem, const uint8_t *addr[],
+                                 const size_t *len, uint8_t *out);
 
 /* 802.11s element IDs (per IEEE 802.11). */
 #define DOT11_IE_MESH_CONFIGURATION (113)
@@ -235,6 +243,17 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 #define WLAN_SP_MESH_PEERING_CLOSE    (3)
 #define DOT11_IE_PEER_MGMT            (117)
 
+/* AMPE (Authenticated Mesh Peering Exchange) — the AES-SIV-protected element + MIC IE (P2d).
+ * WLAN_EID_AMPE/MIC + the AES-SIV block size, all per IEEE 802.11s / hostap mesh_rsn.c. */
+#define WLAN_EID_AMPE             (139)
+#define WLAN_EID_MIC              (140)
+#define AMPE_AES_BLOCK_SIZE       (16)
+/* This (Morse CONFIG_IEEE80211AH=1) build uses the fixed 6-byte AAD[2] window (mesh_rsn.c
+ * MESH_RSN_FRAME_MIC_OFFSET) — the first 6 bytes of the action body — not the variable upstream form. */
+#define MESH_RSN_FRAME_MIC_OFFSET (6)
+/* selected_pairwise_suite in the AMPE element = CCMP (00-0F-AC:4), big-endian. NOT the SAE AKM. */
+#define RSN_CIPHER_SUITE_CCMP_BE  { 0x00, 0x0f, 0xac, 0x04 }
+
 /* HWMP path selection (net/mac80211/mesh_hwmp.c). Mesh Action category, action code, and the
  * PREQ/PREP element IDs + lengths. We implement the minimal target behaviour: reply to a PREQ
  * that targets us with a PREP, so a Linux peer can resolve a mesh path to us and deliver
@@ -333,7 +352,8 @@ struct mesh_peer
     uint8_t peer_nonce[32];
     bool peer_nonce_valid;
     uint8_t mtk[16]; /* derived per-pair pairwise key (replaces the static mesh_p1_mtk) */
-    uint8_t aek[32]; /* derived AMPE encryption key (P2d AES-SIV) */
+    uint8_t aek[32]; /* derived AMPE encryption key (AES-SIV MIC, P2d) */
+    bool aek_valid;  /* AEK derived (at peer alloc — needed to protect/verify peering before ESTAB) */
     /* P2c: the peer's own MGTK (its group-TX key), learned from its Open, installed as our group-RX
      * key for this peer so we can decrypt its broadcast/multicast (replaces the static mesh_p1_mgtk). */
     uint8_t peer_mgtk[16];
@@ -342,6 +362,10 @@ struct mesh_peer
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
+
+/* Forward decl: the AEK (AES-SIV key) is derived at peer alloc — it depends only on the MACs + PMK
+ * (not the nonces), and must be ready before we protect/verify the first peering frame. */
+static void mesh_derive_aek(struct mesh_peer *peer);
 
 /* Optional peer allowlist — used to force a test topology (e.g. line/multi-hop) on a bench
  * where all nodes are in range. Empty (count 0) = peer with anyone, the normal behaviour. */
@@ -433,6 +457,10 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
              * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
             mmint_crypto_get_random(p->my_nonce, sizeof(p->my_nonce));
+            /* Derive the AEK now (it needs only the MACs + static PMK, not the nonces) so the very
+             * first peering frame to/from this peer can be AES-SIV protected/verified (P2d). */
+            mesh_derive_aek(p);
+            p->aek_valid = true;
 #endif
             return p;
         }
@@ -483,8 +511,10 @@ struct mesh_peering_params
     uint16_t llid;
     uint16_t plid;   /* echoed peer id; included for Confirm (and Close if non-zero) */
     uint16_t reason; /* Close only */
-    const uint8_t *my_nonce; /* P2b: 32-byte local AMPE nonce carried on Open/Confirm (NULL = omit) */
-    const uint8_t *my_mgtk;  /* P2c: 16-byte own MGTK carried on Open only (NULL = omit, e.g. Confirm) */
+    const uint8_t *my_nonce;   /* P2b: 32-byte local AMPE nonce (local_nonce in the AMPE element) */
+    const uint8_t *my_mgtk;    /* P2c: 16-byte own MGTK (AMPE GTKdata, Open only) */
+    const uint8_t *peer_nonce; /* P2d: the peer's learned nonce (peer_nonce in the AMPE element; zeros if not yet heard) */
+    const uint8_t *aek;        /* P2d: 32-byte AES-SIV key; non-NULL => emit the protected AMPE+MIC element */
 };
 
 static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf, void *params)
@@ -550,27 +580,45 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
         consbuf_append(buf, (const uint8_t *)&v, sizeof(v));
     }
 
-    /* P2b/P2c AMPE carrier — throwaway scaffolding, replaced by the real AES-SIV AMPE element (139)
-     * in P2d. A vendor-specific IE (221, marker 'RIM') holding our 32-byte AMPE nonce, and on Open
-     * also our 16-byte MGTK + 8-byte RSC (GTKdata is Open-only, like AMPE). type 1 = nonce only
-     * (Confirm); type 2 = nonce + GTKdata (Open). */
-    if (!is_close && p->my_nonce != NULL)
+    /* P2d: the real AES-SIV-protected AMPE element (139) + MIC IE (140), keyed by the AEK — replaces
+     * the P2b/P2c 'RIM' carrier (mesh_rsn.c mesh_rsn_protect_frame). Open carries GTKdata
+     * (MGTK + RSC + GTKExpiry); Confirm carries the nonces only. Appended LAST so the AAD (the first 6
+     * action-body bytes) is already final. The MIC IE declares length 16 (the SIV synthetic IV); the
+     * ciphertext deliberately spills past it (this is why a parser stops at EID 140). */
+    if (!is_close && p->aek != NULL)
     {
         const bool is_open = (p->action == WLAN_SP_MESH_PEERING_OPEN);
-        if (is_open && p->my_mgtk != NULL)
+        const uint8_t ampe_len = (uint8_t)(4 + 32 + 32 + (is_open ? (16 + 8 + 4) : 0)); /* 68 or 96 */
+        const uint16_t ampe_total = (uint16_t)(2 + ampe_len);                       /* element + id/len */
+        const uint16_t tail_total = (uint16_t)(2 + AMPE_AES_BLOCK_SIZE + ampe_total); /* MIC IE + SIV out */
+        uint8_t *out = consbuf_reserve(buf, tail_total);
+        if (out != NULL) /* fill pass only; the sizing pass just advanced the offset */
         {
-            const uint8_t hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32 + 16 + 8, 'R', 'I', 'M', 0x02 };
-            const uint8_t rsc[8] = { 0 }; /* P2c bring-up: own MGTK PN starts at 0 */
-            consbuf_append(buf, hdr, sizeof(hdr));
-            consbuf_append(buf, p->my_nonce, 32);
-            consbuf_append(buf, p->my_mgtk, 16);
-            consbuf_append(buf, rsc, sizeof(rsc));
-        }
-        else
-        {
-            const uint8_t hdr[6] = { DOT11_IE_VENDOR_SPECIFIC, 4 + 32, 'R', 'I', 'M', 0x01 };
-            consbuf_append(buf, hdr, sizeof(hdr));
-            consbuf_append(buf, p->my_nonce, 32);
+            uint8_t ampe_ie[2 + 4 + 32 + 32 + 16 + 8 + 4]; /* plaintext element, 98 max */
+            static const uint8_t ccmp_suite[4] = RSN_CIPHER_SUITE_CCMP_BE;
+            ampe_ie[0] = WLAN_EID_AMPE;
+            ampe_ie[1] = ampe_len;
+            memcpy(&ampe_ie[2], ccmp_suite, 4);     /* selected_pairwise_suite = CCMP (not SAE AKM) */
+            memcpy(&ampe_ie[6], p->my_nonce, 32);   /* local_nonce */
+            memcpy(&ampe_ie[38], p->peer_nonce, 32); /* peer_nonce (zeros until the peer is heard) */
+            if (is_open)
+            {
+                memcpy(&ampe_ie[70], p->my_mgtk, 16); /* MGTK */
+                memset(&ampe_ie[86], 0, 8);           /* Key RSC = 0 (P2c: PN starts at 0) */
+                memset(&ampe_ie[94], 0xff, 4);        /* GTKExpirationTime = 0xffffffff */
+            }
+
+            out[0] = WLAN_EID_MIC;
+            out[1] = AMPE_AES_BLOCK_SIZE; /* 16 — the SIV IV; ciphertext follows past this length */
+
+            /* AAD (fixed-6 CONFIG_IEEE80211AH window): {TA=us, RA=peer, first 6 action-body bytes}.
+             * Copy the 6 bytes locally so they survive the consbuf and match the RX swap exactly. */
+            uint8_t aad2[MESH_RSN_FRAME_MIC_OFFSET];
+            memcpy(aad2, (const uint8_t *)hdr + sizeof(*hdr), MESH_RSN_FRAME_MIC_OFFSET);
+            const uint8_t *aad[3] = { mesh_ctx.mesh_mac, p->da, aad2 };
+            const size_t aad_len[3] = { 6, 6, MESH_RSN_FRAME_MIC_OFFSET };
+            /* out[2..17] = 16-byte SIV tag (the MIC IE body); out[18..] = ciphertext of the element. */
+            (void)mmint_aes_siv_encrypt(p->aek, 32, ampe_ie, ampe_total, 3, aad, aad_len, out + 2);
         }
     }
 }
@@ -590,8 +638,10 @@ static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh
         .llid = peer->llid,
         .plid = peer->plid,
         .reason = reason,
-        .my_nonce = peer->my_nonce, /* build_peering omits it on Close */
-        .my_mgtk = mesh_ctx.own_mgtk, /* build_peering emits it on Open only */
+        .my_nonce = peer->my_nonce, /* build_peering omits the AMPE element on Close */
+        .my_mgtk = mesh_ctx.own_mgtk, /* GTKdata, Open only */
+        .peer_nonce = peer->peer_nonce, /* zeros until the peer is heard */
+        .aek = peer->aek_valid ? peer->aek : NULL, /* non-NULL => emit the protected AMPE+MIC */
     };
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_peering, &params);
     if (frame == NULL)
@@ -905,8 +955,8 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
     }
     mesh_derive_mtk(peer);
     mesh_derive_aek(peer);
-    MMLOG_DBG("MESH-SEC: derived per-pair MTK + AEK for aid=%u (nonce_ok=%d)\n", peer->aid,
-              peer->peer_nonce_valid);
+    MMLOG_DBG("MESH-SEC: derived per-pair MTK + AEK for aid=%u (nonce_ok=%d mgtk_ok=%d)\n", peer->aid,
+              peer->peer_nonce_valid, peer->peer_mgtk_valid);
 
     struct umac_key mtk = { .key_id = 0, .key_type = UMAC_KEY_TYPE_PAIRWISE, .key_len = 16 };
     memcpy(mtk.key_data, peer->mtk, sizeof(peer->mtk));
@@ -967,14 +1017,14 @@ void mmwlan_mesh_send_test_action(void)
      * (umac_mesh_handle_action). Kept as a no-op for ABI compatibility. */
 }
 
-/* Parse a peering action body: read the Mesh Peering Management element (117) link ids, and (P2b/P2c)
- * the AMPE carrier (vendor IE 221 'RIM'): type 1 = 32-byte nonce (Confirm), type 2 = nonce + 16-byte
- * MGTK + 8-byte RSC (Open). Returns false if the MPM IE is absent/malformed. *peer_plid = the sender's
- * link id; *our_llid_echo = the peer-link-id field (0 if absent); *peer_nonce_out / *peer_mgtk_out =
- * pointers into @p body at the 32-byte nonce / 16-byte MGTK, or NULL. */
+/* Parse a peering action body: read the Mesh Peering Management element (117) link ids and locate the
+ * AMPE MIC element (140) — the AES-SIV-encrypted AMPE element follows it (P2d, mesh_process_ampe
+ * decrypts it). Returns false if the MPM IE is absent/malformed. *peer_plid = the sender's link id;
+ * *our_llid_echo = the peer-link-id field (0 if absent); *mic_off = the MIC IE offset within @p body
+ * (valid only when *have_mic is set). */
 static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_t action,
                                   uint16_t *peer_plid, uint16_t *our_llid_echo,
-                                  const uint8_t **peer_nonce_out, const uint8_t **peer_mgtk_out)
+                                  uint32_t *mic_off, bool *have_mic)
 {
     /* Skip the fixed fields: Open=Capability(2); Confirm=Capability(2)+AID(2); Close=0. */
     uint32_t off;
@@ -992,14 +1042,7 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
     }
 
     bool found_mpm = false;
-    if (peer_nonce_out != NULL)
-    {
-        *peer_nonce_out = NULL;
-    }
-    if (peer_mgtk_out != NULL)
-    {
-        *peer_mgtk_out = NULL;
-    }
+    *have_mic = false;
     while (off + 2 <= body_len)
     {
         uint8_t id = body[off];
@@ -1015,19 +1058,83 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
             *our_llid_echo = (len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
             found_mpm = true;
         }
-        else if (peer_nonce_out != NULL && id == DOT11_IE_VENDOR_SPECIFIC && len >= 4 + 32 &&
-                 body[off + 2] == 'R' && body[off + 3] == 'I' && body[off + 4] == 'M')
+        else if (id == WLAN_EID_MIC)
         {
-            *peer_nonce_out = &body[off + 6]; /* the 32-byte AMPE nonce */
-            /* type 2 (Open) additionally carries MGTK(16) + RSC(8) right after the nonce. */
-            if (body[off + 5] == 0x02 && len == 4 + 32 + 16 + 8 && peer_mgtk_out != NULL)
-            {
-                *peer_mgtk_out = &body[off + 6 + 32]; /* 16-byte MGTK (RSC follows at +16) */
-            }
+            /* The MIC IE (140) declares length 16, but the AMPE ciphertext spills past it and is not
+             * valid TLV — stop here (mirrors hostap ieee802_11_common.c stopping at EID_MIC). */
+            *mic_off = off;
+            *have_mic = true;
+            break;
         }
         off += 2 + len;
     }
     return found_mpm;
+}
+
+/* Verify + decrypt a received AMPE-protected peering frame (mesh_rsn.c mesh_rsn_process_ampe). The MIC
+ * IE is at body[mic_off]; the 16-byte AES-SIV synthetic IV + the AMPE ciphertext follow it. On success
+ * the peer's local_nonce (and, on an Open, its MGTK) are learned into @p peer. @p sa = the frame's
+ * transmitter (the peer); @p body[0] = the category byte = the 6-byte AAD window. Returns true if the
+ * frame verifies, false to drop it (do not advance the FSM). */
+static bool mesh_process_ampe(struct mesh_peer *peer, const uint8_t *body, uint32_t body_len,
+                              uint32_t mic_off, uint8_t action, const uint8_t *sa)
+{
+    if (mic_off + 2 + AMPE_AES_BLOCK_SIZE > body_len)
+    {
+        return false;
+    }
+    const uint8_t *crypt = &body[mic_off + 2];        /* 16-byte SIV IV || ciphertext */
+    uint32_t crypt_len = body_len - (mic_off + 2);
+    if (crypt_len < AMPE_AES_BLOCK_SIZE + 2)          /* need the IV + at least a 2-byte element */
+    {
+        return false;
+    }
+    uint32_t plain_len = crypt_len - AMPE_AES_BLOCK_SIZE;
+    uint8_t ampe_buf[2 + 4 + 32 + 32 + 16 + 8 + 4];   /* 98 — the max AMPE element */
+    if (plain_len > sizeof(ampe_buf))
+    {
+        return false;
+    }
+    /* AAD (fixed-6, SWAPPED vs TX): {TA=peer(sa), RA=us, first 6 action-body bytes}. */
+    const uint8_t *aad[3] = { sa, mesh_ctx.mesh_mac, body };
+    const size_t aad_len[3] = { 6, 6, MESH_RSN_FRAME_MIC_OFFSET };
+    if (mmint_aes_siv_decrypt(peer->aek, sizeof(peer->aek), crypt, crypt_len, 3, aad, aad_len,
+                              ampe_buf) != 0)
+    {
+        MMLOG_WRN("MESH-SEC: AMPE verify failed from " MM_MAC_ADDR_FMT " action=%u\n",
+                  MM_MAC_ADDR_VAL(sa), (unsigned)action);
+        return false;
+    }
+    /* Plaintext = the AMPE element [139][len][suite][local_nonce][peer_nonce][GTKdata?]. */
+    if (plain_len < 2 || ampe_buf[0] != WLAN_EID_AMPE)
+    {
+        return false;
+    }
+    uint8_t ampe_ie_len = ampe_buf[1];
+    if (ampe_ie_len < 68 || (uint32_t)(2 + ampe_ie_len) > plain_len)
+    {
+        return false;
+    }
+    /* peer_nonce echo (offset 38): must be zero (peer hasn't heard us) or equal our own nonce. */
+    static const uint8_t zero_nonce[32] = { 0 };
+    const uint8_t *echo = &ampe_buf[2 + 4 + 32];
+    if (memcmp(echo, zero_nonce, 32) != 0 && memcmp(echo, peer->my_nonce, 32) != 0)
+    {
+        MMLOG_WRN("MESH-SEC: AMPE peer-nonce echo mismatch from " MM_MAC_ADDR_FMT "\n",
+                  MM_MAC_ADDR_VAL(sa));
+        return false;
+    }
+    /* Learn the peer's local_nonce (offset 6). */
+    memcpy(peer->peer_nonce, &ampe_buf[2 + 4], 32);
+    peer->peer_nonce_valid = true;
+    /* GTKdata (Open only): MGTK(16) at offset 70 + Key RSC(8) at 86 (+ LE32 expiry, ignored). */
+    if (action == WLAN_SP_MESH_PEERING_OPEN && ampe_ie_len >= (4 + 32 + 32 + 16 + 8 + 4))
+    {
+        memcpy(peer->peer_mgtk, &ampe_buf[2 + 4 + 32 + 32], 16);
+        memcpy(peer->peer_mgtk_rsc, &ampe_buf[2 + 4 + 32 + 32 + 16], 8);
+        peer->peer_mgtk_valid = true;
+    }
+    return true;
 }
 
 /* --- HWMP path selection (minimal target behaviour) ------------------------
@@ -1729,10 +1836,10 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
 
     uint16_t peer_plid = 0;
     uint16_t our_llid_echo = 0;
-    const uint8_t *peer_nonce = NULL;
-    const uint8_t *peer_mgtk = NULL;
+    uint32_t mic_off = 0;
+    bool have_mic = false;
     const bool have_ie = mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo,
-                                               &peer_nonce, &peer_mgtk);
+                                               &mic_off, &have_mic);
     if (!have_ie && action != WLAN_SP_MESH_PEERING_CLOSE)
     {
         MMLOG_WRN("MESH peering from " MM_MAC_ADDR_FMT " action=%u: no Peering Mgmt IE\n",
@@ -1784,18 +1891,21 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     peer->retries = 0;
     peer->last_rx_ms = mmosal_get_time_ms();
 #if MMWLAN_MESH_SEC_PHASE1
-    /* Learn the peer's AMPE nonce (Open/Confirm) before ESTAB derives the per-pair MTK, and (Open
-     * only) the peer's own MGTK + RSC, installed as our group-RX key for this peer at ESTAB. */
-    if (peer_nonce != NULL)
+    /* Verify + decrypt the AES-SIV-protected AMPE element (P2d): learns the peer's nonce (Open/Confirm)
+     * before ESTAB derives the per-pair MTK, and (Open) the peer's MGTK for group RX. A frame that
+     * fails verification is dropped without advancing the FSM (mesh_rsn.c drops on MIC failure). */
+    if (have_mic)
     {
-        memcpy(peer->peer_nonce, peer_nonce, sizeof(peer->peer_nonce));
-        peer->peer_nonce_valid = true;
+        if (!mesh_process_ampe(peer, body, body_len, mic_off, action, sa))
+        {
+            return;
+        }
     }
-    if (peer_mgtk != NULL)
+    else
     {
-        memcpy(peer->peer_mgtk, peer_mgtk, sizeof(peer->peer_mgtk));
-        memcpy(peer->peer_mgtk_rsc, peer_mgtk + 16, sizeof(peer->peer_mgtk_rsc));
-        peer->peer_mgtk_valid = true;
+        MMLOG_WRN("MESH peering from " MM_MAC_ADDR_FMT " action=%u: no AMPE MIC element\n",
+                  MM_MAC_ADDR_VAL(sa), (unsigned)action);
+        return;
     }
 #endif
 
