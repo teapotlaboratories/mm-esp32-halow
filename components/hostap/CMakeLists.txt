@@ -23,6 +23,8 @@ set(SRCS
     ${ROOT_DIR}/src/common/sae.c
     ${ROOT_DIR}/src/common/wpa_common.c
     ${ROOT_DIR}/src/crypto/aes-unwrap.c
+    ${ROOT_DIR}/src/crypto/aes-ctr.c
+    ${ROOT_DIR}/src/crypto/aes-siv.c
     ${ROOT_DIR}/src/crypto/dh_groups.c
     ${ROOT_DIR}/src/crypto/sha256-kdf.c
     ${ROOT_DIR}/src/crypto/sha384-kdf.c
