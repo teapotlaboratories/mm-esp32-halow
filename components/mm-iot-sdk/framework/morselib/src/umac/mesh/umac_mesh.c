@@ -902,6 +902,21 @@ static bool mesh_sae_check_big_sync(struct mesh_peer *peer, uint32_t now)
     return false;
 }
 
+/* Mesh SAE reauth (#13, restored from P3c): a peer that sends a fresh Commit (txn 1) on an
+ * already-ACCEPTED link has genuinely restarted (rebooted / supplicant restart) and will derive a NEW
+ * per-handshake PMK. Since the PMK is load-bearing (MTK/AEK derive from it), an in-place restart would
+ * desync the installed key from the new PMK — so free the peer + its keys and invalidate paths through
+ * it, == hostap ap_free_sta on SAE_ACCEPTED+Commit in mesh (ieee802_11.c:1144-1151). The next heard
+ * beacon re-discovers the peer and re-runs the full SAE -> Open -> ESTAB. Caller MUST NOT touch @peer
+ * after this returns. (P3d removed this to stop a CLOSE-driven re-commit cascade — but that cascade was
+ * the CLOSE handler freeing our SAE, now fixed separately; without reauth a one-sided restart deadlocks:
+ * we stay ACCEPTED replaying a stale Confirm the restarted peer can't verify against its new commit.) */
+static void mesh_sae_reauth_free(struct mesh_peer *peer)
+{
+    umac_mesh_invalidate_paths_via(peer->mac);
+    mesh_peer_free(peer);
+}
+
 /* Drive the per-peer SAE FSM on a received Authentication frame. Ports handle_auth_sae
  * (ieee802_11.c:1329) + sae_sm_step (ieee802_11.c:990), mesh branches only. @txn is the auth
  * transaction (1 Commit / 2 Confirm), @body/@len the SAE body (txn|status already stripped). */
@@ -960,18 +975,15 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
             peer->sae_last_tx_ms = now; /* stay CONFIRMED */
             break;
 
-        case MESH_SAE_ACCEPTED:
-            /* ACCEPTED + Commit. In cross-vendor simultaneous-open the peer keeps retransmitting its
-             * Commit until IT accepts OUR Confirm; freeing+restarting here (the P3c reauth) rebuilds our
-             * Commit with a NEW scalar, desyncing the commit pair and thrashing both FSMs (observed
-             * ESP<->Linux: REAUTH-FREE/BIGSYNC loops, mutual Confirm mismatch). Instead, retransmit our
-             * cached Confirm so the peer can verify it against the SAME commit pair and accept. We keep
-             * our PMK; a genuine peer reboot is handled by the inactivity/CLOSE path, not here. [P3d] */
-            if (peer->sae_confirm_len > 0)
-            {
-                (void)umac_mesh_tx_auth(peer, 2, 0, peer->sae_confirm, peer->sae_confirm_len);
-            }
-            break;
+        case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151): peer restarted -> free + re-SAE.
+            * A Commit (txn 1) in ACCEPTED can only be a genuine restart: a peer still in simultaneous-open
+            * retransmits its CONFIRM (txn 2, handled below), not a Commit — so this is not a retransmit to
+            * absorb. Freeing here (vs replaying our stale Confirm, which the restarted peer can't verify
+            * against its NEW commit pair) is what lets a one-sided restart re-converge. The CLOSE/HOLDING
+            * SAE-stability fix (P3d, kept) prevents the cascade that made this thrash; big-sync is the
+            * backstop. [#13] */
+            mesh_sae_reauth_free(peer);
+            return; /* peer freed — must not touch it again */
 
         default: /* MESH_SAE_NOTHING: unreachable after the lazy start above */
             break;
