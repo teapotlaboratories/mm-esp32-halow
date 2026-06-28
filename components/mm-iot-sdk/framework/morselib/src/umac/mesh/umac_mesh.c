@@ -301,11 +301,6 @@ static const uint8_t mesh_rsn_ie[] = {
     DOT11_IE_RSN, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
     0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00
 };
-/* Placeholder PMKID — fixed/deterministic, not checked on ESP<->ESP. P3 (SAE) replaces it with the
- * SAE-negotiated PMKID needed for a strict Linux peer. */
-static const uint8_t mesh_pmkid_placeholder[MESH_PMKID_LEN] = {
-    0x52, 0x49, 0x4d, 0x42, 0x41, 0x2d, 0x4d, 0x45, 0x53, 0x48, 0x2d, 0x50, 0x4d, 0x4b, 0x49, 0x44
-};
 
 /* HWMP path selection (net/mac80211/mesh_hwmp.c). Mesh Action category, action code, and the
  * PREQ/PREP element IDs + lengths. We implement the minimal target behaviour: reply to a PREQ
@@ -406,16 +401,17 @@ struct mesh_peer
     bool peer_nonce_valid;
     uint8_t mtk[16]; /* derived per-pair pairwise key (replaces the static mesh_p1_mtk) */
     uint8_t aek[32]; /* derived AMPE encryption key (AES-SIV MIC, P2d) */
-    bool aek_valid;  /* AEK derived (at peer alloc — needed to protect/verify peering before ESTAB) */
+    bool aek_valid;  /* AEK derived (P3c: on SAE accept, from peer->pmk — gates the protected-AMPE TX) */
     /* P2c: the peer's own MGTK (its group-TX key), learned from its Open, installed as our group-RX
      * key for this peer so we can decrypt its broadcast/multicast (replaces the static mesh_p1_mgtk). */
     uint8_t peer_mgtk[16];
     uint8_t peer_mgtk_rsc[8];
     bool peer_mgtk_valid;
-    /* P3b: per-peer SAE (Dragonfly) sub-FSM. Runs ALONGSIDE the MPM/AMPE flow and is NOT yet
-     * load-bearing — AMPE still keys off the static mesh_p2_pmk; P3c does the PMK seam. Its sole
-     * output is pmk/pmkid. The protocol state is mirrored HERE (not in the sae handle) because sae.c
-     * never writes sae->state, and mesh_sae_build_commit's internal sae_set_group resets the handle. */
+    /* Per-peer SAE (Dragonfly) sub-FSM. P3c: the SAE PMK is LOAD-BEARING — peer->pmk feeds the AMPE
+     * AEK + the per-pair MTK, and peer->pmkid goes on-wire in the MPM IE (the static mesh_p2_pmk is
+     * gone; the Open is deferred until SAE accepts). The protocol state is mirrored HERE (not in the
+     * sae handle) because sae.c never writes sae->state, and mesh_sae_build_commit's internal
+     * sae_set_group resets the handle. */
     void *sae;                      /* opaque struct sae_data* (mesh_sae_alloc); NULL until SAE starts */
     uint8_t sae_state;              /* enum mesh_sae_fsm_state */
     uint8_t sae_sync;               /* protocol Sync var; anti-thrash cap (== hostap sae->sync) */
@@ -425,15 +421,15 @@ struct mesh_peer
     size_t sae_commit_len;
     uint8_t sae_confirm[MESH_SAE_BODY_MAX]; /* cached OUR Confirm body (replayed once tmp is freed) */
     size_t sae_confirm_len;
-    uint8_t pmk[32];                /* SAE-derived PMK — the P3b deliverable (P3c feeds it to AMPE) */
-    uint8_t pmkid[16];              /* SAE-derived PMKID */
-    bool pmk_valid;                 /* SAE reached ACCEPTED; pmk/pmkid populated */
+    uint8_t pmk[32];                /* SAE-derived PMK — feeds mesh_derive_mtk/_aek (P3c load-bearing) */
+    uint8_t pmkid[16];              /* SAE-derived PMKID — on-wire in the MPM IE; reciprocal-checked on RX */
+    bool pmk_valid;                 /* SAE reached ACCEPTED; pmk/pmkid populated; gates peering RX/TX */
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
 
-/* Forward decl: the AEK (AES-SIV key) is derived at peer alloc — it depends only on the MACs + PMK
- * (not the nonces), and must be ready before we protect/verify the first peering frame. */
+/* Forward decl: the AEK (AES-SIV key) is derived on SAE accept (P3c), from the SAE-negotiated peer->pmk
+ * + the MACs, before the first protected peering frame is sent. */
 static void mesh_derive_aek(struct mesh_peer *peer);
 
 /* Optional peer allowlist — used to force a test topology (e.g. line/multi-hop) on a bench
@@ -526,10 +522,9 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
              * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
             mmint_crypto_get_random(p->my_nonce, sizeof(p->my_nonce));
-            /* Derive the AEK now (it needs only the MACs + static PMK, not the nonces) so the very
-             * first peering frame to/from this peer can be AES-SIV protected/verified (P2d). */
-            mesh_derive_aek(p);
-            p->aek_valid = true;
+            /* P3c: the AEK is NOT derived here — it needs the SAE-negotiated PMK, which doesn't exist
+             * until SAE accepts. aek_valid stays false (memset) until the SAE-accept hook derives it
+             * (== hostap: AEK in mesh_rsn_init_ampe_sta from mesh_mpm_auth_peer, not at add_peer). */
 #endif
             return p;
         }
@@ -591,6 +586,7 @@ struct mesh_peering_params
     const uint8_t *my_mgtk;    /* P2c: 16-byte own MGTK (AMPE GTKdata, Open only) */
     const uint8_t *peer_nonce; /* P2d: the peer's learned nonce (peer_nonce in the AMPE element; zeros if not yet heard) */
     const uint8_t *aek;        /* P2d: 32-byte AES-SIV key; non-NULL => emit the protected AMPE+MIC element */
+    const uint8_t *pmkid;      /* P3c: 16-byte SAE-derived PMKID — the last MPM IE field (Open/Confirm) */
 };
 
 static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf, void *params)
@@ -662,7 +658,7 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
     }
     else
     {
-        consbuf_append(buf, mesh_pmkid_placeholder, MESH_PMKID_LEN); /* PMKID — last MPM IE field */
+        consbuf_append(buf, p->pmkid, MESH_PMKID_LEN); /* P3c: real SAE PMKID — last MPM IE field */
     }
 
     /* P2d: the real AES-SIV-protected AMPE element (139) + MIC IE (140), keyed by the AEK — replaces
@@ -727,6 +723,7 @@ static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh
         .my_mgtk = mesh_ctx.own_mgtk, /* GTKdata, Open only */
         .peer_nonce = peer->peer_nonce, /* zeros until the peer is heard */
         .aek = peer->aek_valid ? peer->aek : NULL, /* non-NULL => emit the protected AMPE+MIC */
+        .pmkid = peer->pmkid, /* P3c: SAE PMKID (valid by the time any peering frame is sent, post-SAE) */
     };
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_peering, &params);
     if (frame == NULL)
@@ -791,10 +788,10 @@ static enum mmwlan_status umac_mesh_tx_auth(const struct mesh_peer *peer, uint16
  * sae.c deliberately does not implement. See docs/mesh-ap/rimba-mesh-p3-sae-plan.md
  * and the P3b worklog for the function-level code-map to ieee802_11.c / mesh_rsn.c.
  *
- * P3b scope: SAE runs alongside the working MPM/AMPE flow and its only output is
- * peer->pmk/pmkid. AMPE still keys off the static mesh_p2_pmk (P3c does the seam,
- * and the SAE-before-Open reorder). The proof is two ESP peers deriving identical
- * peer->pmkid. */
+ * P3c: the SAE PMK is LOAD-BEARING. peer->pmk feeds the AMPE AEK + per-pair MTK and
+ * peer->pmkid goes on-wire in the MPM IE; the MPM Open is deferred until the SAE-accept
+ * hook (below) derives the AEK and sends the first protected Open. Inbound peering frames
+ * are gated on pmk_valid + a reciprocal PMKID check (umac_mesh_handle_action). */
 
 /* Format a byte array as lowercase hex into a NUL-terminated string (diagnostics only). */
 static void mesh_sae_fmt_hex(char *out, size_t out_cap, const uint8_t *in, size_t in_len)
@@ -891,22 +888,16 @@ static bool mesh_sae_check_big_sync(struct mesh_peer *peer, uint32_t now)
     return false;
 }
 
-/* Mesh reauth substitute (P3b): re-derive the PMK in place without disturbing the live MPM/AMPE link.
- * hostap frees the whole STA here (ieee802_11.c:1144-1151); in P3b SAE is not load-bearing, so we just
- * restart the handshake. (P3c, where SAE gates the link, will adopt the true free-and-restart.) */
-static void mesh_sae_restart_in_place(struct mesh_peer *peer, uint32_t now)
+/* Mesh SAE reauth (P3c): a peer that re-initiates SAE on an already-accepted link has rebooted and will
+ * derive a FRESH per-handshake PMK. Now that the PMK is load-bearing (the MTK/AEK derive from it), an
+ * in-place restart would desync the installed MTK from the new PMK — so free the peer + its keys and
+ * invalidate paths through it (== hostap ap_free_sta on ACCEPTED+Commit, ieee802_11.c:1144-1151). The
+ * next heard beacon re-discovers the peer and re-runs the full SAE -> Open -> ESTAB key install. The
+ * caller MUST NOT touch @p peer after this returns. */
+static void mesh_sae_reauth_free(struct mesh_peer *peer)
 {
-    (void)now;
-    if (peer->sae != NULL)
-    {
-        mesh_sae_free(peer->sae);
-        peer->sae = NULL;
-    }
-    peer->sae_state = MESH_SAE_NOTHING;
-    peer->sae_sync = 0;
-    peer->pmk_valid = false;
-    peer->sae_disabled_until_ms = 0;
-    mesh_sae_start(peer);
+    umac_mesh_invalidate_paths_via(peer->mac);
+    mesh_peer_free(peer);
 }
 
 /* Drive the per-peer SAE FSM on a received Authentication frame. Ports handle_auth_sae
@@ -966,9 +957,9 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
             peer->sae_last_tx_ms = now; /* stay CONFIRMED */
             break;
 
-        case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151) */
-            mesh_sae_restart_in_place(peer, now);
-            break;
+        case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151): peer rebooted -> free + re-SAE */
+            mesh_sae_reauth_free(peer);
+            return; /* peer freed — must not touch it again */
 
         default: /* MESH_SAE_NOTHING: unreachable after the lazy start above */
             break;
@@ -1010,6 +1001,20 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
                  * matching PMKIDs prove byte-identical PMKs (the P3b proof). The PMK is never logged. */
                 MMLOG_INF("MESH-SAE " MM_MAC_ADDR_FMT " ACCEPTED pmkid=%s\n",
                           MM_MAC_ADDR_VAL(peer->mac), pmkid_hex);
+                /* P3c: SAE accepted -> this is the mesh_mpm_auth_peer point (mesh_mpm.c:679-717).
+                 * Derive the AEK from the just-cached SAE PMK and send the (now protected) first MPM
+                 * Open -> OPN_SNT — the deferred Open from discovery. The state==LISTEN guard makes
+                 * this fire exactly once (mesh_mpm.c:716; a reauth goes through free-and-restart, so a
+                 * non-LISTEN peer never re-derives the AEK out from under an installed MTK). */
+                if (peer->state == MESH_PLINK_LISTEN)
+                {
+                    mesh_derive_aek(peer);   /* == mesh_rsn_init_ampe_sta -> mesh_rsn_derive_aek (mesh_rsn.c:543) */
+                    peer->aek_valid = true;  /* the protected-AMPE TX path (tx_peering .aek) is now armed */
+                    (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0); /* first protected Open */
+                    peer->state = MESH_PLINK_OPN_SNT;
+                    MMLOG_INF("MESH SAE accepted -> Open sent, OPN_SNT " MM_MAC_ADDR_FMT " llid=0x%04x\n",
+                              MM_MAC_ADDR_VAL(peer->mac), peer->llid);
+                }
             }
             peer->sae_state = MESH_SAE_ACCEPTED;
             peer->sae_last_tx_ms = 0;         /* stop retransmit (sae_clear_retransmit_timer) */
@@ -1056,7 +1061,14 @@ void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview)
     {
         return;
     }
-    peer->last_rx_ms = mmosal_get_time_ms(); /* a received auth frame is peer liveness (mac80211 last_rx) */
+    /* A received auth frame is peer liveness AND SAE forward progress. Reset the peering retry counter
+     * (P3c): once we SAE-accept first and go OPN_SNT, the plink tick starts counting Open retries; if
+     * the peer is still finishing SAE it drops our Opens (its pmk_valid gate) and sends no peering reply,
+     * so without this the faster side could exhaust its peering budget -> HOLDING -> lose the PMK while
+     * the peer is demonstrably alive. Resetting on every auth frame keeps the forming link alive until
+     * both sides accept and exchange Opens. */
+    peer->last_rx_ms = mmosal_get_time_ms();
+    peer->retries = 0;
     mesh_sae_handle_rx(peer, result.seq, result.status_code, result.auth_data, result.auth_data_len);
 }
 
@@ -1232,16 +1244,8 @@ static const uint8_t mesh_p1_mtk[16] = {
     0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
 };
 
-/* P2 (AMPE) static PMK — identical on every node so a static-PMK ESP mesh derives matching per-pair
- * MTKs/AEKs (P3 replaces this with the SAE-negotiated PMK). The MTK derivation hashes 32 bytes of it;
- * the AEK derivation hashes 64 (PMK || 32 zero bytes), mirroring hostap's sizeof(sae->pmk) =
- * SAE_MAX_PMK_LEN=64 with pmk[32..63]==0 for group 19 — see mesh_derive_mtk/_aek below. */
-static const uint8_t mesh_p2_pmk[32] = {
-    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
-    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf
-};
+/* P3c: the static P2 PMK is gone — mesh_derive_mtk/_aek now hash the per-peer SAE-negotiated
+ * peer->pmk (32 bytes for the MTK; PMK || 32 zeros = 64 for the AEK). */
 /* Selected AKM Suite = SAE (00-0F-AC:8), big-endian like hostap RSN_SELECTOR_PUT. Mesh always
  * advertises SAE here even on a static PMK (do NOT substitute a PSK AKM). */
 static const uint8_t mesh_ampe_akm_sae[4] = { 0x00, 0x0f, 0xac, 0x08 };
@@ -1318,7 +1322,9 @@ static void mesh_derive_mtk(struct mesh_peer *peer)
     p += 6;
     memcpy(p, max, 6);
 
-    mmint_sha256_prf(mesh_p2_pmk, sizeof(mesh_p2_pmk), "Temporal Key Derivation",
+    /* P3c: the PMK is the per-peer SAE-derived key (was the static mesh_p2_pmk). MTK hashes 32 bytes
+     * (== hostap mesh_rsn.c:529 sha256_prf(sta->sae->pmk, SAE_PMK_LEN, ...)). */
+    mmint_sha256_prf(peer->pmk, sizeof(peer->pmk), "Temporal Key Derivation",
                      ctx, sizeof(ctx), peer->mtk, sizeof(peer->mtk));
 }
 
@@ -1339,8 +1345,10 @@ static void mesh_derive_aek(struct mesh_peer *peer)
     p += 6;
     memcpy(p, max, 6);
 
+    /* P3c: PMK64 = the per-peer SAE PMK (32) || 32 zero bytes (was the static mesh_p2_pmk). hostap
+     * passes sizeof(sta->sae->pmk)=SAE_MAX_PMK_LEN=64 with pmk[32..63]==0 for group 19 (mesh_rsn.c:468). */
     uint8_t pmk64[64];
-    memcpy(pmk64, mesh_p2_pmk, 32);
+    memcpy(pmk64, peer->pmk, 32);
     memset(pmk64 + 32, 0, 32);
     mmint_sha256_prf(pmk64, sizeof(pmk64), "AEK Derivation",
                      ctx, sizeof(ctx), peer->aek, sizeof(peer->aek));
@@ -1374,9 +1382,14 @@ static void umac_mesh_peer_secure_estab(struct mesh_peer *peer)
      * umac_keys_install_key populates the peer-stad keychain (so the unicast TX path sets Protected
      * + selects the pairwise key) AND installs to firmware at peer->aid -- same slots as the old raw
      * calls. The datapath maps the peer's address -> this stad (umac_mesh_get_peer_stad). */
-    /* Derive the per-pair MTK + AEK from the exchanged nonces (P2b). Both ends order min/max
-     * identically (memcmp nonces/MACs, numeric LIDs) so they agree on the key. peer_nonce must be
-     * learned from the peer's Open/Confirm by now (set in umac_mesh_handle_action). */
+    /* Derive the per-pair MTK + AEK (P3c: from the SAE-negotiated peer->pmk + the exchanged nonces).
+     * Both ends order min/max identically (memcmp nonces/MACs, numeric LIDs) so they agree on the key.
+     * peer_nonce must be learned from the peer's Open/Confirm by now (set in umac_mesh_handle_action),
+     * and pmk_valid must hold (ESTAB is only reachable post-SAE via the pmk_valid peering gate). */
+    if (!peer->pmk_valid)
+    {
+        MMLOG_WRN("MESH-SEC: aid=%u ESTAB without SAE PMK — MTK/AEK invalid\n", peer->aid);
+    }
     if (!peer->peer_nonce_valid)
     {
         MMLOG_WRN("MESH-SEC: aid=%u ESTAB without peer nonce — MTK will mismatch\n", peer->aid);
@@ -1431,15 +1444,13 @@ void mmwlan_mesh_peer_open(const uint8_t *peer_mac)
     {
         return;
     }
-    /* Start the per-peer SAE (Dragonfly) handshake (== secure-mesh discovery, mesh_mpm.c:899
-     * mesh_rsn_auth_sae_sta). P3b: SAE derives peer->pmk/pmkid alongside the MPM/AMPE flow but is not
-     * yet load-bearing — AMPE still keys off the static PMK; P3c reorders SAE-before-Open + the seam. */
+    /* P3c: start SAE only — the MPM Open is DEFERRED until SAE accepts (== secure-mesh discovery
+     * mesh_mpm.c:894-900 SEC_AMPE else-branch: mesh_rsn_auth_sae_sta with no plink_open). The peer
+     * stays MESH_PLINK_LISTEN; the SAE-accept hook derives the AEK and sends the first protected Open
+     * (-> OPN_SNT). This makes the SAE PMK load-bearing for the AMPE MIC + the per-pair MTK. */
     mesh_sae_start(peer);
-    /* mesh_plink_open(): send a Mesh Peering Open, -> OPN_SNT. */
-    enum mmwlan_status st = umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);
-    peer->state = MESH_PLINK_OPN_SNT;
-    MMLOG_INF("MESH open -> " MM_MAC_ADDR_FMT " OPN_SNT st=%d llid=0x%04x\n",
-              MM_MAC_ADDR_VAL(peer_mac), (int)st, peer->llid);
+    MMLOG_INF("MESH SAE start -> " MM_MAC_ADDR_FMT " (LISTEN, Open deferred until SAE accept) llid=0x%04x\n",
+              MM_MAC_ADDR_VAL(peer_mac), peer->llid);
 }
 
 void mmwlan_mesh_send_test_action(void)
@@ -1456,7 +1467,8 @@ void mmwlan_mesh_send_test_action(void)
  * (valid only when *have_mic is set). */
 static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_t action,
                                   uint16_t *peer_plid, uint16_t *our_llid_echo,
-                                  uint32_t *mic_off, bool *have_mic)
+                                  uint32_t *mic_off, bool *have_mic,
+                                  const uint8_t **adv_pmkid, bool *have_pmkid)
 {
     /* Skip the fixed fields: Open=Capability(2); Confirm=Capability(2)+AID(2); Close=0. */
     uint32_t off;
@@ -1475,6 +1487,7 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
 
     bool found_mpm = false;
     *have_mic = false;
+    *have_pmkid = false;
     while (off + 2 <= body_len)
     {
         uint8_t id = body[off];
@@ -1494,6 +1507,13 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
             uint8_t core_len = (uint8_t)(len - pmkid_len);
             *peer_plid = (uint16_t)(p[2] | (p[3] << 8));
             *our_llid_echo = (core_len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
+            /* P3c: the advertised PMKID is the trailing 16 bytes of an AMPE-proto MPM IE. The peer
+             * computes the same SAE PMKID as us, so it must equal our peer->pmkid (reciprocal check). */
+            if (pmkid_len == MESH_PMKID_LEN)
+            {
+                *adv_pmkid = &p[core_len];
+                *have_pmkid = true;
+            }
             found_mpm = true;
         }
         else if (id == WLAN_EID_MIC)
@@ -2276,8 +2296,10 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     uint16_t our_llid_echo = 0;
     uint32_t mic_off = 0;
     bool have_mic = false;
+    const uint8_t *adv_pmkid = NULL;
+    bool have_pmkid = false;
     const bool have_ie = mesh_parse_peering_ie(body, body_len, action, &peer_plid, &our_llid_echo,
-                                               &mic_off, &have_mic);
+                                               &mic_off, &have_mic, &adv_pmkid, &have_pmkid);
     if (!have_ie && action != WLAN_SP_MESH_PEERING_CLOSE)
     {
         MMLOG_WRN("MESH peering from " MM_MAC_ADDR_FMT " action=%u: no Peering Mgmt IE\n",
@@ -2312,6 +2334,40 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         mesh_peer_free(peer);
         return;
     }
+
+#if MMWLAN_MESH_SEC_PHASE1
+    /* P3c SAE-accepted gate (== hostap mesh_mpm.c:1272-1278): peering frames are AMPE-protected and
+     * carry the SAE PMKID, so they can't be processed until SAE has derived peer->pmk/pmkid/aek. Both
+     * ends defer their Open until SAE accept, so a healthy link only exchanges peering frames post-SAE;
+     * an Open that races ahead of our SAE is dropped and recovered by the sender's Open retransmit. */
+    if (!peer->pmk_valid)
+    {
+        MMLOG_DBG("MESH-SEC: drop peering from " MM_MAC_ADDR_FMT " action=%u — SAE not accepted yet\n",
+                  MM_MAC_ADDR_VAL(sa), (unsigned)action);
+        return;
+    }
+    /* Reciprocal PMKID check (== hostap mesh_rsn.c:689-695): the peer advertises its SAE PMKID in the
+     * MPM IE; it must equal ours (both ends derive the same PMK). A missing or mismatched PMKID drops
+     * the frame only — no teardown (mesh_rsn.c returns -1). */
+    if (!have_pmkid || memcmp(adv_pmkid, peer->pmkid, MESH_PMKID_LEN) != 0)
+    {
+        char ours_hex[2 * MESH_PMKID_LEN + 1];
+        mesh_sae_fmt_hex(ours_hex, sizeof(ours_hex), peer->pmkid, MESH_PMKID_LEN);
+        if (have_pmkid)
+        {
+            char adv_hex[2 * MESH_PMKID_LEN + 1];
+            mesh_sae_fmt_hex(adv_hex, sizeof(adv_hex), adv_pmkid, MESH_PMKID_LEN);
+            MMLOG_WRN("MESH-SEC: PMKID mismatch from " MM_MAC_ADDR_FMT " adv=%s ours=%s — dropping\n",
+                      MM_MAC_ADDR_VAL(sa), adv_hex, ours_hex);
+        }
+        else
+        {
+            MMLOG_WRN("MESH-SEC: peering from " MM_MAC_ADDR_FMT " missing PMKID (ours=%s) — dropping\n",
+                      MM_MAC_ADDR_VAL(sa), ours_hex);
+        }
+        return;
+    }
+#endif
 
     /* Stale-session guard: a peer-link-id echo that isn't our current llid means our link
      * ids are out of sync (e.g. the peer rebooted across an established link). Close and
