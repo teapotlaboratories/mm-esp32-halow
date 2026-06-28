@@ -254,6 +254,25 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 /* selected_pairwise_suite in the AMPE element = CCMP (00-0F-AC:4), big-endian. NOT the SAE AKM. */
 #define RSN_CIPHER_SUITE_CCMP_BE  { 0x00, 0x0f, 0xac, 0x04 }
 
+/* P2d.3: the Linux-shaped peering-frame wrapper (matches the live chronosalt/chronogen Open exactly).
+ * Capability = PRIVACY (secured mesh). RSN IE (48) = version 1, group+pairwise CCMP, AKM SAE, caps 0.
+ * The MPM IE 'protocol' becomes 1 (AMPE) and carries a 16-byte PMKID as its last field. For ESP<->ESP
+ * the PMKID is not checked (our parser owns both ends); a real cross-vendor PMKID needs P3 (SAE), so
+ * this is a deterministic placeholder. */
+#define DOT11_IE_RSN              (48)
+#define MESH_CAP_PRIVACY          (0x0010)
+#define MESH_MPM_PROTO_AMPE       (1)
+#define MESH_PMKID_LEN            (16)
+static const uint8_t mesh_rsn_ie[] = {
+    DOT11_IE_RSN, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
+    0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00
+};
+/* Placeholder PMKID — fixed/deterministic, not checked on ESP<->ESP. P3 (SAE) replaces it with the
+ * SAE-negotiated PMKID needed for a strict Linux peer. */
+static const uint8_t mesh_pmkid_placeholder[MESH_PMKID_LEN] = {
+    0x52, 0x49, 0x4d, 0x42, 0x41, 0x2d, 0x4d, 0x45, 0x53, 0x48, 0x2d, 0x50, 0x4d, 0x4b, 0x49, 0x44
+};
+
 /* HWMP path selection (net/mac80211/mesh_hwmp.c). Mesh Action category, action code, and the
  * PREQ/PREP element IDs + lengths. We implement the minimal target behaviour: reply to a PREQ
  * that targets us with a PREP, so a Linux peer can resolve a mesh path to us and deliver
@@ -534,10 +553,12 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
     const uint8_t cat_act[2] = { DOT11_CATEGORY_SELF_PROTECTED, p->action };
     consbuf_append(buf, cat_act, sizeof(cat_act));
 
-    /* Fixed fields: Open/Confirm carry Capability; Confirm also carries AID. */
+    /* Fixed fields: Open/Confirm carry Capability; Confirm also carries AID. PRIVACY (secured mesh,
+     * P2d.3) — matches Linux; note this byte is inside the 6-byte AMPE AAD window, so both ends must
+     * use it (consistent on ESP<->ESP). */
     if (!is_close)
     {
-        uint16_t cap = htole16(MESH_CAPABILITY_INFO);
+        uint16_t cap = htole16(MESH_CAP_PRIVACY);
         consbuf_append(buf, (const uint8_t *)&cap, sizeof(cap));
     }
     if (is_confirm)
@@ -550,6 +571,7 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
     if (!is_close)
     {
         ie_s1g_capabilities_build(umacd, buf);
+        consbuf_append(buf, mesh_rsn_ie, sizeof(mesh_rsn_ie)); /* RSN IE (48) — P2d.3, after S1G caps */
     }
     const uint8_t mesh_id_hdr[2] = { DOT11_IE_MESH_ID, mesh_ctx.mesh_id_len };
     consbuf_append(buf, mesh_id_hdr, sizeof(mesh_id_hdr));
@@ -559,13 +581,15 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
         mesh_build_config_ie(buf);
     }
 
-    /* Mesh Peering Management element (117). */
+    /* Mesh Peering Management element (117). P2d.3: Open/Confirm use protocol=1 (AMPE) and carry a
+     * 16-byte PMKID as the LAST field (matches Linux); Close stays base (protocol 0, no PMKID). */
     const bool include_plid = is_confirm || (is_close && p->plid != 0);
     const uint8_t ie_len = (uint8_t)(2 /* protocol */ + 2 /* local link id */ +
-                                     (include_plid ? 2 : 0) + (is_close ? 2 : 0));
+                                     (include_plid ? 2 : 0) + (is_close ? 2 : 0) +
+                                     (is_close ? 0 : MESH_PMKID_LEN));
     const uint8_t mpm_hdr[2] = { DOT11_IE_PEER_MGMT, ie_len };
     consbuf_append(buf, mpm_hdr, sizeof(mpm_hdr));
-    uint16_t protocol = htole16(0); /* 0 = base MPM (no vendor / no AMPE) */
+    uint16_t protocol = htole16(is_close ? 0 : MESH_MPM_PROTO_AMPE);
     consbuf_append(buf, (const uint8_t *)&protocol, sizeof(protocol));
     uint16_t v = htole16(p->llid);
     consbuf_append(buf, (const uint8_t *)&v, sizeof(v));
@@ -578,6 +602,10 @@ static void umac_mesh_build_peering(struct umac_data *umacd, struct consbuf *buf
     {
         v = htole16(p->reason);
         consbuf_append(buf, (const uint8_t *)&v, sizeof(v));
+    }
+    else
+    {
+        consbuf_append(buf, mesh_pmkid_placeholder, MESH_PMKID_LEN); /* PMKID — last MPM IE field */
     }
 
     /* P2d: the real AES-SIV-protected AMPE element (139) + MIC IE (140), keyed by the AEK — replaces
@@ -1054,8 +1082,14 @@ static bool mesh_parse_peering_ie(const uint8_t *body, uint32_t body_len, uint8_
         if (id == DOT11_IE_PEER_MGMT && len >= 4)
         {
             const uint8_t *p = &body[off + 2]; /* protocol(2), local-link-id(2)[, peer-link-id(2)] */
+            /* P2d.3: protocol==1 (AMPE) appends a 16-byte PMKID as the last field — exclude it from the
+             * 'is a peer-link-id present?' length check so an Open's PMKID isn't misread as a plid. */
+            uint16_t proto = (uint16_t)(p[0] | (p[1] << 8));
+            uint8_t pmkid_len = (proto == MESH_MPM_PROTO_AMPE && len >= 4 + MESH_PMKID_LEN)
+                                    ? MESH_PMKID_LEN : 0;
+            uint8_t core_len = (uint8_t)(len - pmkid_len);
             *peer_plid = (uint16_t)(p[2] | (p[3] << 8));
-            *our_llid_echo = (len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
+            *our_llid_echo = (core_len >= 6) ? (uint16_t)(p[4] | (p[5] << 8)) : 0;
             found_mpm = true;
         }
         else if (id == WLAN_EID_MIC)
