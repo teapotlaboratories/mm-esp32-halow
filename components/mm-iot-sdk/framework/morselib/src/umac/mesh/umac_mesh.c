@@ -17,6 +17,7 @@
  * mac80211 mesh beacon. Peering / HWMP / path table come in P2+.
  */
 
+#include <stdio.h> /* TEMP(P3a bring-up): printf for SAE auth trace */
 #include <string.h>
 
 #include "common/common.h"
@@ -33,6 +34,7 @@
 #include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
 #include "umac/datapath/umac_datapath.h"
+#include "umac/frames/authentication.h"
 #include "umac/frames/frames_common.h"
 #include "umac/ies/s1g_capabilities.h"
 #include "umac/ies/ssid.h"
@@ -59,6 +61,22 @@ extern int mmint_aes_siv_encrypt(const uint8_t *key, size_t key_len, const uint8
 extern int mmint_aes_siv_decrypt(const uint8_t *key, size_t key_len, const uint8_t *iv_crypt,
                                  size_t iv_c_len, size_t num_elem, const uint8_t *addr[],
                                  const size_t *len, uint8_t *out);
+/* SAE (Dragonfly) handshake — the mesh_sae shim over hostap sae.c (mesh_sae.c in mmhostap), reached
+ * the same way as the mmint_* crypto. The per-peer instance handle is opaque (struct sae_data*). P3. */
+extern void *mesh_sae_alloc(void);
+extern void mesh_sae_free(void *handle);
+extern int mesh_sae_build_commit(void *handle, const uint8_t *our_mac, const uint8_t *peer_mac,
+                                 const char *password, size_t password_len, uint8_t *out,
+                                 size_t out_cap, size_t *out_len);
+extern int mesh_sae_process_commit(void *handle, const uint8_t *body, size_t len);
+extern int mesh_sae_build_confirm(void *handle, uint8_t *out, size_t out_cap, size_t *out_len);
+extern int mesh_sae_check_confirm(void *handle, const uint8_t *body, size_t len);
+extern int mesh_sae_get_keys(void *handle, uint8_t *pmk32, uint8_t *pmkid16);
+extern int mesh_sae_state(void *handle);
+/* Shared mesh SAE password (matches the Linux sae_password for cross-vendor interop, P3d). */
+#define MESH_SAE_PASSWORD "rimbamesh2026"
+/* Max SAE auth body we build/carry (group-19 Commit ~98 B, Confirm ~34 B). */
+#define MESH_SAE_BODY_MAX 192
 
 /* 802.11s element IDs (per IEEE 802.11). */
 #define DOT11_IE_MESH_CONFIGURATION (113)
@@ -683,6 +701,66 @@ static enum mmwlan_status umac_mesh_tx_peering(uint8_t action, const struct mesh
     return umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
 }
 
+/* Send a mesh SAE Authentication frame (P3). frame_authentication_build appends auth_data verbatim for
+ * non-OPEN algorithms, so the body MUST be transaction(2) | status(2) | <SAE body>. Mesh/IBSS auth
+ * addressing: DA(A1)+A3 = peer, SA(A2) = our mesh MAC. */
+static enum mmwlan_status umac_mesh_tx_auth(const struct mesh_peer *peer, uint16_t transaction,
+                                            uint16_t status, const uint8_t *sae_body,
+                                            size_t sae_body_len)
+{
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+    if (sae_body_len > MESH_SAE_BODY_MAX)
+    {
+        return MMWLAN_NO_MEM;
+    }
+    uint8_t blob[4 + MESH_SAE_BODY_MAX];
+    blob[0] = (uint8_t)(transaction & 0xff);
+    blob[1] = (uint8_t)(transaction >> 8);
+    blob[2] = (uint8_t)(status & 0xff);
+    blob[3] = (uint8_t)(status >> 8);
+    memcpy(&blob[4], sae_body, sae_body_len);
+
+    struct frame_data_auth params = {
+        .auth_alg = DOT11_AUTH_ALG_SAE,
+        .bssid = peer->mac,               /* A1(DA) + A3 */
+        .sta_address = mesh_ctx.mesh_mac, /* A2(SA) */
+        .seq = 0,
+        .status_code = 0,
+        .auth_data = blob,
+        .auth_data_len = (uint16_t)(4 + sae_body_len),
+    };
+    struct umac_data *umacd = umac_data_get_umacd();
+    struct mmpkt *frame = build_mgmt_frame(umacd, frame_authentication_build, &params);
+    if (frame == NULL)
+    {
+        return MMWLAN_NO_MEM;
+    }
+    mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
+    return umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
+}
+
+/* Handle a received mesh SAE Authentication frame (P3). Called from the mesh datapath's
+ * process_rx_mgmt_frame. P3a: parse + log only; P3b drives the per-peer SAE FSM. */
+void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview)
+{
+    (void)umacd;
+    struct frame_data_auth result;
+    if (!frame_authentication_parse(rxbufview, &result))
+    {
+        return;
+    }
+    if (result.auth_alg != DOT11_AUTH_ALG_SAE)
+    {
+        return;
+    }
+    printf("MESH-SAE rx auth from " MM_MAC_ADDR_FMT " txn=%u status=%u body_len=%u\n",
+           MM_MAC_ADDR_VAL(result.sta_address), (unsigned)result.seq, (unsigned)result.status_code,
+           (unsigned)result.auth_data_len);
+}
+
 /* Periodic peer-link retransmission, mirroring mac80211's mesh_plink_timer. One tick
  * services every peer: while a handshake is in progress (OPN_SNT/OPN_RCVD/CNF_RCVD) it
  * retransmits the Open until ESTAB or max retries, then sends a reason-coded Close and
@@ -1024,6 +1102,31 @@ void mmwlan_mesh_peer_open(const uint8_t *peer_mac)
     if (peer == NULL)
     {
         return;
+    }
+    /* P3a: emit a test SAE Commit on-air (no FSM yet) to prove the auth-frame TX path + the mesh_sae
+     * shim linkage. The existing AMPE-over-static-PMK peering below is untouched; P3b drives the real
+     * per-peer SAE handshake and P3c feeds its PMK into the AMPE. TEMP scaffolding. */
+    {
+        void *sae = mesh_sae_alloc();
+        if (sae != NULL)
+        {
+            uint8_t commit[MESH_SAE_BODY_MAX];
+            size_t commit_len = 0;
+            int cret = mesh_sae_build_commit(sae, mesh_ctx.mesh_mac, peer->mac, MESH_SAE_PASSWORD,
+                                             strlen(MESH_SAE_PASSWORD), commit, sizeof(commit),
+                                             &commit_len);
+            if (cret == 0)
+            {
+                enum mmwlan_status ast = umac_mesh_tx_auth(peer, 1, 0, commit, commit_len);
+                printf("MESH-SAE tx commit -> " MM_MAC_ADDR_FMT " len=%u st=%d\n",
+                       MM_MAC_ADDR_VAL(peer->mac), (unsigned)commit_len, (int)ast);
+            }
+            else
+            {
+                printf("MESH-SAE build_commit FAILED ret=%d\n", cret);
+            }
+            mesh_sae_free(sae);
+        }
     }
     /* mesh_plink_open(): send a Mesh Peering Open, -> OPN_SNT. */
     enum mmwlan_status st = umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);

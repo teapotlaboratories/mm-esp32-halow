@@ -102,6 +102,10 @@ uint32_t umac_mesh_next_seqnum(void);
  *  datapath's process_rx_mgmt_frame. */
 void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufview);
 
+/** Handle a received mesh AUTHENTICATION frame (SAE). Called from the mesh datapath's
+ *  process_rx_mgmt_frame. */
+void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview);
+
 /** Handle a received peer S1G mesh beacon for peer discovery. `peer_mac` is the beacon's
  *  source address (= the peer's MAC, since a mesh BSSID equals the sender's own MAC); `ies`
  *  points at the beacon information elements. If the Mesh ID matches ours, initiates a peer

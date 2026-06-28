@@ -62,6 +62,7 @@ set(SRCS
     ${ROOT_DIR}/wpa_supplicant/bssid_ignore.c
     ${ROOT_DIR}/wpa_supplicant/wnm_sta.c
     ${ROOT_DIR}/crypto_mbedtls_mm.c
+    ${ROOT_DIR}/mesh_sae.c
     ${ROOT_DIR}/morse_stubs.c
 )
 
