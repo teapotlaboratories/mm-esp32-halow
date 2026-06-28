@@ -977,11 +977,27 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
 
         case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151): peer restarted -> free + re-SAE.
             * A Commit (txn 1) in ACCEPTED can only be a genuine restart: a peer still in simultaneous-open
-            * retransmits its CONFIRM (txn 2, handled below), not a Commit — so this is not a retransmit to
-            * absorb. Freeing here (vs replaying our stale Confirm, which the restarted peer can't verify
-            * against its NEW commit pair) is what lets a one-sided restart re-converge. The CLOSE/HOLDING
-            * SAE-stability fix (P3d, kept) prevents the cascade that made this thrash; big-sync is the
-            * backstop. [#13] */
+            * retransmits its CONFIRM (txn 2, handled below), not a Commit. Freeing here (vs replaying our
+            * stale Confirm, which the restarted peer can't verify against its NEW commit pair) is what lets
+            * a one-sided restart re-converge. The CLOSE/HOLDING SAE-stability fix (P3d, kept) prevents the
+            * cascade that made this thrash; big-sync is the backstop. [#13]
+            *
+            * #13 hardening — follow hostap EXACTLY: hostap reaches ap_free_sta only AFTER the Commit clears
+            * handle_auth_sae's validation envelope — status-success (ieee802_11.c:1466), well-formed
+            * sae_parse_commit (:1502), reflection -> SAE_SILENTLY_DISCARD (:1511). A frame failing those
+            * goes to reply/remove_sta, which does NOT free an MPM mesh peer (added_unassoc=false, :1657),
+            * so hostap KEEPS the ACCEPTED link. Only a well-formed, success, non-reflected Commit (what a
+            * genuine restart emits) may tear the link down — else a single forged/malformed/reflected
+            * Commit spoofing the peer's MAC would flap an established secure link. Gate accordingly. */
+            if (status != 0 ||                                          /* status-success (:1466) */
+                peer->sae_commit_len < 3 ||                             /* our commit must be cached */
+                len < peer->sae_commit_len ||                          /* well-formed for our group */
+                memcmp(body, peer->sae_commit, 2) != 0 ||              /* same SAE group (:1457-1462) */
+                memcmp(body + 2, peer->sae_commit + 2,
+                       peer->sae_commit_len - 2) == 0)                 /* reflection of our commit (:1511) */
+            {
+                break; /* not a genuine restart trigger — keep the ACCEPTED link (hostap drops it intact) */
+            }
             mesh_sae_reauth_free(peer);
             return; /* peer freed — must not touch it again */
 
