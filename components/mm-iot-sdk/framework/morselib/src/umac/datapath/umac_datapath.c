@@ -3202,12 +3202,18 @@ static void umac_datapath_process_rx_mgmt_frame_mesh(struct umac_data *umacd,
     {
         umac_mesh_handle_action(umacd, rxbufview);
     }
+    else if (subtype == DOT11_FC_SUBTYPE_AUTH)
+    {
+        umac_mesh_handle_auth(umacd, rxbufview); /* SAE peering (P3) */
+    }
 }
 
-/* Mesh peering uses ACTION frames pre-association; allow them (and beacons) through. */
+/* Mesh peering uses ACTION frames (MPM/AMPE) + AUTH frames (SAE) pre-association; allow them (and
+ * beacons) through. */
 static const uint16_t frames_allowed_pre_association_mesh[] = {
     DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
     DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
+    DOT11_VER_TYPE_SUBTYPE(0, MGMT, AUTH),
     UINT16_MAX,
 };
 
