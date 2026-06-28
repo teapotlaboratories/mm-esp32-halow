@@ -17,7 +17,6 @@
  * mac80211 mesh beacon. Peering / HWMP / path table come in P2+.
  */
 
-#include <stdio.h> /* TEMP(P3a bring-up): printf for SAE auth trace */
 #include <string.h>
 
 #include "common/common.h"
@@ -73,10 +72,27 @@ extern int mesh_sae_build_confirm(void *handle, uint8_t *out, size_t out_cap, si
 extern int mesh_sae_check_confirm(void *handle, const uint8_t *body, size_t len);
 extern int mesh_sae_get_keys(void *handle, uint8_t *pmk32, uint8_t *pmkid16);
 extern int mesh_sae_state(void *handle);
+extern void mesh_sae_clear_temp(void *handle);
 /* Shared mesh SAE password (matches the Linux sae_password for cross-vendor interop, P3d). */
 #define MESH_SAE_PASSWORD "rimbamesh2026"
 /* Max SAE auth body we build/carry (group-19 Commit ~98 B, Confirm ~34 B). */
 #define MESH_SAE_BODY_MAX 192
+
+/* Per-peer SAE (Dragonfly) protocol FSM tunables, mirroring hostap's mesh SAE state machine
+ * (src/ap/ieee802_11.c sae_sm_step + the AP defaults). */
+#define MESH_SAE_SYNC_MAX   (3)     /* == conf->sae_sync default (ap_config.c:133); strict '>' bail */
+#define MESH_SAE_RETRANS_MS (1000)  /* == dot11RSNASAERetransPeriod default, ms (sae_set_retransmit_timer) */
+#define MESH_SAE_LOCKOUT_MS (10000) /* == sae_check_big_sync 10 s disabled_until (ieee802_11.c:823-832) */
+
+/* Mirrors enum sae_state (sae.h:103). Tracked in struct mesh_peer because sae.c never advances
+ * sae->state itself — the simultaneous-open FSM owns it (the SAE core is pure crypto). */
+enum mesh_sae_fsm_state
+{
+    MESH_SAE_NOTHING = 0,
+    MESH_SAE_COMMITTED = 1,
+    MESH_SAE_CONFIRMED = 2,
+    MESH_SAE_ACCEPTED = 3,
+};
 
 /* 802.11s element IDs (per IEEE 802.11). */
 #define DOT11_IE_MESH_CONFIGURATION (113)
@@ -396,6 +412,22 @@ struct mesh_peer
     uint8_t peer_mgtk[16];
     uint8_t peer_mgtk_rsc[8];
     bool peer_mgtk_valid;
+    /* P3b: per-peer SAE (Dragonfly) sub-FSM. Runs ALONGSIDE the MPM/AMPE flow and is NOT yet
+     * load-bearing — AMPE still keys off the static mesh_p2_pmk; P3c does the PMK seam. Its sole
+     * output is pmk/pmkid. The protocol state is mirrored HERE (not in the sae handle) because sae.c
+     * never writes sae->state, and mesh_sae_build_commit's internal sae_set_group resets the handle. */
+    void *sae;                      /* opaque struct sae_data* (mesh_sae_alloc); NULL until SAE starts */
+    uint8_t sae_state;              /* enum mesh_sae_fsm_state */
+    uint8_t sae_sync;               /* protocol Sync var; anti-thrash cap (== hostap sae->sync) */
+    uint32_t sae_last_tx_ms;        /* last SAE-frame TX; drives the ~1 s retransmit; 0 == idle/stopped */
+    uint32_t sae_disabled_until_ms; /* 10 s big-sync lockout (sae_check_big_sync); 0 == enabled */
+    uint8_t sae_commit[MESH_SAE_BODY_MAX];  /* cached OUR Commit body for non-destructive retransmit */
+    size_t sae_commit_len;
+    uint8_t sae_confirm[MESH_SAE_BODY_MAX]; /* cached OUR Confirm body (replayed once tmp is freed) */
+    size_t sae_confirm_len;
+    uint8_t pmk[32];                /* SAE-derived PMK — the P3b deliverable (P3c feeds it to AMPE) */
+    uint8_t pmkid[16];              /* SAE-derived PMKID */
+    bool pmk_valid;                 /* SAE reached ACCEPTED; pmk/pmkid populated */
 };
 
 static struct mesh_peer mesh_peers[MESH_MAX_PEERS];
@@ -508,6 +540,13 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
 /* Release a peer slot, freeing its per-peer stad (heap; the common_stad is static — never freed). */
 static void mesh_peer_free(struct mesh_peer *peer)
 {
+    /* Free the SAE protocol instance (sae_data + bignum scratch) — mirrors sta_info.c:427-428. This
+     * single site covers every teardown path (HOLDING, inactivity, CLOSE RX, llid mismatch, stop). */
+    if (peer->sae != NULL)
+    {
+        mesh_sae_free(peer->sae);
+        peer->sae = NULL;
+    }
 #if MMWLAN_MESH_SEC_PHASE1
     if (peer->stad != NULL)
     {
@@ -742,8 +781,259 @@ static enum mmwlan_status umac_mesh_tx_auth(const struct mesh_peer *peer, uint16
     return umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
 }
 
-/* Handle a received mesh SAE Authentication frame (P3). Called from the mesh datapath's
- * process_rx_mgmt_frame. P3a: parse + log only; P3b drives the per-peer SAE FSM. */
+/* ---- Per-peer SAE (Dragonfly) simultaneous-open FSM (P3b) ------------------
+ *
+ * A native port of hostap's mesh SAE state machine: the per-peer kick
+ * (mesh_rsn_auth_sae_sta / auth_sae_init_committed), the RX dispatch
+ * (handle_auth_sae -> sae_sm_step) and the retransmit/anti-thrash timers
+ * (auth_sae_retransmit_timer / sae_check_big_sync). The Dragonfly crypto is
+ * reused via the mesh_sae shim; this code is purely the protocol FSM, which
+ * sae.c deliberately does not implement. See docs/mesh-ap/rimba-mesh-p3-sae-plan.md
+ * and the P3b worklog for the function-level code-map to ieee802_11.c / mesh_rsn.c.
+ *
+ * P3b scope: SAE runs alongside the working MPM/AMPE flow and its only output is
+ * peer->pmk/pmkid. AMPE still keys off the static mesh_p2_pmk (P3c does the seam,
+ * and the SAE-before-Open reorder). The proof is two ESP peers deriving identical
+ * peer->pmkid. */
+
+/* Format a byte array as lowercase hex into a NUL-terminated string (diagnostics only). */
+static void mesh_sae_fmt_hex(char *out, size_t out_cap, const uint8_t *in, size_t in_len)
+{
+    static const char d[] = "0123456789abcdef";
+    size_t j = 0;
+    for (size_t i = 0; i < in_len && j + 2 < out_cap; i++)
+    {
+        out[j++] = d[in[i] >> 4];
+        out[j++] = d[in[i] & 0x0f];
+    }
+    out[j] = '\0';
+}
+
+/* Start the per-peer SAE handshake: alloc the instance, build + send our Commit, -> COMMITTED. Mirrors
+ * mesh_rsn_auth_sae_sta (mesh_rsn.c:371) + auth_sae_init_committed (ieee802_11.c:1682). Idempotent and
+ * safe to call from peer discovery (beacon/Open) or lazily on a first RX Commit. */
+static void mesh_sae_start(struct mesh_peer *peer)
+{
+    uint32_t now = mmosal_get_time_ms();
+    if (peer->sae != NULL || peer->pmk_valid)
+    {
+        return; /* already running, or P3b already has a PMK (one is enough) */
+    }
+    if (peer->sae_disabled_until_ms != 0 && now < peer->sae_disabled_until_ms)
+    {
+        return; /* still inside the 10 s big-sync lockout */
+    }
+    peer->sae = mesh_sae_alloc();
+    if (peer->sae == NULL)
+    {
+        return;
+    }
+    /* mesh_sae_build_commit is DESTRUCTIVE: it runs sae_set_group -> sae_clear_data, wiping
+     * pmk/state/peer scalars. Call it EXACTLY ONCE per session and replay the cached bytes for every
+     * retransmit/resync — never rebuild (would silently destroy a derived PMK). */
+    if (mesh_sae_build_commit(peer->sae, mesh_ctx.mesh_mac, peer->mac, MESH_SAE_PASSWORD,
+                              strlen(MESH_SAE_PASSWORD), peer->sae_commit, sizeof(peer->sae_commit),
+                              &peer->sae_commit_len) != 0)
+    {
+        mesh_sae_free(peer->sae);
+        peer->sae = NULL;
+        return;
+    }
+    (void)umac_mesh_tx_auth(peer, 1 /*txn*/, 0 /*status*/, peer->sae_commit, peer->sae_commit_len);
+    peer->sae_state = MESH_SAE_COMMITTED; /* "Init and sent commit" (ieee802_11.c:1696) */
+    peer->sae_sync = 0;
+    peer->sae_last_tx_ms = now;           /* arm retransmit (sae_set_retransmit_timer) */
+    peer->sae_disabled_until_ms = 0;
+    MMLOG_DBG("MESH-SAE -> " MM_MAC_ADDR_FMT " Commit (COMMITTED) len=%u\n", MM_MAC_ADDR_VAL(peer->mac),
+              (unsigned)peer->sae_commit_len);
+}
+
+/* Build, cache, and send our SAE Confirm (txn=2). Mirrors auth_sae_send_confirm (ieee802_11.c:756).
+ * The bytes are cached so an ACCEPTED-state retransmit can replay them after the bignum tmp is freed. */
+static void mesh_sae_tx_confirm(struct mesh_peer *peer)
+{
+    uint8_t cf[MESH_SAE_BODY_MAX];
+    size_t n = 0;
+    if (mesh_sae_build_confirm(peer->sae, cf, sizeof(cf), &n) != 0)
+    {
+        return;
+    }
+    memcpy(peer->sae_confirm, cf, n);
+    peer->sae_confirm_len = n;
+    (void)umac_mesh_tx_auth(peer, 2 /*txn*/, 0 /*status*/, cf, n);
+}
+
+/* Big-sync bail: free the SAE instance, reset to NOTHING, and lock the peer out for 10 s. Mirrors the
+ * sae_check_big_sync reset path (ieee802_11.c:823-832); the plink tick restarts SAE after the lockout. */
+static void mesh_sae_big_sync_reset(struct mesh_peer *peer, uint32_t now)
+{
+    if (peer->sae != NULL)
+    {
+        mesh_sae_free(peer->sae);
+        peer->sae = NULL;
+    }
+    peer->sae_state = MESH_SAE_NOTHING;
+    peer->sae_sync = 0;
+    peer->sae_last_tx_ms = 0;
+    peer->sae_disabled_until_ms = now + MESH_SAE_LOCKOUT_MS;
+    MMLOG_DBG("MESH-SAE " MM_MAC_ADDR_FMT " sync>max -> 10 s lockout\n", MM_MAC_ADDR_VAL(peer->mac));
+}
+
+/* sae_check_big_sync (ieee802_11.c:821-836): returns true (caller must bail) if sync exceeded the cap,
+ * triggering the lockout. Strict '>' so sync may reach MESH_SAE_SYNC_MAX+1 before bailing. */
+static bool mesh_sae_check_big_sync(struct mesh_peer *peer, uint32_t now)
+{
+    if (peer->sae_sync > MESH_SAE_SYNC_MAX)
+    {
+        mesh_sae_big_sync_reset(peer, now);
+        return true;
+    }
+    return false;
+}
+
+/* Mesh reauth substitute (P3b): re-derive the PMK in place without disturbing the live MPM/AMPE link.
+ * hostap frees the whole STA here (ieee802_11.c:1144-1151); in P3b SAE is not load-bearing, so we just
+ * restart the handshake. (P3c, where SAE gates the link, will adopt the true free-and-restart.) */
+static void mesh_sae_restart_in_place(struct mesh_peer *peer, uint32_t now)
+{
+    (void)now;
+    if (peer->sae != NULL)
+    {
+        mesh_sae_free(peer->sae);
+        peer->sae = NULL;
+    }
+    peer->sae_state = MESH_SAE_NOTHING;
+    peer->sae_sync = 0;
+    peer->pmk_valid = false;
+    peer->sae_disabled_until_ms = 0;
+    mesh_sae_start(peer);
+}
+
+/* Drive the per-peer SAE FSM on a received Authentication frame. Ports handle_auth_sae
+ * (ieee802_11.c:1329) + sae_sm_step (ieee802_11.c:990), mesh branches only. @txn is the auth
+ * transaction (1 Commit / 2 Confirm), @body/@len the SAE body (txn|status already stripped). */
+static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t status,
+                               const uint8_t *body, size_t len)
+{
+    uint32_t now = mmosal_get_time_ms();
+
+    if (txn != 1 && txn != 2)
+    {
+        return; /* ieee802_11.c:998-999 */
+    }
+
+    /* Lazy responder alloc: the first SAE frame must be a Commit with success status (handle_auth_sae
+     * ieee802_11.c:1375-1390). mesh_sae_start sends OUR Commit and -> COMMITTED; we then fall through
+     * to process the peer's Commit below — the mesh "send Commit+Confirm, NOTHING->CONFIRMED" shape
+     * (ieee802_11.c:1041-1052). Normally the peer already started SAE at discovery, so sae != NULL. */
+    if (peer->sae == NULL)
+    {
+        if (txn != 1 || status != 0)
+        {
+            return;
+        }
+        mesh_sae_start(peer);
+        if (peer->sae == NULL)
+        {
+            return; /* alloc failed or in lockout */
+        }
+    }
+
+    if (txn == 1) /* ---- Commit RX ---- */
+    {
+        switch (peer->sae_state)
+        {
+        case MESH_SAE_COMMITTED: /* normal next step (ieee802_11.c:1074-1083) */
+            if (mesh_sae_process_commit(peer->sae, body, len) != 0)
+            {
+                return; /* parse/derive failed -> drop, no state change */
+            }
+            mesh_sae_tx_confirm(peer);
+            peer->sae_state = MESH_SAE_CONFIRMED; /* "Sent Confirm" */
+            peer->sae_sync = 0;
+            peer->sae_last_tx_ms = now;
+            break;
+
+        case MESH_SAE_CONFIRMED: /* peer restarted / resync (ieee802_11.c:1121-1137) */
+            if (mesh_sae_check_big_sync(peer, now))
+            {
+                return;
+            }
+            peer->sae_sync++;
+            (void)umac_mesh_tx_auth(peer, 1, 0, peer->sae_commit, peer->sae_commit_len);
+            (void)mesh_sae_process_commit(peer->sae, body, len);
+            mesh_sae_tx_confirm(peer);
+            peer->sae_last_tx_ms = now; /* stay CONFIRMED */
+            break;
+
+        case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151) */
+            mesh_sae_restart_in_place(peer, now);
+            break;
+
+        default: /* MESH_SAE_NOTHING: unreachable after the lazy start above */
+            break;
+        }
+    }
+    else /* ---- txn == 2, Confirm RX ---- */
+    {
+        if (status != 0)
+        {
+            return; /* ieee802_11.c:1582 */
+        }
+        switch (peer->sae_state)
+        {
+        case MESH_SAE_COMMITTED:
+            /* Mesh COMMITTED+Confirm: the confirm body is NOT validated here (handle_auth_sae gates
+             * sae_check_confirm on state>=CONFIRMED, ieee802_11.c:1584); just resync by resending our
+             * Commit (ieee802_11.c:1084-1097). */
+            if (mesh_sae_check_big_sync(peer, now))
+            {
+                return;
+            }
+            peer->sae_sync++;
+            (void)umac_mesh_tx_auth(peer, 1, 0, peer->sae_commit, peer->sae_commit_len);
+            peer->sae_last_tx_ms = now; /* stay COMMITTED */
+            break;
+
+        case MESH_SAE_CONFIRMED: /* THE ACCEPT (ieee802_11.c:1138-1140 + sae_accept_sta:940) */
+            if (mesh_sae_check_confirm(peer->sae, body, len) != 0)
+            {
+                return; /* confirm hash mismatch -> drop */
+            }
+            if (mesh_sae_get_keys(peer->sae, peer->pmk, peer->pmkid) == 0)
+            {
+                peer->pmk_valid = true; /* == wpa_auth_pmksa_add_sae (ieee802_11.c:983) */
+                char pmkid_hex[2 * 16 + 1];
+                mesh_sae_fmt_hex(pmkid_hex, sizeof(pmkid_hex), peer->pmkid, 16);
+                /* PMKID is the public on-wire key identifier (carried in the MPM/RSN IE), NOT key
+                 * material — safe to log, and a deterministic function of the PMK, so two peers'
+                 * matching PMKIDs prove byte-identical PMKs (the P3b proof). The PMK is never logged. */
+                MMLOG_INF("MESH-SAE " MM_MAC_ADDR_FMT " ACCEPTED pmkid=%s\n",
+                          MM_MAC_ADDR_VAL(peer->mac), pmkid_hex);
+            }
+            peer->sae_state = MESH_SAE_ACCEPTED;
+            peer->sae_last_tx_ms = 0;         /* stop retransmit (sae_clear_retransmit_timer) */
+            mesh_sae_clear_temp(peer->sae);   /* drop bignums, keep pmk/pmkid (ieee802_11.c:1169) */
+            break;
+
+        case MESH_SAE_ACCEPTED:
+            /* Retransmit our (cached) final Confirm so a peer stuck in CONFIRMED can complete
+             * (ieee802_11.c:1163-1172). tmp is gone, so replay the cached bytes rather than rebuild. */
+            if (peer->sae_confirm_len > 0)
+            {
+                (void)umac_mesh_tx_auth(peer, 2, 0, peer->sae_confirm, peer->sae_confirm_len);
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+/* Handle a received mesh SAE Authentication frame (P3b). Called from the mesh datapath's
+ * process_rx_mgmt_frame. frame_authentication_parse strips txn|status, so result.seq = transaction,
+ * result.status_code = status, result.auth_data/_len = the SAE body. */
 void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     (void)umacd;
@@ -756,9 +1046,18 @@ void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview)
     {
         return;
     }
-    printf("MESH-SAE rx auth from " MM_MAC_ADDR_FMT " txn=%u status=%u body_len=%u\n",
-           MM_MAC_ADDR_VAL(result.sta_address), (unsigned)result.seq, (unsigned)result.status_code,
-           (unsigned)result.auth_data_len);
+    /* SAE peers are discovered via beacons (mmwlan_mesh_peer_open) or an inbound MPM Open
+     * (umac_mesh_handle_action) — both create the peer AND start SAE. An auth frame from a peer we
+     * don't yet track is dropped (like Linux's mesh_pending_auth, which waits for a peer candidate
+     * instead of auto-creating a STA); the sender's SAE retransmit redelivers it once a beacon has
+     * created the peer. This keeps mmwlan_mesh_peer_open the sole MPM-Open initiator. */
+    struct mesh_peer *peer = mesh_peer_find(result.sta_address);
+    if (peer == NULL)
+    {
+        return;
+    }
+    peer->last_rx_ms = mmosal_get_time_ms(); /* a received auth frame is peer liveness (mac80211 last_rx) */
+    mesh_sae_handle_rx(peer, result.seq, result.status_code, result.auth_data, result.auth_data_len);
 }
 
 /* Periodic peer-link retransmission, mirroring mac80211's mesh_plink_timer. One tick
@@ -785,6 +1084,35 @@ static void umac_mesh_plink_tick(void *arg1, void *arg2)
         {
             continue;
         }
+
+        /* SAE protocol retransmit (auth_sae_retransmit_timer ieee802_11.c:861-895), driven off
+         * sae_state + sae_last_tx_ms (~1 s) and fully independent of the MPM-Open retransmit below
+         * (peer->state). Each fire bumps sae_sync; exceeding the cap triggers the big-sync lockout. */
+        if (peer->sae != NULL && peer->sae_last_tx_ms != 0 &&
+            (uint32_t)(now - peer->sae_last_tx_ms) >= MESH_SAE_RETRANS_MS)
+        {
+            if (!mesh_sae_check_big_sync(peer, now))
+            {
+                peer->sae_sync++;
+                if (peer->sae_state == MESH_SAE_COMMITTED)
+                {
+                    (void)umac_mesh_tx_auth(peer, 1, 0, peer->sae_commit, peer->sae_commit_len);
+                    peer->sae_last_tx_ms = now;
+                }
+                else if (peer->sae_state == MESH_SAE_CONFIRMED)
+                {
+                    mesh_sae_tx_confirm(peer);
+                    peer->sae_last_tx_ms = now;
+                }
+            }
+        }
+        /* Self-heal: re-kick SAE for a peer with no live handshake and no PMK once any big-sync
+         * lockout has expired (also retries a transient alloc failure). mesh_sae_start re-checks. */
+        else if (peer->sae == NULL && !peer->pmk_valid && now >= peer->sae_disabled_until_ms)
+        {
+            mesh_sae_start(peer);
+        }
+
         switch (peer->state)
         {
         case MESH_PLINK_OPN_SNT:
@@ -1103,31 +1431,10 @@ void mmwlan_mesh_peer_open(const uint8_t *peer_mac)
     {
         return;
     }
-    /* P3a: emit a test SAE Commit on-air (no FSM yet) to prove the auth-frame TX path + the mesh_sae
-     * shim linkage. The existing AMPE-over-static-PMK peering below is untouched; P3b drives the real
-     * per-peer SAE handshake and P3c feeds its PMK into the AMPE. TEMP scaffolding. */
-    {
-        void *sae = mesh_sae_alloc();
-        if (sae != NULL)
-        {
-            uint8_t commit[MESH_SAE_BODY_MAX];
-            size_t commit_len = 0;
-            int cret = mesh_sae_build_commit(sae, mesh_ctx.mesh_mac, peer->mac, MESH_SAE_PASSWORD,
-                                             strlen(MESH_SAE_PASSWORD), commit, sizeof(commit),
-                                             &commit_len);
-            if (cret == 0)
-            {
-                enum mmwlan_status ast = umac_mesh_tx_auth(peer, 1, 0, commit, commit_len);
-                printf("MESH-SAE tx commit -> " MM_MAC_ADDR_FMT " len=%u st=%d\n",
-                       MM_MAC_ADDR_VAL(peer->mac), (unsigned)commit_len, (int)ast);
-            }
-            else
-            {
-                printf("MESH-SAE build_commit FAILED ret=%d\n", cret);
-            }
-            mesh_sae_free(sae);
-        }
-    }
+    /* Start the per-peer SAE (Dragonfly) handshake (== secure-mesh discovery, mesh_mpm.c:899
+     * mesh_rsn_auth_sae_sta). P3b: SAE derives peer->pmk/pmkid alongside the MPM/AMPE flow but is not
+     * yet load-bearing — AMPE still keys off the static PMK; P3c reorders SAE-before-Open + the seam. */
+    mesh_sae_start(peer);
     /* mesh_plink_open(): send a Mesh Peering Open, -> OPN_SNT. */
     enum mmwlan_status st = umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);
     peer->state = MESH_PLINK_OPN_SNT;
@@ -1991,6 +2298,9 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
             MMLOG_WRN("MESH peer table full; ignoring " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(sa));
             return;
         }
+        /* New peer learned from an inbound Open (not a beacon): start SAE here too, so the handshake
+         * runs regardless of which path discovered the peer (== mesh_mpm.c:899 for the responder). */
+        mesh_sae_start(peer);
     }
 
     /* CLOSE: tear the link down (mesh_plink_fsm CLS_ACPT). */

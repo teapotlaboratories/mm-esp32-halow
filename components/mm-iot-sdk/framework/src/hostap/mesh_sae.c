@@ -136,9 +136,24 @@ int mesh_sae_get_keys(void *handle, uint8_t *pmk32, uint8_t *pmkid16)
     return 0;
 }
 
-/* The SAE protocol state (enum sae_state: NOTHING/COMMITTED/CONFIRMED/ACCEPTED) as a plain int. */
+/* The SAE protocol state (enum sae_state: NOTHING/COMMITTED/CONFIRMED/ACCEPTED) as a plain int. NOTE:
+ * sae.c never advances sae->state itself (only sae_clear_data's memset writes it) — the simultaneous-
+ * open FSM owns the state. The umac mesh FSM therefore mirrors the state in struct mesh_peer and uses
+ * this getter only for diagnostics. */
 int mesh_sae_state(void *handle)
 {
     struct sae_data *sae = handle;
     return (int)sae->state;
+}
+
+/* Free the SAE bignum scratch (sae->tmp: peer_commit_scalar, EC group, KCK) after the handshake is
+ * ACCEPTED while PRESERVING pmk/pmkid/state — mirrors hostap dropping tmp at ieee802_11.c:1169. Lets
+ * the umac mesh FSM reclaim the P-256 scratch per peer without losing the derived PMK. */
+void mesh_sae_clear_temp(void *handle)
+{
+    struct sae_data *sae = handle;
+    if (sae != NULL)
+    {
+        sae_clear_temp_data(sae);
+    }
 }
