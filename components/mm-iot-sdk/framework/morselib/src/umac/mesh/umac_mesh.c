@@ -158,7 +158,10 @@ static void mesh_build_config_ie(struct consbuf *buf)
         0x01, /* Active Path Selection Metric:   Airtime */
         0x00, /* Congestion Control Mode:        none */
         0x01, /* Synchronization Method:         neighbour offset (mac80211 default) */
-        0x00, /* Authentication Protocol:        open */
+        0x01, /* Authentication Protocol:        SAE — secured mesh. MUST be 0x01 (not 0x00=open):
+               * Linux mesh_matches_local (net/mac80211/mesh.c) compares meshconf_auth and drops a
+               * candidate whose beacon advertises a different value, so a Linux SAE peer never creates
+               * the ESP as a peer candidate and drops its SAE Commits ("peer not yet known"). P3d. */
         0x00, /* Mesh Formation Info:            0 peerings */
         0x01, /* Mesh Capability:                Accepting Additional Peerings */
     };
@@ -169,6 +172,15 @@ static void mesh_build_config_ie(struct consbuf *buf)
  * 0x1c; high byte 0x08 matches the morse Linux reference (no Next-TBTT/Compressed-SSID/ANO
  * optional fields present, so the IEs follow the 15-byte header directly). */
 #define MESH_S1G_BEACON_FC (0x081cu)
+
+/* RSN IE (48) for the secured (SAE) mesh — version 1, group+pairwise CCMP, AKM SAE, RSN caps 0.
+ * Emitted in BOTH the beacon (P3d, so a Linux SAE peer accepts the candidate) and the peering
+ * Open/Confirm (P2d.3). Defined here (before umac_mesh_build_beacon) so the beacon builder can use it. */
+#define DOT11_IE_RSN (48)
+static const uint8_t mesh_rsn_ie[] = {
+    DOT11_IE_RSN, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
+    0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00
+};
 
 static void umac_mesh_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *params)
 {
@@ -219,6 +231,12 @@ static void umac_mesh_build_beacon(struct umac_data *umacd, struct consbuf *buf,
         op->primary_channel_number = mesh_ctx.s1g_primary_chan;
         op->channel_center_freq = mesh_ctx.s1g_centre_chan;
     }
+
+    /* RSN IE (48) — secured mesh (P3d). A Linux SAE mesh advertises the RSN IE in its beacon; without
+     * it a Linux peer treats the ESP as a security-incompatible candidate (Mesh Config says auth=SAE
+     * but no RSN params) and won't create a peer for it, dropping the ESP's SAE Commits. Same IE the
+     * peering Open carries. (Was deferred in P2d.3 — needed once a real Linux peer is on the other end.) */
+    consbuf_append(buf, mesh_rsn_ie, sizeof(mesh_rsn_ie));
 
     /* Mesh ID IE (114) then Mesh Configuration IE (113). */
     const uint8_t mesh_id_hdr[2] = { DOT11_IE_MESH_ID, mesh_ctx.mesh_id_len };
@@ -293,14 +311,10 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
  * The MPM IE 'protocol' becomes 1 (AMPE) and carries a 16-byte PMKID as its last field. For ESP<->ESP
  * the PMKID is not checked (our parser owns both ends); a real cross-vendor PMKID needs P3 (SAE), so
  * this is a deterministic placeholder. */
-#define DOT11_IE_RSN              (48)
 #define MESH_CAP_PRIVACY          (0x0010)
 #define MESH_MPM_PROTO_AMPE       (1)
 #define MESH_PMKID_LEN            (16)
-static const uint8_t mesh_rsn_ie[] = {
-    DOT11_IE_RSN, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
-    0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00
-};
+/* mesh_rsn_ie + DOT11_IE_RSN are defined earlier (before umac_mesh_build_beacon, which also emits it). */
 
 /* HWMP path selection (net/mac80211/mesh_hwmp.c). Mesh Action category, action code, and the
  * PREQ/PREP element IDs + lengths. We implement the minimal target behaviour: reply to a PREQ
@@ -888,18 +902,6 @@ static bool mesh_sae_check_big_sync(struct mesh_peer *peer, uint32_t now)
     return false;
 }
 
-/* Mesh SAE reauth (P3c): a peer that re-initiates SAE on an already-accepted link has rebooted and will
- * derive a FRESH per-handshake PMK. Now that the PMK is load-bearing (the MTK/AEK derive from it), an
- * in-place restart would desync the installed MTK from the new PMK — so free the peer + its keys and
- * invalidate paths through it (== hostap ap_free_sta on ACCEPTED+Commit, ieee802_11.c:1144-1151). The
- * next heard beacon re-discovers the peer and re-runs the full SAE -> Open -> ESTAB key install. The
- * caller MUST NOT touch @p peer after this returns. */
-static void mesh_sae_reauth_free(struct mesh_peer *peer)
-{
-    umac_mesh_invalidate_paths_via(peer->mac);
-    mesh_peer_free(peer);
-}
-
 /* Drive the per-peer SAE FSM on a received Authentication frame. Ports handle_auth_sae
  * (ieee802_11.c:1329) + sae_sm_step (ieee802_11.c:990), mesh branches only. @txn is the auth
  * transaction (1 Commit / 2 Confirm), @body/@len the SAE body (txn|status already stripped). */
@@ -930,6 +932,7 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
         }
     }
 
+
     if (txn == 1) /* ---- Commit RX ---- */
     {
         switch (peer->sae_state)
@@ -957,9 +960,18 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
             peer->sae_last_tx_ms = now; /* stay CONFIRMED */
             break;
 
-        case MESH_SAE_ACCEPTED: /* mesh reauth (ieee802_11.c:1144-1151): peer rebooted -> free + re-SAE */
-            mesh_sae_reauth_free(peer);
-            return; /* peer freed — must not touch it again */
+        case MESH_SAE_ACCEPTED:
+            /* ACCEPTED + Commit. In cross-vendor simultaneous-open the peer keeps retransmitting its
+             * Commit until IT accepts OUR Confirm; freeing+restarting here (the P3c reauth) rebuilds our
+             * Commit with a NEW scalar, desyncing the commit pair and thrashing both FSMs (observed
+             * ESP<->Linux: REAUTH-FREE/BIGSYNC loops, mutual Confirm mismatch). Instead, retransmit our
+             * cached Confirm so the peer can verify it against the SAME commit pair and accept. We keep
+             * our PMK; a genuine peer reboot is handled by the inactivity/CLOSE path, not here. [P3d] */
+            if (peer->sae_confirm_len > 0)
+            {
+                (void)umac_mesh_tx_auth(peer, 2, 0, peer->sae_confirm, peer->sae_confirm_len);
+            }
+            break;
 
         default: /* MESH_SAE_NOTHING: unreachable after the lazy start above */
             break;
@@ -1133,6 +1145,14 @@ static void umac_mesh_plink_tick(void *arg1, void *arg2)
             if (peer->retries < MESH_PLINK_MAX_RETRIES)
             {
                 peer->retries++;
+                (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);
+            }
+            else if (peer->pmk_valid)
+            {
+                /* P3d: SAE is accepted (the expensive part is done) — don't HOLDING/free over an
+                 * unanswered Open; that would destroy the SAE PMK + commit and force a fresh SAE,
+                 * desyncing a slower cross-vendor peer. Keep retrying the Open with the stable SAE. */
+                peer->retries = 0;
                 (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);
             }
             else
@@ -2325,7 +2345,28 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         mesh_sae_start(peer);
     }
 
-    /* CLOSE: tear the link down (mesh_plink_fsm CLS_ACPT). */
+    /* CLOSE: the peer's MPM plink failed (mesh_plink_fsm CLS_ACPT). P3d: a CLOSE tears down the PLINK,
+     * NOT the SAE session. While SAE is still running/accepted and we haven't ESTAB'd, freeing the peer
+     * here destroys the SAE PMK + commit and forces a fresh SAE with a NEW commit — which desyncs the
+     * commit pair from a (slower) cross-vendor peer that keeps Closing, thrashing forever (observed
+     * ESP<->Linux). So keep the SAE/commit stable: drop the failed plink back to LISTEN (the SAE-accept
+     * hook / Open retransmit re-attempts the Open) but preserve sae/pmk/pmkid/aek. Only a CLOSE on an
+     * ESTAB link (or a peer with no SAE) is a real teardown -> free. */
+    if (action == WLAN_SP_MESH_PEERING_CLOSE && peer->state != MESH_PLINK_ESTAB &&
+        (peer->sae != NULL || peer->pmk_valid))
+    {
+        peer->state = MESH_PLINK_LISTEN; /* plink reset; SAE kept. Re-Open fires from the accept hook
+                                          * (if still mid-SAE) or the OPN_SNT retransmit once we re-Open. */
+        peer->retries = 0;
+        peer->last_rx_ms = mmosal_get_time_ms();
+        if (peer->pmk_valid && peer->aek_valid)
+        {
+            /* SAE already done: immediately re-attempt the Open with the existing PMK/AEK. */
+            (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0);
+            peer->state = MESH_PLINK_OPN_SNT;
+        }
+        return;
+    }
     if (action == WLAN_SP_MESH_PEERING_CLOSE)
     {
         MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " closed (state %u)\n", MM_MAC_ADDR_VAL(sa),
