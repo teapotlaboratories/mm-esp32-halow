@@ -1870,22 +1870,14 @@ static void umac_mesh_tx_hwmp(struct hwmp_frame_params *p)
         return;
     }
     mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
-    /* #17: a secured mesh protects a GROUP-addressed HWMP frame (broadcast PREQ/PERR) with the MGTK
-     * (CCMP) — NOT BIP. But umac_datapath_tx_mgmt_frame DROPS a BC/MC robust-mgmt frame (umac_datapath.c
-     * ~2233: its PMF branch is the infrastructure BIP case, unsupported here), so in a secured mesh board0
-     * would silently emit NO PREQ (can't originate a path) and NO PERR — HWMP never resolves and no
-     * encrypted data flows. Route the broadcast HWMP through the mesh GROUP-key path
-     * (umac_datapath_tx_mesh_group_frame: encrypt under the common-stad MGTK + Protected/HW_ENC, leaving
-     * the ACTION subtype intact — same as a forwarded group DATA frame). Unicast PREP keeps the pairwise
-     * mgmt path. (Open mesh worked only because PMF is off and the drop was skipped.) */
-    if (p->da != NULL && (p->da[0] & 0x01)) /* group/broadcast bit -> PREQ/PERR */
-    {
-        (void)umac_datapath_tx_mesh_group_frame(mesh_ctx.common_stad, frame);
-    }
-    else
-    {
-        (void)umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
-    }
+    /* All HWMP path-selection frames go through the robust-mgmt TX path. net/mac80211 sends a
+     * GROUP-addressed HWMP frame (broadcast PREQ/PERR/RANN) UNPROTECTED — mesh peers are MFP=no, so
+     * group HWMP is not BIP/MGTK-protected — and the peer accepts it (the #18 RX exemption). So
+     * umac_datapath_tx_mgmt_frame now exempts a group-privacy action from its BC/MC-robust-mgmt drop
+     * and emits it in the clear; a unicast PREP (da = a peer) stays pairwise-CCMP-encrypted on the
+     * same path. This supersedes the earlier #17 approach of MGTK-encrypting the broadcast HWMP, which
+     * a cross-vendor relay can't decrypt as group management (breaking the ESP↔ESP multi-hop relay). */
+    (void)umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
 }
 
 /* Originate a PREQ to discover a path to `dest` (mesh_queue_preq). Rate-limited per dest. */
@@ -2220,6 +2212,15 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
         umac_mesh_start_discovery(mesh_da); /* no path yet — drop, resolve for next time */
         return false;
     }
+    /* The next hop is a directly-peered neighbour; its per-peer stad holds the pairwise MTK the
+     * forwarded unicast must be CCMP-encrypted under (net/mac80211 keys a forwarded unicast with the
+     * next-hop PTK). Forwarding off the common stad instead would send it plaintext (no pairwise key)
+     * and a secured next hop would drop it — the cause of the multi-hop-relay timeout in a secured mesh. */
+    struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(next_hop);
+    if (nh_stad == NULL)
+    {
+        return false; /* next hop is not an established peer — can't forward */
+    }
     struct mesh_forward_params p = { .mesh_da = mesh_da,
                                      .mesh_sa = mesh_sa,
                                      .seqnum = umac_mesh_next_seqnum(),
@@ -2234,7 +2235,7 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
         return false;
     }
     mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
-    (void)umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
+    (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
     return true;
 }
 
