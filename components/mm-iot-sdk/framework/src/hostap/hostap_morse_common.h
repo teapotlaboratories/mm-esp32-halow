@@ -91,6 +91,8 @@ const char *inet_ntop(int __af, const void *__cp, char *__buf, int __len);
 #define aes_encrypt_deinit             mmint_aes_encrypt_deinit
 #define aes_encrypt_init               mmint_aes_encrypt_init
 #define aes_wrap                       mmint_aes_wrap
+#define aes_ccm_ae                     mmint_aes_ccm_ae
+#define aes_ccm_ad                     mmint_aes_ccm_ad
 #define aes_siv_encrypt                mmint_aes_siv_encrypt
 #define aes_siv_decrypt                mmint_aes_siv_decrypt
 #define crypto_bignum_add              mmint_crypto_bignum_add
