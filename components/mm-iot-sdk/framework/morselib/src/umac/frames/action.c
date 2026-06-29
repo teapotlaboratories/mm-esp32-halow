@@ -39,6 +39,33 @@ bool frame_is_robust_action(struct mmpktview *view)
     }
 }
 
+/* A group-addressed Mesh (13) or Multihop (14) Action frame — net/mac80211's
+ * _ieee80211_is_group_privacy_action (include/linux/ieee80211.h). In 802.11s these group-addressed
+ * HWMP/path-selection (PREQ/PERR/RANN) and congestion-control frames are a distinct class: they are
+ * protected by the MGTK (group privacy) when group-addressed-frame protection is active, NOT by BIP
+ * (no MMIE), and in the live morse mesh they are sent in the clear (mesh peers are MFP=no — confirmed
+ * on chronite: `iw station dump` shows the peer with `MFP: no`). So they must NOT be subjected to the
+ * unprotected-robust-mgmt / BIP-MMIE RX drop that applies to BIP-protected group robust mgmt frames. */
+bool frame_is_group_privacy_action(struct mmpktview *view)
+{
+    const struct dot11_action *frame = (struct dot11_action *)mmpkt_get_data_start(view);
+
+    if (!(dot11_frame_control_get_type(frame->hdr.frame_control) == DOT11_FC_TYPE_MGMT) ||
+        !(dot11_frame_control_get_subtype(frame->hdr.frame_control) == DOT11_FC_SUBTYPE_ACTION))
+    {
+        return false;
+    }
+
+    /* group/multicast bit of the DA (addr1) — is_multicast_ether_addr(hdr->addr1) */
+    if (!(dot11_get_da(&frame->hdr)[0] & 0x01))
+    {
+        return false;
+    }
+
+    return frame->field.category == DOT11_ACTION_CATEGORY_MESH ||
+           frame->field.category == DOT11_ACTION_CATEGORY_MULTIHOP;
+}
+
 void frame_action_build(struct umac_data *umacd, struct consbuf *buf, void *args)
 {
     MM_UNUSED(umacd);
