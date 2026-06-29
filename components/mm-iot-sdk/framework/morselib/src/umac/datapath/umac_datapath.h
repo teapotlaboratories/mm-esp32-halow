@@ -108,6 +108,12 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
  * plaintext — its encryption is for robust management frames only). */
 enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf);
 
+/* Send a pre-built FORWARDED UNICAST mesh data frame, CCMP-encrypting it under the stad's PAIRWISE
+ * key (the next hop's MTK) when security != OPEN. `stad` must be the next hop's per-peer stad. Used
+ * by umac_mesh_forward_data so a relayed unicast is encrypted on every hop (mirrors net/mac80211
+ * keying a forwarded unicast with the next-hop PTK). */
+enum mmwlan_status umac_datapath_tx_mesh_unicast_frame(struct umac_sta_data *stad, struct mmpkt *txbuf);
+
 
 enum mmwlan_status umac_datapath_tx_mgmt_frame_ap(struct umac_data *umacd,
                                                   struct mmpkt *txbuf,

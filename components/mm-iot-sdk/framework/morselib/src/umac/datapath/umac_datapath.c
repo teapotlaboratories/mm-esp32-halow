@@ -2233,7 +2233,16 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     if ((data->ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
     {
 
-        if (umac_sta_data_pmf_is_required(stad) && frame_is_robust_mgmt(txbufview))
+        /* A group-addressed Mesh/Multihop Action frame (HWMP PREQ/PERR/RANN) is a group-privacy
+         * action (frame_is_group_privacy_action / mac80211 _ieee80211_is_group_privacy_action): in a
+         * mesh it is sent UNPROTECTED (mesh peers are MFP=no — net/mac80211 transmits group HWMP in the
+         * clear), and the peer accepts it (the RX mirror of this exemption). So skip the robust-mgmt
+         * handling entirely and let it go out unprotected, instead of the BC/MC RMF drop below (which is
+         * the infra BIP case). This is the TX counterpart of the #18 RX exemption and supersedes the
+         * #17 workaround of MGTK-encrypting the broadcast HWMP (which a cross-vendor relay can't
+         * decrypt as group management). Unicast HWMP (PREP) is NOT exempt — it stays pairwise-encrypted. */
+        if (umac_sta_data_pmf_is_required(stad) && frame_is_robust_mgmt(txbufview) &&
+            !frame_is_group_privacy_action(txbufview))
         {
             if (mm_mac_addr_is_multicast(dot11_get_da(header)))
             {
@@ -2303,16 +2312,18 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     return MMWLAN_SUCCESS;
 }
 
-/* Send a pre-built mesh GROUP-addressed (broadcast/multicast) data frame — the re-broadcast of a
- * forwarded group frame (umac_mesh_handle_group_data). umac_datapath_tx_mgmt_frame can't be reused:
- * its encryption path is for robust *management* frames (PMF/pairwise) and it overwrites the tx
- * metadata, so a forwarded data frame goes out in the clear. This applies the *data-path* rule
- * instead — when the stad's security != OPEN, encrypt under the GROUP key (the forwarder's own MGTK
- * on the common stad) so a forwarded multicast is CCMP-protected on every hop, mirroring how
- * net/mac80211 re-encrypts a forwarded mesh group frame with the local MGTK on re-TX. The 802.11
- * header + Mesh Control + payload are already built (umac_mesh_build_rebcast); the firmware inserts
- * the CCMP header for HW_ENC frames. */
-enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+/* Send a pre-built mesh DATA frame on the *data-path* rule. umac_datapath_tx_mgmt_frame can't be
+ * reused: its encryption path is for robust *management* frames (PMF/pairwise) and it overwrites the
+ * tx metadata, so a forwarded data frame goes out in the clear. This applies the data-path rule
+ * instead — when the stad's security != OPEN, encrypt under `key_type` on `stad` and set
+ * Protected/HW_ENC + the data-path PN. Two callers, mirroring net/mac80211 ieee80211_tx_h_select_key
+ * (tx.c:614): a re-broadcast GROUP frame uses the forwarder's own MGTK on the common stad (== the
+ * GTK for a multicast frame); a forwarded UNICAST frame uses the NEXT HOP's pairwise MTK on its
+ * per-peer stad (== tx->sta->ptk for a unicast frame). The 802.11 header + Mesh Control + payload
+ * are already built; the firmware inserts the CCMP header for HW_ENC frames. */
+static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data *stad,
+                                                            struct mmpkt *txbuf,
+                                                            enum umac_key_type key_type)
 {
     enum mmwlan_status status;
     struct umac_data *umacd = umac_sta_data_get_umacd(stad);
@@ -2328,14 +2339,15 @@ enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad,
     int key_id = -1;
     if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN)
     {
-        key_id = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_GROUP);
+        key_id = umac_keys_get_active_key_id(stad, key_type);
         if (key_id >= 0)
         {
             header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
         }
         else
         {
-            MMLOG_WRN("MESH group forward: no group key installed, sending in the clear\n");
+            MMLOG_WRN("MESH forward: no %s key installed, sending in the clear\n",
+                      key_type == UMAC_KEY_TYPE_GROUP ? "group" : "pairwise");
         }
     }
 
@@ -2370,6 +2382,20 @@ enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad,
     }
 
     return MMWLAN_SUCCESS;
+}
+
+/* Re-broadcast GROUP-addressed mesh data frame (umac_mesh_handle_group_data): forwarder's own MGTK. */
+enum mmwlan_status umac_datapath_tx_mesh_group_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    return umac_datapath_tx_mesh_keyed_frame(stad, txbuf, UMAC_KEY_TYPE_GROUP);
+}
+
+/* Forwarded UNICAST mesh data frame (umac_mesh_forward_data, ESP as an intermediate hop): encrypt
+ * under the NEXT HOP's pairwise MTK on its per-peer stad — net/mac80211 re-keys a forwarded unicast
+ * with tx->sta->ptk (the next-hop PTK). `stad` MUST be the next hop's per-peer stad. */
+enum mmwlan_status umac_datapath_tx_mesh_unicast_frame(struct umac_sta_data *stad, struct mmpkt *txbuf)
+{
+    return umac_datapath_tx_mesh_keyed_frame(stad, txbuf, UMAC_KEY_TYPE_PAIRWISE);
 }
 
 void umac_datapath_handle_tx_status(struct umac_data *umacd, struct mmpkt *mmpkt)
