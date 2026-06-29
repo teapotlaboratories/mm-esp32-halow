@@ -361,8 +361,16 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
             return;
         }
 
+        /* A group-addressed Mesh/Multihop Action frame (HWMP PREQ/PERR/RANN) is a group-privacy
+         * action (frame_is_group_privacy_action / mac80211 _ieee80211_is_group_privacy_action): it is
+         * MGTK/group-privacy class, NOT BIP, and in the morse mesh it is sent unprotected (mesh peers
+         * are MFP=no). net/mac80211 does not subject it to the unprotected-robust-mgmt drop — its
+         * ieee80211_drop_unencrypted_mgmt MFP block is skipped for MFP=no peers (rx.c:2454) — so the
+         * frame reaches the HWMP handler. Without this exemption the broadcast PREQ targeting us is
+         * dropped here and we never emit a PREP, so a Linux peer can't resolve a path to us. */
         if (!dot11_frame_control_get_protected(frame_control_le) &&
-            umac_sta_data_pmf_is_required(stad))
+            umac_sta_data_pmf_is_required(stad) &&
+            !frame_is_group_privacy_action(rxbufview))
         {
             const uint8_t *frame_data = mmpkt_get_data_start(rxbufview) + sizeof(*header);
             size_t frame_data_len = mmpkt_get_data_length(rxbufview) - sizeof(*header);

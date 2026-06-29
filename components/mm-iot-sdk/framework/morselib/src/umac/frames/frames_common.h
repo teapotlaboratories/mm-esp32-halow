@@ -24,4 +24,8 @@ struct mmpkt *build_mgmt_frame(struct umac_data *umacd, mgmt_frame_builder_t bui
 
 bool frame_is_robust_mgmt(struct mmpktview *view);
 
+/* Group-addressed Mesh/Multihop Action frame (mac80211 _ieee80211_is_group_privacy_action): exempt
+ * from the unprotected-robust-mgmt RX drop (these are MGTK/group-privacy class, not BIP). */
+bool frame_is_group_privacy_action(struct mmpktview *view);
+
 
