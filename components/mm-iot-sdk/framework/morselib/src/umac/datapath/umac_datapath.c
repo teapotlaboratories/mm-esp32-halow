@@ -370,7 +370,7 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
          * dropped here and we never emit a PREP, so a Linux peer can't resolve a path to us. */
         if (!dot11_frame_control_get_protected(frame_control_le) &&
             umac_sta_data_pmf_is_required(stad) &&
-            !frame_is_group_privacy_action(rxbufview))
+            !frame_is_mesh_action(rxbufview))
         {
             const uint8_t *frame_data = mmpkt_get_data_start(rxbufview) + sizeof(*header);
             size_t frame_data_len = mmpkt_get_data_length(rxbufview) - sizeof(*header);
@@ -505,6 +505,142 @@ static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
 }
 
 
+/* #P5 — host-side CCMP for the mesh data/robust-mgmt path. The MM6108 firmware keys CCMP decryption by
+ * the mesh-SA (A4), so a forwarded A4!=TA frame can't be HW-decrypted (#20); moving all mesh CCMP to the
+ * host (no FW key offload, see umac_keys_mmdrv_install_key) makes multi-hop work. Mirrors net/mac80211
+ * ieee80211_crypto_ccmp_{encrypt,decrypt}. Single TX/RX datapath task -> file-static scratch buffers. */
+#define MESH_SW_CCMP_BODY_MAX 1600
+
+/* TX: the mmpkt holds a fully-built [802.11 hdr (+QoS) | body]. Encrypt the body under the active
+ * `key_type` key on `stad` using the current TX PN (the caller must have incremented it — mac80211
+ * increments before use), insert the 8-byte CCMP header between the header and the body, and append the
+ * MIC. Returns false (caller drops) on missing key / oversize / no buffer space. */
+static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmpktview *view,
+                                          enum umac_key_type key_type, int key_id)
+{
+    static uint8_t ct_scratch[MESH_SW_CCMP_BODY_MAX];
+
+    const uint8_t *tk = umac_keys_get_key_data(stad, (uint8_t)key_id);
+    size_t tk_len = umac_keys_get_key_len(stad, (uint8_t)key_id);
+    if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: no usable key %d\n", key_id);
+        return false;
+    }
+    size_t mic_len = (tk_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+
+    uint8_t *hdr = mmpkt_get_data_start(view);
+    uint16_t fc = ((const struct dot11_hdr *)hdr)->frame_control;
+    size_t mac_len = dot11_data_hdr_get_len((const struct dot11_data_hdr *)hdr);
+    bool is_qos = (dot11_frame_control_get_type(fc) == DOT11_FC_TYPE_DATA) &&
+                  (dot11_frame_control_get_subtype(fc) == DOT11_FC_SUBTYPE_QOS_DATA);
+    size_t hdr_total = mac_len + (is_qos ? sizeof(struct dot11_qos_ctrl) : 0);
+
+    size_t total = mmpkt_get_data_length(view);
+    if (total < hdr_total)
+    {
+        return false;
+    }
+    size_t body_len = total - hdr_total;
+    if (body_len > sizeof(ct_scratch))
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: body %u > scratch\n", (unsigned)body_len);
+        return false;
+    }
+
+    /* PN already incremented by the caller (mac80211 increments conf.tx_pn before use). */
+    uint64_t pn = umac_keys_get_tx_seq(stad, key_type);
+
+    uint8_t ccmp_hdr[DOT11_CCMP_HEADER_LEN];
+    uint8_t mic[DOT11_CCMP_256_MIC_LEN];
+    uint8_t *body = hdr + hdr_total;
+    if (mesh_ccmp_encrypt(tk, tk_len, hdr, ccmp_hdr, pn, (uint8_t)key_id,
+                          body, ct_scratch, body_len, mic) != 0)
+    {
+        return false;
+    }
+
+    if (mmpkt_available_space_at_start(view) < DOT11_CCMP_HEADER_LEN ||
+        mmpkt_available_space_at_end(view) < mic_len)
+    {
+        MMLOG_WRN("Mesh SW CCMP TX: no head/tail room (h=%u t=%u)\n",
+                  (unsigned)mmpkt_available_space_at_start(view),
+                  (unsigned)mmpkt_available_space_at_end(view));
+        return false;
+    }
+
+    /* Open an 8-byte CCMP slot between the header and the body: prepend exposes 8 bytes of headroom at
+     * the front, then slide the MAC header forward over them so the gap lands right after the header. */
+    uint8_t *start = mmpkt_prepend(view, DOT11_CCMP_HEADER_LEN);
+    memmove(start, start + DOT11_CCMP_HEADER_LEN, hdr_total);
+    uint8_t *ccmp_slot = start + hdr_total;
+    memcpy(ccmp_slot, ccmp_hdr, DOT11_CCMP_HEADER_LEN);
+    memcpy(ccmp_slot + DOT11_CCMP_HEADER_LEN, ct_scratch, body_len);
+    memcpy(mmpkt_append(view, mic_len), mic, mic_len);
+    return true;
+}
+
+/* RX: the FW delivered a protected mesh frame raw (no FW key). On entry the 802.11 header + QoS have
+ * been peeled from `view` (it starts at the CCMP header) but `data_hdr` still points at the contiguous
+ * MAC header for the AAD. Look up the key by the CCMP KeyID on `stad` (resolved by TA), decrypt + verify
+ * the MIC, then replay-check the PN in `space` (only after MIC, so a forged MIC can't poison the replay
+ * window), then strip the CCMP header + MIC. `space` = DEFAULT for data, IND_ROBUST_MGMT for unicast
+ * action frames. Returns false (drop) on missing key / MIC / replay failure. This is where a forwarded
+ * A4!=TA frame the FW can't decrypt finally decrypts. */
+static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmpktview *view,
+                                          const struct dot11_data_hdr *data_hdr,
+                                          enum umac_key_rx_counter_space space)
+{
+    static uint8_t pt_scratch[MESH_SW_CCMP_BODY_MAX];
+
+    size_t avail = mmpkt_get_data_length(view);
+    if (avail < DOT11_CCMP_HEADER_LEN)
+    {
+        return false;
+    }
+    uint8_t *ccmp_hdr = mmpkt_get_data_start(view);
+    uint8_t key_id = mesh_ccmp_key_id(ccmp_hdr);
+
+    const uint8_t *tk = umac_keys_get_key_data(stad, key_id);
+    size_t tk_len = umac_keys_get_key_len(stad, key_id);
+    if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
+    {
+        MMLOG_WRN("Mesh SW CCMP RX: no key %u\n", key_id);
+        return false;
+    }
+    size_t mic_len = (tk_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+    if (avail < DOT11_CCMP_HEADER_LEN + mic_len)
+    {
+        return false;
+    }
+    size_t body_len = avail - DOT11_CCMP_HEADER_LEN - mic_len;
+    if (body_len > sizeof(pt_scratch))
+    {
+        return false;
+    }
+    const uint8_t *ct = ccmp_hdr + DOT11_CCMP_HEADER_LEN;
+    const uint8_t *mic = ct + body_len;
+
+    if (mesh_ccmp_decrypt(tk, tk_len, (const uint8_t *)data_hdr, ccmp_hdr,
+                          ct, pt_scratch, body_len, mic) != 0)
+    {
+        return false; /* MIC failure */
+    }
+    /* MIC verified -> now it's safe to advance the replay counter. */
+    if (!ccmp_is_valid(stad, ccmp_hdr, space))
+    {
+        return false; /* replay */
+    }
+
+    (void)mmpkt_remove_from_start(view, DOT11_CCMP_HEADER_LEN);
+    memcpy(mmpkt_get_data_start(view), pt_scratch, body_len);
+    if (mmpkt_remove_from_end(view, mic_len) == NULL)
+    {
+        return false;
+    }
+    return true;
+}
+
 static void umac_datapath_process_rx_data_frame_after_reorder(
     struct umac_sta_data *stad,
     struct umac_datapath_sta_data *sta_data,
@@ -566,28 +702,42 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     if (dot11_frame_control_get_protected(header->frame_control))
     {
-        if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
+        if (rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED)
+        {
+            /* FW HW-decrypted: strip the CCMP header (+ replay-check) and the MIC it left in place. */
+            uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
+            if (ccmp_header == NULL ||
+                !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+            {
+
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                goto drop;
+            }
+
+
+            if (mmpkt_remove_from_end(rxbufview, DOT11_CCMP_128_MIC_LEN) == NULL)
+            {
+                MMLOG_WRN("Drop frame as rxbuf was shorter than expected");
+                goto drop;
+            }
+        }
+        else if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            /* #P5d — FW delivered the protected mesh frame raw (no FW key). Decrypt on the host. This is
+             * where a forwarded A4!=TA frame (which the FW keys by A4, so can't decrypt) finally works. */
+            if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, data_hdr,
+                                               UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+            {
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                goto drop;
+            }
+        }
+        else
         {
 
             MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x, SEQ: 0x%04x).\n",
                       le16toh(header->frame_control),
                       le16toh(header->sequence_control));
-            goto drop;
-        }
-
-        uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
-        if (ccmp_header == NULL ||
-            !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
-        {
-
-            umac_stats_increment_datapath_rx_ccmp_failures(umacd);
-            goto drop;
-        }
-
-
-        if (mmpkt_remove_from_end(rxbufview, DOT11_CCMP_128_MIC_LEN) == NULL)
-        {
-            MMLOG_WRN("Drop frame as rxbuf was shorter than expected");
             goto drop;
         }
     }
@@ -1148,8 +1298,25 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
 
     struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
+
     if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
     {
+        /* #P5d — a protected unicast mesh action frame (e.g. PREP under the pairwise MTK) the FW
+         * delivered raw (no FW key). SW-decrypt it on the host, mirroring the data-frame path. Without
+         * this the relay drops every encrypted PREP and HWMP path discovery never resolves. */
+        if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            mmpkt_remove_from_start(rxbufview, sizeof(*header)); /* peel the MAC header; AAD uses it */
+            if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, (const struct dot11_data_hdr *)header,
+                                               UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT))
+            {
+                umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+                return false;
+            }
+            uint8_t *sw_hdr_dest = mmpkt_prepend(rxbufview, sizeof(*header));
+            memmove(sw_hdr_dest, header, sizeof(*header));
+            return true;
+        }
 
         MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x).\n",
                   le16toh(frame_control_le));
@@ -1757,7 +1924,11 @@ void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
 
 struct mmpkt *umac_datapath_alloc_mmpkt_for_qos_data_tx(uint32_t payload_len, uint8_t pkt_class)
 {
-    return umac_datapath_alloc_raw_tx_mmpkt(pkt_class, MAX_QOS_DATA_MAC_HEADER_LEN, payload_len);
+    /* +CCMP header headroom + MIC tailroom so a locally-originated mesh data frame can be host-side
+     * CCMP-encrypted in place (#P5). Harmless slack for the FW HW-crypto + non-mesh paths. */
+    return umac_datapath_alloc_raw_tx_mmpkt(pkt_class,
+                                            MAX_QOS_DATA_MAC_HEADER_LEN + DOT11_CCMP_HEADER_LEN,
+                                            payload_len + DOT11_CCMP_256_MIC_LEN);
 }
 
 struct mmpkt *mmwlan_alloc_mmpkt_for_tx(uint32_t payload_len, uint8_t tid)
@@ -1924,6 +2095,22 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     }
     bool is_multicast = mm_mac_addr_is_multicast(ra);
 
+    /* A locally-originated mesh UNICAST to a multi-hop destination is dequeued on the common_stad, which
+     * only carries the vestigial static fallback MTK (mesh_p1_mtk). It must instead be CCMP-keyed under
+     * the NEXT-HOP peer's per-pair MTK — RA is the HWMP next hop (set by the mesh data-header builder),
+     * and that next hop decrypts under the real per-pair MTK, so keying off the common_stad fails the MIC
+     * and the reply is dropped (the multi-hop relay break). Mirrors the forward path keying under the
+     * next hop (umac_mesh_forward_data). Single-hop dest: the frame is already on the peer stad, so this
+     * resolves back to `stad`. Group TX stays on the common_stad's own MGTK. */
+    struct umac_sta_data *key_stad = stad;
+    if (umac_mesh_is_active() && !is_multicast)
+    {
+        struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(ra);
+        if (nh_stad != NULL)
+        {
+            key_stad = nh_stad;
+        }
+    }
 
     MMOSAL_DEV_ASSERT(is_eapol || enc == ENCRYPTION_ENABLED);
 
@@ -1931,10 +2118,10 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     {
         enum umac_key_type key_type = is_multicast ? UMAC_KEY_TYPE_GROUP : UMAC_KEY_TYPE_PAIRWISE;
 
-        key_id = umac_keys_get_active_key_id(stad, key_type);
+        key_id = umac_keys_get_active_key_id(key_stad, key_type);
         if (key_id >= 0)
         {
-            key_len = umac_keys_get_key_len(stad, key_id);
+            key_len = umac_keys_get_key_len(key_stad, key_id);
             header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
         }
         else if (enc == ENCRYPTION_ENABLED)
@@ -1998,8 +2185,22 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     tx_metadata->flags = 0;
     if (key_id >= 0)
     {
-        tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
-        umac_keys_increment_tx_seq(stad, key_id);
+        /* #P5c — locally-originated mesh data: encrypt on the host (FW has no key). Otherwise FW HW. */
+        if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            enum umac_key_type key_type = is_multicast ? UMAC_KEY_TYPE_GROUP : UMAC_KEY_TYPE_PAIRWISE;
+            umac_keys_increment_tx_seq(key_stad, key_id);
+            if (!umac_datapath_sw_ccmp_encrypt(key_stad, txbufview, key_type, key_id))
+            {
+                status = MMWLAN_ERROR;
+                goto error;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            umac_keys_increment_tx_seq(key_stad, key_id);
+        }
     }
 
     tx_metadata->key_idx = key_id;
@@ -2274,8 +2475,23 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
     if (key_id >= 0)
     {
-        tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
-        tx_metadata->key_idx = key_id;
+        /* #P5c — a protected unicast mesh action frame (e.g. unicast PREP under the pairwise MTK):
+         * encrypt on the host. The PN was already incremented in the key-setup above. */
+        if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
+        {
+            if (!umac_datapath_sw_ccmp_encrypt(stad, txbufview, UMAC_KEY_TYPE_PAIRWISE, key_id))
+            {
+                mmpkt_close(&txbufview);
+                mmpkt_release(txbuf);
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                return MMWLAN_ERROR;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            tx_metadata->key_idx = key_id;
+        }
     }
 
     tx_metadata->tid = MMWLAN_MAX_QOS_TID;
@@ -2354,9 +2570,25 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
     if (key_id >= 0)
     {
-        tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
-        tx_metadata->key_idx = key_id;
-        umac_keys_increment_tx_seq(stad, key_id);
+        /* #P5c — forwarded unicast (next-hop MTK) / re-broadcast group (own MGTK): encrypt on the host
+         * so a forwarded A4!=TA frame the FW can't key is still protected end-to-end. Otherwise FW HW. */
+        if (umac_mesh_sw_crypto_enabled())
+        {
+            umac_keys_increment_tx_seq(stad, key_id);
+            if (!umac_datapath_sw_ccmp_encrypt(stad, txbufview, key_type, key_id))
+            {
+                mmpkt_close(&txbufview);
+                mmpkt_release(txbuf);
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                return MMWLAN_ERROR;
+            }
+        }
+        else
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+            tx_metadata->key_idx = key_id;
+            umac_keys_increment_tx_seq(stad, key_id);
+        }
     }
     tx_metadata->tid = MMWLAN_MAX_QOS_TID;
     tx_metadata->aid = umac_sta_data_get_aid(stad);

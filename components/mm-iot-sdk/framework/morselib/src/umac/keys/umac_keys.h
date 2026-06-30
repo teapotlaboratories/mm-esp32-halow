@@ -92,3 +92,8 @@ int umac_keys_get_active_key_id(struct umac_sta_data *stad, enum umac_key_type k
 void umac_keys_increment_tx_seq(struct umac_sta_data *stad, uint8_t key_id);
 
 
+/* The active key's TX sequence number (PN) for `key_type` — the host-managed CCMP PN source for the
+ * mesh SW-crypto TX path (mac80211 increments then uses, so callers increment_tx_seq before reading). */
+uint64_t umac_keys_get_tx_seq(struct umac_sta_data *stad, enum umac_key_type key_type);
+
+

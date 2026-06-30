@@ -8,6 +8,7 @@
 #include "umac_keys.h"
 #include "umac_keys_data.h"
 #include "connection_keys.h"
+#include "umac/mesh/umac_mesh.h"
 #include "mmdrv.h"
 #include "mmlog.h"
 
@@ -22,6 +23,17 @@ static enum mmwlan_status umac_keys_mmdrv_install_key(uint16_t vif_id,
                                                       uint16_t aid,
                                                       struct umac_key *key)
 {
+    /* #P5b — mesh SW crypto: keep the CCMP data keys (pairwise MTK / group MGTK) host-side only; do NOT
+     * offload to the firmware. With no FW key the MM6108 delivers protected mesh frames raw to the host
+     * (#20 no-key test), which is what lets the host decrypt a forwarded A4!=TA frame the FW can't. */
+    if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled() &&
+        ((key->key_type == UMAC_KEY_TYPE_PAIRWISE) || (key->key_type == UMAC_KEY_TYPE_GROUP)))
+    {
+        MMLOG_DBG("Mesh SW crypto: key %u (type %u) kept host-side, no FW offload\n",
+                  key->key_id, key->key_type);
+        return MMWLAN_SUCCESS;
+    }
+
     if ((key->key_type == UMAC_KEY_TYPE_PAIRWISE) || (key->key_type == UMAC_KEY_TYPE_GROUP))
     {
         struct mmdrv_key_conf key_conf = {
@@ -159,4 +171,10 @@ void umac_keys_increment_tx_seq(struct umac_sta_data *stad, uint8_t key_id)
 {
     struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
     connection_keys_increment_tx_seq(&sta_data->keys, key_id);
+}
+
+uint64_t umac_keys_get_tx_seq(struct umac_sta_data *stad, enum umac_key_type key_type)
+{
+    struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
+    return connection_keys_get_tx_seq(&sta_data->keys, key_type);
 }
