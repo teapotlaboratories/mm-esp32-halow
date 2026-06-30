@@ -131,6 +131,16 @@ bool umac_mesh_is_active(void)
     return mesh_ctx.active;
 }
 
+/* #P5 — host-side mesh CCMP. Default ON: multi-hop forwarding requires it (the MM6108 FW keys CCMP
+ * decryption by the mesh-SA/A4 and silently drops forwarded A4!=TA frames). Flip to false to force the
+ * legacy FW HW-crypto single-hop path for A/B comparison. */
+static bool g_mesh_sw_crypto = true;
+
+bool umac_mesh_sw_crypto_enabled(void)
+{
+    return g_mesh_sw_crypto;
+}
+
 struct umac_sta_data *umac_mesh_get_common_stad(void)
 {
     return mesh_ctx.common_stad;
@@ -1873,11 +1883,25 @@ static void umac_mesh_tx_hwmp(struct hwmp_frame_params *p)
     /* All HWMP path-selection frames go through the robust-mgmt TX path. net/mac80211 sends a
      * GROUP-addressed HWMP frame (broadcast PREQ/PERR/RANN) UNPROTECTED — mesh peers are MFP=no, so
      * group HWMP is not BIP/MGTK-protected — and the peer accepts it (the #18 RX exemption). So
-     * umac_datapath_tx_mgmt_frame now exempts a group-privacy action from its BC/MC-robust-mgmt drop
-     * and emits it in the clear; a unicast PREP (da = a peer) stays pairwise-CCMP-encrypted on the
-     * same path. This supersedes the earlier #17 approach of MGTK-encrypting the broadcast HWMP, which
-     * a cross-vendor relay can't decrypt as group management (breaking the ESP↔ESP multi-hop relay). */
-    (void)umac_datapath_tx_mgmt_frame(mesh_ctx.common_stad, frame);
+     * umac_datapath_tx_mgmt_frame exempts a group-privacy action from its BC/MC-robust-mgmt drop and
+     * emits it in the clear; a unicast PREP (da = a peer) stays pairwise-CCMP-encrypted.
+     *
+     * KEY: a unicast PREP MUST go out on the DESTINATION's per-peer stad, not the common stad. The
+     * common stad's pairwise key (idx 0) is only a static FALLBACK (umac_mesh_install_common_keys); the
+     * real per-pair MTK lives on each peer's stad. With FW HW crypto that didn't matter (the FW keys by
+     * the peer AID), but host SW crypto (#P5) encrypts under the stad's own key — so off the common stad
+     * it would use the static MTK and the next hop (keying by TA → the real per-peer MTK) drops it on a
+     * MIC failure. Mirrors net/mac80211 keying a unicast PREP under tx->sta->ptk (the next-hop PTK). */
+    struct umac_sta_data *tx_stad = mesh_ctx.common_stad;
+    if (p->da != NULL && !mm_mac_addr_is_multicast(p->da))
+    {
+        struct umac_sta_data *peer_stad = umac_mesh_get_peer_stad(p->da);
+        if (peer_stad != NULL)
+        {
+            tx_stad = peer_stad;
+        }
+    }
+    (void)umac_datapath_tx_mgmt_frame(tx_stad, frame);
 }
 
 /* Originate a PREQ to discover a path to `dest` (mesh_queue_preq). Rate-limited per dest. */
@@ -2363,7 +2387,8 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     const uint8_t *body = (const uint8_t *)hdr + sizeof(*hdr);
     uint32_t body_len = total - sizeof(*hdr);
 
-    /* HWMP path selection (Mesh Action category 13): reply to a PREQ targeting us. */
+    /* HWMP path selection (Mesh Action category 13): reply to a PREQ targeting us. (umac_mesh_handle_hwmp
+     * already gates on the forced-topology allowlist by the immediate transmitter == frame_sa.) */
     if (body[0] == DOT11_CATEGORY_MESH)
     {
         if (body[1] == WLAN_MESH_ACTION_HWMP_PATH_SEL)

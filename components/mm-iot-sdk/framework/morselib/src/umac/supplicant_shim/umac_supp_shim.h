@@ -121,3 +121,15 @@ bool ccmp_is_valid(struct umac_sta_data *stad,
                    enum umac_key_rx_counter_space space);
 
 
+/* Host-side CCMP (P5c/P5d): encrypt/decrypt a mesh data frame body under the link/group key, with the
+ * canonical mac80211 CCMP AAD/nonce (hostap ccmp_aad_nonce). `hdr` = contiguous 802.11 header, `ccmp_hdr`
+ * = the 8-byte CCMP header. Encrypt writes ccmp_hdr (from pn+key_id) + the MIC; both return 0 = OK. The
+ * in/out body buffers MUST NOT alias (aes_ccm_encr is not in-place safe). */
+int mesh_ccmp_encrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, uint8_t *ccmp_hdr,
+                      uint64_t pn, uint8_t key_id, const uint8_t *body_in, uint8_t *body_out,
+                      size_t body_len, uint8_t *mic);
+int mesh_ccmp_decrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, const uint8_t *ccmp_hdr,
+                      const uint8_t *ct_in, uint8_t *pt_out, size_t ct_len, const uint8_t *mic);
+uint8_t mesh_ccmp_key_id(const uint8_t *ccmp_header);
+
+

@@ -72,6 +72,12 @@ void mmwlan_mesh_send_test_action(void);
 /** True while a mesh interface is active (routes beacon generation here). */
 bool umac_mesh_is_active(void);
 
+/** #P5 — true when mesh CCMP data crypto runs on the HOST (no FW key offload), required for multi-hop
+ *  forwarding (the FW keys decryption by the mesh-SA/A4, so it drops forwarded A4!=TA frames). When
+ *  false the node uses FW HW crypto (single-hop only). Switches the FW-offload gate + the datapath
+ *  TX/RX SW-CCMP paths together. */
+bool umac_mesh_sw_crypto_enabled(void);
+
 /** Build the next mesh beacon. Called from mmdrv_host_get_beacon() when a mesh
  *  interface is active. Returns NULL on failure. */
 struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd);

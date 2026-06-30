@@ -28,4 +28,9 @@ bool frame_is_robust_mgmt(struct mmpktview *view);
  * from the unprotected-robust-mgmt RX drop (these are MGTK/group-privacy class, not BIP). */
 bool frame_is_group_privacy_action(struct mmpktview *view);
 
+/* Mesh/Multihop Action frame of any addressing (group OR unicast). Mesh peers are MFP=no, so mac80211
+ * never drops their unprotected robust mesh actions (incl. the unicast PREP); use this to exempt them
+ * from the unprotected-robust-mgmt RX drop. Broader than frame_is_group_privacy_action (no group-DA req). */
+bool frame_is_mesh_action(struct mmpktview *view);
+
 

@@ -66,6 +66,29 @@ bool frame_is_group_privacy_action(struct mmpktview *view)
            frame->field.category == DOT11_ACTION_CATEGORY_MULTIHOP;
 }
 
+/* A Mesh (13) or Multihop (14) Action frame of ANY addressing (group OR unicast) — the broader sibling of
+ * frame_is_group_privacy_action without the group-DA requirement. In the live morse/Linux mesh ALL mesh
+ * peers are MFP=no (chronite `iw station dump` -> `MFP: no`), so net/mac80211 sends EVERY mesh path-selection
+ * frame in the clear, including the UNICAST PREP, and its RX never drops them: ieee80211_drop_unencrypted_mgmt
+ * (rx.c) gates the unprotected-robust-mgmt drop entirely on test_sta_flag(rx->sta, WLAN_STA_MFP), which is
+ * false for a mesh peer, so the whole drop block is skipped. The morse stad is (incorrectly) PMF_REQUIRED, so
+ * we mirror mac80211's BEHAVIOUR here by exempting every mesh action — not just the group-addressed ones the
+ * #18 fix covered — from that drop. Without this a Linux peer's unprotected unicast PREP is dropped and the
+ * cross-vendor relay can't resolve a forward path. */
+bool frame_is_mesh_action(struct mmpktview *view)
+{
+    const struct dot11_action *frame = (struct dot11_action *)mmpkt_get_data_start(view);
+
+    if (!(dot11_frame_control_get_type(frame->hdr.frame_control) == DOT11_FC_TYPE_MGMT) ||
+        !(dot11_frame_control_get_subtype(frame->hdr.frame_control) == DOT11_FC_SUBTYPE_ACTION))
+    {
+        return false;
+    }
+
+    return frame->field.category == DOT11_ACTION_CATEGORY_MESH ||
+           frame->field.category == DOT11_ACTION_CATEGORY_MULTIHOP;
+}
+
 void frame_action_build(struct umac_data *umacd, struct consbuf *buf, void *args)
 {
     MM_UNUSED(umacd);
