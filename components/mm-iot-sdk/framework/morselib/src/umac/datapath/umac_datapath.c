@@ -723,8 +723,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         else if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled())
         {
-            /* #P5d — FW delivered the protected mesh frame raw (no FW key). Decrypt on the host. This is
-             * where a forwarded A4!=TA frame (which the FW keys by A4, so can't decrypt) finally works. */
+            /* #P5d — FW delivered the protected mesh frame raw (no FW key offloaded). Decrypt on the host,
+             * keyed by TA. This is where a forwarded A4!=TA frame works: in HW-crypto mode the FW does not
+             * deliver such a forward (an A4-sensitive FW delivery gate, worklog §#26); with no FW key it
+             * delivers it raw instead, so the host CCMP runs. */
             if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, data_hdr,
                                                UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
             {

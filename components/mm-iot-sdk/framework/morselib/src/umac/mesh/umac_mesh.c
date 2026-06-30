@@ -131,9 +131,11 @@ bool umac_mesh_is_active(void)
     return mesh_ctx.active;
 }
 
-/* #P5 — host-side mesh CCMP. Default ON: multi-hop forwarding requires it (the MM6108 FW keys CCMP
- * decryption by the mesh-SA/A4 and silently drops forwarded A4!=TA frames). Flip to false to force the
- * legacy FW HW-crypto single-hop path for A/B comparison. */
+/* #P5 — host-side mesh CCMP. Default ON: multi-hop forwarding requires it. In HW-crypto mode the MM6108
+ * FW does NOT deliver a forwarded 4-addr frame whose A4 (mesh-SA) is not the keyed peer — an A4-sensitive
+ * FW *delivery* gate (NOT a decrypt-by-A4 limit; the same FW HW-decrypts keyed by TA on Linux, see worklog
+ * §#26). host SW-CCMP installs no FW mesh key, so the FW delivers the protected frame raw and the host
+ * decrypts (keyed by TA), bypassing the gate. Flip to false to force the legacy FW HW-crypto single-hop path. */
 static bool g_mesh_sw_crypto = true;
 
 bool umac_mesh_sw_crypto_enabled(void)
