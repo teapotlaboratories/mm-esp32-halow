@@ -93,6 +93,39 @@ int mesh_sae_process_commit(void *handle, const uint8_t *body, size_t len)
     return 0;
 }
 
+/* Validate a received peer Commit body's crypto WITHOUT touching any live SAE instance — runs hostap's
+ * sae_parse_commit (peer-scalar in [1, r-1], sae.c:1921-1926; element coords < p + on the P-256 curve,
+ * sae.c:1959-1981) on a throwaway sae_data, so an established peer's PMK/state/freed-tmp are never
+ * disturbed. Returns 0 IFF the Commit is crypto-valid. Used by the ACCEPTED-state reauth gate so a
+ * malformed Commit cannot flap a live link: hostap reaches ap_free_sta only after sae_parse_commit
+ * succeeds (ieee802_11.c:1502/1538). sae_set_group alone populates tmp->ec/prime/order — sae_parse_commit
+ * needs no PWE (sae_prepare_commit) for these checks, and on a fresh instance (state == SAE_NOTHING) its
+ * reflection branch (sae.c:1911, state == SAE_ACCEPTED) is skipped, so it does NOT touch own_commit_scalar.
+ * Parse args are byte-identical to mesh_sae_process_commit so any Commit that path accepts also passes. */
+int mesh_sae_validate_commit(const uint8_t *body, size_t len)
+{
+    struct sae_data *scratch = os_zalloc(sizeof(struct sae_data));
+    const u8 *token = NULL;
+    size_t token_len = 0;
+    int allowed_groups[] = { MESH_SAE_GROUP, 0 };
+    int ie_offset = 0;
+    int ok = -1;
+
+    if (scratch == NULL)
+    {
+        return -1; /* OOM -> keep the link (a genuine restart recovers on its next Commit retransmit) */
+    }
+    if (sae_set_group(scratch, MESH_SAE_GROUP) == 0 &&
+        sae_parse_commit(scratch, body, len, &token, &token_len, allowed_groups, MESH_SAE_H2E,
+                         &ie_offset) == WLAN_STATUS_SUCCESS)
+    {
+        ok = 0;
+    }
+    sae_clear_data(scratch);
+    os_free(scratch);
+    return ok;
+}
+
 /* Build our SAE Confirm (send-confirm counter | confirm hash). Returns 0; *out_len = body length. */
 int mesh_sae_build_confirm(void *handle, uint8_t *out, size_t out_cap, size_t *out_len)
 {

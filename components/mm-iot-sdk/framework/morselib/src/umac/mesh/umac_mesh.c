@@ -73,6 +73,9 @@ extern int mesh_sae_check_confirm(void *handle, const uint8_t *body, size_t len)
 extern int mesh_sae_get_keys(void *handle, uint8_t *pmk32, uint8_t *pmkid16);
 extern int mesh_sae_state(void *handle);
 extern void mesh_sae_clear_temp(void *handle);
+/* Validate a peer Commit's crypto (scalar-range + on-curve) on a throwaway SAE without touching a live
+ * instance — gates the ACCEPTED-state reauth so a malformed Commit cannot flap an established link. */
+extern int mesh_sae_validate_commit(const uint8_t *body, size_t len);
 /* Shared mesh SAE password (matches the Linux sae_password for cross-vendor interop, P3d). */
 #define MESH_SAE_PASSWORD "rimbamesh2026"
 /* Max SAE auth body we build/carry (group-19 Commit ~98 B, Confirm ~34 B). */
@@ -450,6 +453,7 @@ struct mesh_peer
     void *sae;                      /* opaque struct sae_data* (mesh_sae_alloc); NULL until SAE starts */
     uint8_t sae_state;              /* enum mesh_sae_fsm_state */
     uint8_t sae_sync;               /* protocol Sync var; anti-thrash cap (== hostap sae->sync) */
+    uint16_t sae_rc;                /* peer's accepted send-confirm counter (== hostap sae->rc); GAP-14 anti-replay */
     uint32_t sae_last_tx_ms;        /* last SAE-frame TX; drives the ~1 s retransmit; 0 == idle/stopped */
     uint32_t sae_disabled_until_ms; /* 10 s big-sync lockout (sae_check_big_sync); 0 == enabled */
     uint8_t sae_commit[MESH_SAE_BODY_MAX];  /* cached OUR Commit body for non-destructive retransmit */
@@ -1045,7 +1049,9 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
                 len < peer->sae_commit_len ||                          /* well-formed for our group */
                 memcmp(body, peer->sae_commit, 2) != 0 ||              /* same SAE group (:1457-1462) */
                 memcmp(body + 2, peer->sae_commit + 2,
-                       peer->sae_commit_len - 2) == 0)                 /* reflection of our commit (:1511) */
+                       peer->sae_commit_len - 2) == 0 ||               /* reflection of our commit (:1511) */
+                mesh_sae_validate_commit(body, len) != 0)              /* crypto-valid: scalar∈[1,r-1] + on-curve
+                                                                        * (sae_parse_commit, :1502/1538) [GAP-C] */
             {
                 break; /* not a genuine restart trigger — keep the ACCEPTED link (hostap drops it intact) */
             }
@@ -1082,6 +1088,12 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
             {
                 return; /* confirm hash mismatch -> drop */
             }
+            if (len >= 2)
+            {
+                /* Record Rc from this cryptographically-verified Confirm (== hostap ieee802_11.c:1613,
+                 * sae->rc = peer_send_confirm) — the ACCEPTED-path anti-replay baseline (GAP-14). */
+                peer->sae_rc = (uint16_t)(body[0] | ((uint16_t)body[1] << 8));
+            }
             if (mesh_sae_get_keys(peer->sae, peer->pmk, peer->pmkid) == 0)
             {
                 peer->pmk_valid = true; /* == wpa_auth_pmksa_add_sae (ieee802_11.c:983) */
@@ -1113,8 +1125,30 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
             break;
 
         case MESH_SAE_ACCEPTED:
-            /* Retransmit our (cached) final Confirm so a peer stuck in CONFIRMED can complete
-             * (ieee802_11.c:1163-1172). tmp is gone, so replay the cached bytes rather than rebuild. */
+            /* hostap anti-replay (ieee802_11.c:1596-1605): a Confirm whose send-confirm counter (leading
+             * 2 octets, LE) does NOT strictly advance past Rc — or is the pinned 0xffff — is silently
+             * ignored. A live retransmit increments it (sae.c:2366); a replay does not. This stops a
+             * captured-Confirm flood from amplifying into reflected Confirms / a big-sync lockout (GAP-14). */
+            if (len < 2)
+            {
+                break;
+            }
+            {
+                uint16_t psc = (uint16_t)(body[0] | ((uint16_t)body[1] << 8));
+                if (psc <= peer->sae_rc || psc == 0xffff)
+                {
+                    break; /* replay or pinned-max -> silently ignore (ieee802_11.c:1603) */
+                }
+                peer->sae_rc = psc;
+            }
+            /* hostap sae_sm_step SAE_ACCEPTED else-branch (ieee802_11.c:1160-1167): rate-limit the resend
+             * behind big_sync + sync++, then resend our cached final Confirm so a peer stuck in CONFIRMED
+             * can complete (ieee802_11.c:1165). tmp is gone, so replay the cached bytes rather than rebuild. */
+            if (mesh_sae_check_big_sync(peer, now))
+            {
+                break;
+            }
+            peer->sae_sync++;
             if (peer->sae_confirm_len > 0)
             {
                 (void)umac_mesh_tx_auth(peer, 2, 0, peer->sae_confirm, peer->sae_confirm_len);
@@ -2467,15 +2501,26 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         {
             return; /* nothing to tear down, or peer not on the forced-topology allowlist */
         }
+#if MMWLAN_MESH_SEC_PHASE1
+        /* Secured mesh (== hostap mesh_mpm.c:1262-1266): a peer is added from an inbound Open ONLY when a
+         * PMKSA is cached. We keep no PMKSA cache, so that condition is always false — drop the unsolicited
+         * peering frame and let the peer's beacon (umac_mesh_handle_peer_beacon -> mmwlan_mesh_peer_open)
+         * create the peer + start SAE. The sender's Open retransmit redelivers once the beacon-created peer
+         * exists. Avoids running a full Dragonfly SAE off a spoofed/unsolicited Open (GAP-15). */
+        MMLOG_DBG("MESH-SEC: peering from unknown " MM_MAC_ADDR_FMT " dropped — await beacon (no PMKSA)\n",
+                  MM_MAC_ADDR_VAL(sa));
+        return;
+#else
         peer = mesh_peer_alloc(sa);
         if (peer == NULL)
         {
             MMLOG_WRN("MESH peer table full; ignoring " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(sa));
             return;
         }
-        /* New peer learned from an inbound Open (not a beacon): start SAE here too, so the handshake
-         * runs regardless of which path discovered the peer (== mesh_mpm.c:899 for the responder). */
+        /* Open-mesh: new peer learned from an inbound Open (not a beacon): start SAE here too, so the
+         * handshake runs regardless of which path discovered the peer (== mesh_mpm.c:899 responder). */
         mesh_sae_start(peer);
+#endif
     }
 
     /* CLOSE: the peer's MPM plink failed (mesh_plink_fsm CLS_ACPT). P3d: a CLOSE tears down the PLINK,
