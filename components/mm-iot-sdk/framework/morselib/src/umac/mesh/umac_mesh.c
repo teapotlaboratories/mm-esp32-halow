@@ -1319,6 +1319,27 @@ static void umac_mesh_plink_tick(void *arg1, void *arg2)
                                      umac_mesh_plink_tick, umacd, NULL);
 }
 
+/* Number of ESTAB mesh peers + (optionally) their MACs. Lightweight operational telemetry: the app
+ * heartbeat logs it so a node's mesh peering state is visible on the console. morselib MMLOG does not
+ * reach the UART, so this app-visible getter is the only peer-state signal — without it, two ESP nodes
+ * peering with no Linux node present reads (falsely) as "never peers". */
+uint8_t mmwlan_mesh_peer_count(uint8_t estab_macs[][6])
+{
+    uint8_t n = 0;
+    for (size_t i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (mesh_peers[i].used && mesh_peers[i].state == MESH_PLINK_ESTAB)
+        {
+            if (estab_macs != NULL)
+            {
+                memcpy(estab_macs[n], mesh_peers[i].mac, MMWLAN_MAC_ADDR_LEN);
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
 void umac_mesh_handle_peer_beacon(const uint8_t *peer_mac, const uint8_t *ies, uint32_t ies_len)
 {
     if (!mesh_ctx.active || peer_mac == NULL || ies == NULL)
