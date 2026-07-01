@@ -562,10 +562,12 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             {
                 p->llid = (uint16_t)mmhal_random_u32(1, 0xffff);
             } while (p->llid == 0);
-#if MMWLAN_MESH_SEC_PHASE1
-            /* Per-peer host stad (mirrors IBSS umac_ibss_get_or_create_peer_stad + adds the
-             * encryption setup): its AID selects the firmware key slot, peer_addr keys the unicast
-             * datapath lookup, and security != OPEN gates TX encryption. Keys install at ESTAB. */
+            /* Per-peer host stad (mirrors IBSS umac_ibss_get_or_create_peer_stad): its AID selects the
+             * firmware key slot, peer_addr keys the unicast/forward datapath lookup. Allocated in BOTH
+             * builds so the datapath has a per-peer key + TX-queue context for every ESTAB peer (the
+             * multi-hop relay forward keys + queues off the next-hop peer stad). Secured: SAE security +
+             * AMPE nonce, keys installed at ESTAB. Open: MMWLAN_OPEN, so unicast + multi-hop forwarding
+             * run unencrypted (true non-secure mesh — no per-peer key, the datapath sends plaintext). */
             p->stad = umac_sta_data_alloc(umac_data_get_umacd());
             if (p->stad == NULL)
             {
@@ -579,6 +581,7 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             umac_sta_data_set_aid(p->stad, p->aid);
             umac_sta_data_set_bssid(p->stad, mesh_ctx.mesh_mac);
             umac_sta_data_set_peer_addr(p->stad, mac);
+#if MMWLAN_MESH_SEC_PHASE1
             umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
             /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
              * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
@@ -586,6 +589,8 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             /* P3c: the AEK is NOT derived here — it needs the SAE-negotiated PMK, which doesn't exist
              * until SAE accepts. aek_valid stays false (memset) until the SAE-accept hook derives it
              * (== hostap: AEK in mesh_rsn_init_ampe_sta from mesh_mpm_auth_peer, not at add_peer). */
+#else
+            umac_sta_data_set_security(p->stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED); /* open mesh: plaintext */
 #endif
             return p;
         }
@@ -603,13 +608,11 @@ static void mesh_peer_free(struct mesh_peer *peer)
         mesh_sae_free(peer->sae);
         peer->sae = NULL;
     }
-#if MMWLAN_MESH_SEC_PHASE1
-    if (peer->stad != NULL)
+    if (peer->stad != NULL)   /* per-peer stad is allocated in both builds (open: plaintext) */
     {
         mmosal_free(peer->stad);
         peer->stad = NULL;
     }
-#endif
     peer->used = false;
 }
 
@@ -2828,6 +2831,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
          * it (mac80211 __mesh_rsn_auth_init). The install onto the common stad stays deferred to first
          * ESTAB (umac_mesh_install_common_keys) — a group key at start breaks OPEN peering (P1 gotcha). */
         mmint_crypto_get_random(mesh_ctx.own_mgtk, sizeof(mesh_ctx.own_mgtk));
+#else
+        /* Open mesh: common stad stays OPEN so broadcast + group TX (and the relay forward) go out
+         * plaintext — no group key installed, true non-secure mesh. */
+        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
 #endif
     }
     umac_datapath_configure_mesh_mode(umacd);
