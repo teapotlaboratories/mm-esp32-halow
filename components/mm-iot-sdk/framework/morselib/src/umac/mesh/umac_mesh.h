@@ -143,6 +143,14 @@ bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t s
  *  anyone (default). */
 void mmwlan_mesh_set_peer_allowlist(const uint8_t *macs, uint8_t count);
 
+/** Enable/disable multi-hop forwarding + HWMP for this node (default enabled). When disabled the
+ *  node is a pure mesh STA ("leaf"): it peers with direct neighbours normally but never relays
+ *  another node's traffic (unicast or group), never uses a multi-hop path for its own TX, and
+ *  emits no PREQ/PREP/PERR — so peers never route through it (no black hole). Runtime-settable
+ *  before or after mmwlan_mesh_start; survives a restart. Stricter than Linux dot11MeshForwarding,
+ *  which only stops forwarding-for-others. */
+void mmwlan_mesh_set_multihop(bool enabled);
+
 /** True if `mac` is an allowed peer (or the allowlist is empty). Used to drop frames whose
  *  immediate transmitter isn't an allowed neighbour, forcing a test topology. */
 bool umac_mesh_peer_allowed(const uint8_t *mac);
