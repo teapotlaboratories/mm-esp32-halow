@@ -503,6 +503,28 @@ bool umac_mesh_peer_allowed(const uint8_t *mac)
     return mesh_peer_allowed(mac);
 }
 
+/* --- Multi-hop / HWMP enable toggle ----------------------------------------
+ * Runtime switch. When disabled this node becomes a pure mesh STA ("leaf"): it still
+ * forms DIRECT 1-hop peer links normally (MPM/SAE/AMPE are untouched), but it never
+ * relays another node's traffic (unicast OR group), never resolves/uses a multi-hop
+ * next hop for its OWN TX (always sends direct), and emits no HWMP path-selection
+ * frames (PREQ/PREP/PERR — originated or forwarded). Because it advertises no HWMP,
+ * peers never select it as a relay, so there is no routing black hole.
+ *
+ * Mirrors the intent of Linux's dot11MeshForwarding (mesh_fwding) but is stricter:
+ * mesh_fwding only stops forwarding-for-others, whereas this also disables this
+ * node's own multi-hop use, giving a true single-hop-only node.
+ *
+ * File-static (NOT in mesh_ctx, which is zeroed on every mmwlan_mesh_start) so it is
+ * settable before OR after start and survives a restart. Default ON = unchanged
+ * multi-hop behaviour. */
+static bool g_mesh_multihop = true;
+
+void mmwlan_mesh_set_multihop(bool enabled)
+{
+    g_mesh_multihop = enabled;
+}
+
 static struct mesh_peer *mesh_peer_find(const uint8_t *mac)
 {
     for (size_t i = 0; i < MESH_MAX_PEERS; i++)
@@ -1784,6 +1806,10 @@ static void mesh_path_update(const uint8_t *dest, const uint8_t *next_hop, uint3
 
 bool umac_mesh_lookup_next_hop(const uint8_t *dest, uint8_t *next_hop_out)
 {
+    if (!g_mesh_multihop)
+    {
+        return false; /* leaf mode: own TX always goes direct (never via a multi-hop next hop) */
+    }
     struct mesh_path_entry *p = mesh_path_find(dest);
     if (p != NULL && p->active && (int32_t)(p->expiry_ms - mmosal_get_time_ms()) > 0)
     {
@@ -1871,7 +1897,10 @@ static void umac_mesh_build_hwmp(struct umac_data *umacd, struct consbuf *buf, v
 
 static void umac_mesh_tx_hwmp(struct hwmp_frame_params *p)
 {
-    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
+    /* Leaf mode emits no HWMP at all — this is the single TX chokepoint for every PREQ/PREP,
+     * whether originated by us (start_discovery, PREP-as-target) or forwarded for someone else
+     * (PREQ flood, PREP forward). Gating here makes the node invisible to HWMP path selection. */
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL || !g_mesh_multihop)
     {
         return;
     }
@@ -1909,9 +1938,9 @@ static void umac_mesh_tx_hwmp(struct hwmp_frame_params *p)
 /* Originate a PREQ to discover a path to `dest` (mesh_queue_preq). Rate-limited per dest. */
 void umac_mesh_start_discovery(const uint8_t *dest)
 {
-    if (!mesh_ctx.active)
+    if (!mesh_ctx.active || !g_mesh_multihop)
     {
-        return;
+        return; /* leaf mode: never originate path discovery (own TX falls back to direct) */
     }
     struct mesh_path_entry *p = mesh_path_get_or_add(dest);
     uint32_t now = mmosal_get_time_ms();
@@ -1981,7 +2010,8 @@ static void umac_mesh_build_perr(struct umac_data *umacd, struct consbuf *buf, v
 
 static void umac_mesh_tx_perr(struct hwmp_perr_params *p)
 {
-    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
+    /* Leaf mode emits no PERR (originated on peer loss, or propagated). */
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL || !g_mesh_multihop)
     {
         return;
     }
@@ -2228,6 +2258,10 @@ static void umac_mesh_build_forward(struct umac_data *umacd, struct consbuf *buf
 bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, const uint8_t *payload,
                             uint32_t payload_len)
 {
+    if (!g_mesh_multihop)
+    {
+        return false; /* leaf mode: never relay another node's unicast (caller drops the frame) */
+    }
     if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
     {
         return false;
@@ -2357,8 +2391,10 @@ bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t s
     {
         return true; /* duplicate — drop (don't re-broadcast, don't deliver again) */
     }
-    if (ttl > 1 && mesh_ctx.common_stad != NULL)
+    if (g_mesh_multihop && ttl > 1 && mesh_ctx.common_stad != NULL)
     {
+        /* Leaf mode: deliver this group frame locally (we still return false below) but do NOT
+         * re-broadcast it onward — a leaf carries no one else's multicast either. */
         struct mesh_rebcast_params p = {
             .mesh_sa = mesh_sa, .ttl = ttl, .seqnum = seqnum, .payload = payload,
             .payload_len = payload_len
