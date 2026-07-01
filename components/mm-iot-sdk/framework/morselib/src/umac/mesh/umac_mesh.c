@@ -613,9 +613,10 @@ static void mesh_peer_free(struct mesh_peer *peer)
     peer->used = false;
 }
 
-#if MMWLAN_MESH_SEC_PHASE1
 /* The per-peer stad for a unicast peer (for the datapath unicast TX/RX key lookup), or NULL for an
- * unknown/non-ESTAB peer so the caller falls back to the common (MBSS) stad. */
+ * unknown/non-ESTAB peer so the caller falls back to the common (MBSS) stad. Always defined so the
+ * datapath links in both builds: in an OPEN mesh (MMWLAN_MESH_SEC_PHASE1=0) no per-peer stad is
+ * allocated, so this returns NULL and the common (group-key) stad keys every frame. */
 struct umac_sta_data *umac_mesh_get_peer_stad(const uint8_t *addr)
 {
     struct mesh_peer *p = mesh_peer_find(addr);
@@ -634,7 +635,6 @@ struct umac_sta_data *umac_mesh_peer_stad_at(size_t index)
     struct mesh_peer *p = &mesh_peers[index];
     return (p->used && p->state == MESH_PLINK_ESTAB) ? p->stad : NULL;
 }
-#endif
 
 struct mesh_peering_params
 {
@@ -1111,8 +1111,10 @@ static void mesh_sae_handle_rx(struct mesh_peer *peer, uint16_t txn, uint16_t st
                  * non-LISTEN peer never re-derives the AEK out from under an installed MTK). */
                 if (peer->state == MESH_PLINK_LISTEN)
                 {
+#if MMWLAN_MESH_SEC_PHASE1
                     mesh_derive_aek(peer);   /* == mesh_rsn_init_ampe_sta -> mesh_rsn_derive_aek (mesh_rsn.c:543) */
                     peer->aek_valid = true;  /* the protected-AMPE TX path (tx_peering .aek) is now armed */
+#endif
                     (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_OPEN, peer, 0); /* first protected Open */
                     peer->state = MESH_PLINK_OPN_SNT;
                     MMLOG_INF("MESH SAE accepted -> Open sent, OPN_SNT " MM_MAC_ADDR_FMT " llid=0x%04x\n",
