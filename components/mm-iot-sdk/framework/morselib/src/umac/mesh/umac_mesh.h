@@ -64,6 +64,12 @@ enum mmwlan_status mmwlan_mesh_stop(void);
  *  peer's mesh beacon (same Mesh ID) is heard. No-op if no mesh vif is active. */
 void mmwlan_mesh_peer_open(const uint8_t *peer_mac);
 
+/* Number of ESTAB mesh peers; if @p estab_macs != NULL, copies up to UMAC_MESH_MAX_PEERS peer MACs into it.
+ * Operational telemetry the app heartbeat logs so a node's mesh peering state is visible on the console
+ * (morselib MMLOG does not reach the UART; without this app-visible getter, two ESP nodes peering with no
+ * Linux node present reads falsely as "never peers"). */
+uint8_t mmwlan_mesh_peer_count(uint8_t estab_macs[][6]);
+
 /** Retired no-op (was a broadcast Peering-Open probe). Kept for ABI compatibility. */
 void mmwlan_mesh_send_test_action(void);
 
