@@ -362,6 +362,7 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 #define MESH_MAX_PATHS        (8)
 #define MESH_PATH_LINK_METRIC (100)
 #define MESH_PATH_LIFETIME_MS (30000) /* refresh well before traffic stalls */
+#define MESH_PATH_REFRESH_MS  (6000)  /* preemptively refresh an active path in its final ~20% (== mac80211 path_refresh_time) */
 #define MESH_PREQ_MIN_GAP_MS  (250)   /* rate-limit path discovery per destination */
 /* The PREQ Lifetime field is in TUs, not ms (mesh_hwmp.c `MSEC_TO_TU(x) = x*1000/1024`). */
 #define MESH_MSEC_TO_TU(ms)   ((uint32_t)((ms) * 1000u / 1024u))
@@ -1871,8 +1872,20 @@ bool umac_mesh_lookup_next_hop(const uint8_t *dest, uint8_t *next_hop_out)
         return false; /* leaf mode: own TX always goes direct (never via a multi-hop next hop) */
     }
     struct mesh_path_entry *p = mesh_path_find(dest);
-    if (p != NULL && p->active && (int32_t)(p->expiry_ms - mmosal_get_time_ms()) > 0)
+    uint32_t now = mmosal_get_time_ms();
+    if (p != NULL && p->active && (int32_t)(p->expiry_ms - now) > 0)
     {
+        /* Preemptive path refresh (== mac80211 mesh_path_refresh, net/mac80211/mesh_hwmp.c): when an
+         * active path is inside its final MESH_PATH_REFRESH_MS, fire a background PREQ WITHOUT
+         * invalidating it — keep forwarding on the current next hop while the returning PREP renews
+         * expiry_ms (mesh_path_update). So an actively-used path never expires mid-transfer and then
+         * re-resolves reactively (which stalls the flow). Safe from the TX/forward path:
+         * umac_mesh_start_discovery is rate-limited (MESH_PREQ_MIN_GAP_MS) and already sends a
+         * Target-Only PREQ for a known dest (the mesh_queue_preq / PREQ_Q_F_REFRESH analog). */
+        if ((int32_t)(p->expiry_ms - now) < MESH_PATH_REFRESH_MS)
+        {
+            umac_mesh_start_discovery(dest);
+        }
         mac_addr_copy(next_hop_out, p->next_hop);
         return true;
     }
