@@ -632,6 +632,7 @@ static void mesh_peer_free(struct mesh_peer *peer)
     }
     if (peer->stad != NULL)   /* per-peer stad is allocated in both builds (open: plaintext) */
     {
+        umac_rc_stop(peer->stad); /* P6c real-RC: free the reference_table (no-op if RC never started) */
         mmosal_free(peer->stad);
         peer->stad = NULL;
     }
@@ -659,6 +660,17 @@ struct umac_sta_data *umac_mesh_peer_stad_at(size_t index)
     }
     struct mesh_peer *p = &mesh_peers[index];
     return (p->used && p->state == MESH_PLINK_ESTAB) ? p->stad : NULL;
+}
+
+/* Start per-peer rate control at ESTAB so mmrc learns this link's best rate from TX-status feedback
+ * (P6c real-RC: closes GAP-1). Mesh operating point: 1 MHz, long GI, single stream, ceiling MCS7
+ * (matches mesh_thr_kbps_from_rssi + the beacon mgmt table). sgi_flags=0 keeps long GI. */
+static void umac_mesh_peer_rc_start(struct mesh_peer *peer)
+{
+    if (peer->stad != NULL)
+    {
+        umac_rc_start(peer->stad, /*sgi_flags=*/0, /*max_mcs=*/MMRC_MCS7);
+    }
 }
 
 struct mesh_peering_params
@@ -2250,13 +2262,19 @@ static void umac_mesh_invalidate_paths_via(const uint8_t *next_hop)
 /* airtime_link_metric_get() fixed-point ETT (mesh_hwmp.c:359-380), given the expected throughput in Kbps
  * (== sta_get_expected_throughput units). Lower = better — the mesh_path_update fresh-info compare relies
  * on it. */
-static uint32_t mesh_airtime_from_thr_kbps(uint32_t thr_kbps)
+static uint32_t mesh_airtime_from_thr_kbps(uint32_t thr_kbps, uint8_t prob)
 {
     uint32_t rate = (thr_kbps + 99u) / 100u; /* DIV_ROUND_UP(thr,100): rate in units of 100 Kbps (:359) */
     if (rate == 0u)
         return MESH_METRIC_MAX; /* :368 !rate -> MAX_METRIC (defensive; our thr is always > 0) */
+    if (prob == 0u)
+        return MESH_METRIC_MAX; /* == Linux fail_avg >= 100 early return (:361) */
     uint32_t s_unit = 1u << MESH_METRIC_ARITH_SHIFT;
-    uint32_t err = 0u; /* rate>0 => err=0; the fail_avg fallback (:361-372) is not ported (divergence) */
+    /* Real per-rate fail term, byte-exact to Linux mesh_hwmp.c:361: err = (fail_avg << SHIFT) / 100 with
+     * fail_avg = 100 - prob (the single-division form rounds identically to Linux; the s_unit - s_unit*prob
+     * form rounds 1 unit off). prob=100 => err=0 (== the old RSSI-seed behaviour). s_unit-err = s_unit -
+     * ((100-prob)*s_unit)/100 >= 2 for prob>=1 (prob==0 already returned MAX above), so no div-by-0. */
+    uint32_t err = ((100u - prob) * s_unit) / 100u;
     /* :377 device_constant + 10*test_frame_len/rate — Linux associativity is (10*tfl)/rate (left-to-right),
      * NOT 10*(tfl/rate); they differ by ≤1 unit at some rates. 10*(8192<<8)=20971520 fits u32. */
     uint32_t tx_time = (1u << MESH_METRIC_ARITH_SHIFT)
@@ -2291,10 +2309,17 @@ static uint32_t mesh_last_hop_metric(const uint8_t *frame_sa)
     struct mesh_peer *p = mesh_peer_find(frame_sa);
     if (p == NULL || p->state != MESH_PLINK_ESTAB)
         return MESH_METRIC_MAX; /* :351 plink != ESTAB -> MAX_METRIC */
+    /* Hybrid: once mmrc has converged on this peer (real TX-status feedback), use its learned
+     * best-throughput rate + real success probability; otherwise fall back to the RSSI-seed tier with
+     * prob=100 (err=0) — i.e. exactly the pre-RC behaviour, so a cold/unconverged peer is unchanged. */
+    uint32_t thr_kbps;
+    uint8_t prob;
+    if (p->stad != NULL && umac_rc_get_learned_metric(p->stad, &thr_kbps, &prob))
+        return mesh_airtime_from_thr_kbps(thr_kbps, prob);
     int16_t rssi = p->last_rssi_dbm;
     if (rssi == MESH_RSSI_NONE)
         rssi = MESH_METRIC_RSSI_MCS3; /* link exists but not yet sampled: assume the mid tier */
-    return mesh_airtime_from_thr_kbps(mesh_thr_kbps_from_rssi(rssi));
+    return mesh_airtime_from_thr_kbps(mesh_thr_kbps_from_rssi(rssi), 100);
 }
 
 static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const uint8_t *frame_sa)
@@ -2914,6 +2939,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
             peer->state = MESH_PLINK_ESTAB;
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
+            umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */
 #if MMWLAN_MESH_SEC_PHASE1
             umac_mesh_peer_secure_estab(peer);
 #endif
@@ -2931,6 +2957,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
             peer->state = MESH_PLINK_ESTAB;
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
+            umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */
 #if MMWLAN_MESH_SEC_PHASE1
             umac_mesh_peer_secure_estab(peer);
 #endif
