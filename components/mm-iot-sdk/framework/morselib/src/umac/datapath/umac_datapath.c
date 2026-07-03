@@ -505,9 +505,12 @@ static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
 }
 
 
-/* #P5 — host-side CCMP for the mesh data/robust-mgmt path. The MM6108 firmware keys CCMP decryption by
- * the mesh-SA (A4), so a forwarded A4!=TA frame can't be HW-decrypted (#20); moving all mesh CCMP to the
- * host (no FW key offload, see umac_keys_mmdrv_install_key) makes multi-hop work. Mirrors net/mac80211
+/* #P5 — host-side CCMP for the mesh data/robust-mgmt path. In HW-crypto mode the MM6108 firmware
+ * withholds a forwarded A4!=TA 4-addr frame from the host (an A4-sensitive *delivery* gate, #20 — NOT a
+ * keys-by-A4 decrypt limit: the same FW delivers+HW-decrypts the forward on Linux). Moving all mesh CCMP
+ * to the host (no FW key offload, see umac_keys_mmdrv_install_key) sidesteps the gate and makes multi-hop
+ * work. Re-verified 2026-07-02 as a host-stack (not FW/BCF, not a FW-command) difference — worklog
+ * docs/worklog/2026-07-02-mesh-20-hwcrypto-reverify.md. Mirrors net/mac80211
  * ieee80211_crypto_ccmp_{encrypt,decrypt}. Single TX/RX datapath task -> file-static scratch buffers. */
 #define MESH_SW_CCMP_BODY_MAX 1600
 
@@ -586,7 +589,7 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
  * the MIC, then replay-check the PN in `space` (only after MIC, so a forged MIC can't poison the replay
  * window), then strip the CCMP header + MIC. `space` = DEFAULT for data, IND_ROBUST_MGMT for unicast
  * action frames. Returns false (drop) on missing key / MIC / replay failure. This is where a forwarded
- * A4!=TA frame the FW can't decrypt finally decrypts. */
+ * A4!=TA frame the FW withholds in HW-crypto mode (#20) is instead delivered raw and decrypted host-side. */
 static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmpktview *view,
                                           const struct dot11_data_hdr *data_hdr,
                                           enum umac_key_rx_counter_space space)
@@ -725,8 +728,8 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
             /* #P5d — FW delivered the protected mesh frame raw (no FW key offloaded). Decrypt on the host,
              * keyed by TA. This is where a forwarded A4!=TA frame works: in HW-crypto mode the FW does not
-             * deliver such a forward (an A4-sensitive FW delivery gate, worklog §#26); with no FW key it
-             * delivers it raw instead, so the host CCMP runs. */
+             * deliver such a forward (an A4-sensitive delivery gate, #20 — re-verified 2026-07-02 as a
+             * host-stack, not a FW-command, difference); with no FW key it delivers it raw, so host CCMP runs. */
             if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, data_hdr,
                                                UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
             {
@@ -2573,7 +2576,8 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     if (key_id >= 0)
     {
         /* #P5c — forwarded unicast (next-hop MTK) / re-broadcast group (own MGTK): encrypt on the host
-         * so a forwarded A4!=TA frame the FW can't key is still protected end-to-end. Otherwise FW HW. */
+         * so a forwarded A4!=TA frame (which the FW withholds in HW-crypto mode, #20) is protected
+         * end-to-end. Otherwise FW HW. */
         if (umac_mesh_sw_crypto_enabled())
         {
             umac_keys_increment_tx_seq(stad, key_id);
