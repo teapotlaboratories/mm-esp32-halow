@@ -557,3 +557,20 @@ void umac_rc_free_rc_stats(struct mmwlan_rc_stats *stats)
         mmosal_free(stats);
     }
 }
+
+bool umac_rc_get_learned_metric(struct umac_sta_data *stad, uint32_t *thr_kbps, uint8_t *prob)
+{
+    struct umac_rc_sta_data *sta_data = umac_sta_data_get_rc(stad);
+    if (sta_data == NULL || sta_data->reference_table == NULL)
+    {
+        return false; /* RC not started on this peer (GAP-1 path), or a non-RC stad */
+    }
+    struct mmrc_rate best = mmrc_sta_get_best_rate(sta_data->reference_table);
+    if (sta_data->reference_table->table[best.index].evidence == 0)
+    {
+        return false; /* cold: mmrc has no TX-status samples yet for the best rate */
+    }
+    *thr_kbps = mmrc_calculate_theoretical_throughput(best) / 1000u; /* bits/s -> Kbps */
+    *prob = sta_data->reference_table->table[best.index].prob;       /* success EWMA 0..100 */
+    return true;
+}

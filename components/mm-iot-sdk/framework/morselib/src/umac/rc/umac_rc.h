@@ -48,3 +48,10 @@ struct mmwlan_rc_stats *umac_rc_get_rc_stats(struct umac_sta_data *stad);
 void umac_rc_free_rc_stats(struct mmwlan_rc_stats *stats);
 
 
+/* Mesh airtime metric (P6c): the learned best-throughput rate for a peer, returned as expected
+ * throughput (Kbps) + that rate's success-probability EWMA (0..100). Returns false if RC isn't
+ * started or hasn't converged (evidence==0) on this peer — the caller then falls back to the RSSI
+ * seed. */
+bool umac_rc_get_learned_metric(struct umac_sta_data *stad, uint32_t *thr_kbps, uint8_t *prob);
+
+

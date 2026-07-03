@@ -2598,7 +2598,11 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     }
     tx_metadata->tid = MMWLAN_MAX_QOS_TID;
     tx_metadata->aid = umac_sta_data_get_aid(stad);
-    umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+    /* P6c real-RC (Edit 2b): sample the peer's learned data rates on the forward path (mirrors the
+     * local-origin path :2240), so a relay-dominated node trains mmrc instead of only feeding MCS0.
+     * Falls back to the mgmt table until RC is started on this stad (umac_rc.c:437-442). */
+    umac_rc_init_rate_table_data(stad, &tx_metadata->rc_data, false,
+                                 mmpkt_get_data_length(txbufview));
 
     uint16_t pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
     uint32_t timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
@@ -3104,6 +3108,21 @@ static struct umac_sta_data *umac_datapath_lookup_stad_by_aid_sta(struct umac_da
     return stad;
 }
 
+/* Mesh per-AID stad lookup (P6c real-RC: closes GAP-2). The STA variant above returns the single
+ * common stad (AID 0), which mismatches every mesh peer AID (1..N) -> TX-status feedback is dropped.
+ * Mirror umac_ap_lookup_sta_by_aid: peer AID N maps to mesh slot N-1. AID 0 = the common (group/mgmt)
+ * stad. */
+static struct umac_sta_data *umac_datapath_lookup_stad_by_aid_mesh(struct umac_data *umacd,
+                                                                   uint16_t aid)
+{
+    MM_UNUSED(umacd);
+    if (aid == 0)
+    {
+        return umac_mesh_get_common_stad();
+    }
+    return umac_mesh_peer_stad_at((size_t)(aid - 1));
+}
+
 
 static enum mmwlan_sta_state umac_datapath_get_state_sta(struct umac_sta_data *stad)
 {
@@ -3493,7 +3512,7 @@ static const struct umac_datapath_ops datapath_ops_mesh = {
     .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_mesh,
     .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_mesh,
     .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_mesh,
-    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_sta,
+    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_mesh,
     .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
     .is_stad_tx_paused = umac_sta_data_is_paused,
     .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
