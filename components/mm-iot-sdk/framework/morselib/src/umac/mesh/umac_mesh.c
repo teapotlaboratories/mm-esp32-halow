@@ -364,7 +364,9 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
  * airtime metric (P6c) — a port of net/mac80211 airtime_link_metric_get (mesh_hwmp.c:338-381): the exact
  * fixed-point ETT, fed a per-link rate seeded from the peer's RX RSSI (mesh_last_hop_metric below). Same
  * metric scale as Linux nodes' airtime, so a mixed ESP/Linux mesh accumulates comparably. */
-#define MESH_MAX_PATHS        (8)
+#define MESH_MAX_PATHS        (64)            /* path pool: one entry per reachable dest (was 8) */
+#define MESH_PATH_BUCKETS     (64)            /* dest-MAC hash buckets; power of two, >= MESH_MAX_PATHS */
+#define MESH_PATH_NIL         ((int16_t)-1)   /* empty-bucket / end-of-chain sentinel */
 /* airtime_link_metric_get constants (mesh_hwmp.c:14-16, verified on the pinned rpi-linux). */
 #define MESH_METRIC_TEST_FRAME_LEN (8192u)
 #define MESH_METRIC_MAX            (0xffffffffu)
@@ -1809,9 +1811,63 @@ struct mesh_path_entry
     uint8_t hop_count;
     uint32_t expiry_ms;
     uint32_t last_preq_ms;
+    int16_t hnext; /* next entry index in this dest's hash bucket, or MESH_PATH_NIL */
 };
 
 static struct mesh_path_entry mesh_paths[MESH_MAX_PATHS];
+static int16_t mesh_path_bucket[MESH_PATH_BUCKETS]; /* bucket head index into mesh_paths, or NIL */
+
+/* Dest-MAC hash index over the fixed path pool — O(1) find/insert/remove by chaining int16_t pool
+ * indices (position-independent, all-BSS, no heap/fragmentation). The embedded stand-in for
+ * mac80211's rhashtable: a single umac event loop has no concurrent readers/writers, so none of the
+ * RCU/resize machinery is needed. Chaining (not open addressing) so eviction unlinks in one step. */
+static inline uint32_t mesh_path_hash(const uint8_t *mac)
+{
+    uint32_t h = 2166136261u; /* FNV-1a over all 6 MAC bytes */
+    for (int i = 0; i < MMWLAN_MAC_ADDR_LEN; i++)
+    {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+    return h & (MESH_PATH_BUCKETS - 1);
+}
+
+static void mesh_path_hash_insert(struct mesh_path_entry *p)
+{
+    uint32_t b = mesh_path_hash(p->dest);
+    p->hnext = mesh_path_bucket[b];
+    mesh_path_bucket[b] = (int16_t)(p - mesh_paths);
+}
+
+static void mesh_path_hash_remove(struct mesh_path_entry *p)
+{
+    uint32_t b = mesh_path_hash(p->dest);
+    int16_t idx = (int16_t)(p - mesh_paths);
+    for (int16_t *pp = &mesh_path_bucket[b]; *pp != MESH_PATH_NIL; pp = &mesh_paths[*pp].hnext)
+    {
+        if (*pp == idx)
+        {
+            *pp = p->hnext;
+            p->hnext = MESH_PATH_NIL;
+            return;
+        }
+    }
+}
+
+/* Reset the path table to empty. MUST be used instead of a bare memset: a raw zero would leave every
+ * bucket head + hnext == 0, i.e. pointing at entry 0 — mesh_path_find would then cycle. */
+static void mesh_path_tbl_reset(void)
+{
+    memset(mesh_paths, 0, sizeof(mesh_paths));
+    for (size_t i = 0; i < MESH_MAX_PATHS; i++)
+    {
+        mesh_paths[i].hnext = MESH_PATH_NIL;
+    }
+    for (size_t b = 0; b < MESH_PATH_BUCKETS; b++)
+    {
+        mesh_path_bucket[b] = MESH_PATH_NIL;
+    }
+}
 
 static uint32_t mesh_rd32(const uint8_t *p)
 {
@@ -1820,7 +1876,7 @@ static uint32_t mesh_rd32(const uint8_t *p)
 
 static struct mesh_path_entry *mesh_path_find(const uint8_t *dest)
 {
-    for (size_t i = 0; i < MESH_MAX_PATHS; i++)
+    for (int16_t i = mesh_path_bucket[mesh_path_hash(dest)]; i != MESH_PATH_NIL; i = mesh_paths[i].hnext)
     {
         if (mesh_paths[i].used && memcmp(mesh_paths[i].dest, dest, MMWLAN_MAC_ADDR_LEN) == 0)
         {
@@ -1852,9 +1908,15 @@ static struct mesh_path_entry *mesh_path_get_or_add(const uint8_t *dest)
     }
     if (victim != NULL)
     {
+        if (victim->used)
+        {
+            mesh_path_hash_remove(victim); /* unlink the evicted dest from its bucket first */
+        }
         memset(victim, 0, sizeof(*victim));
+        victim->hnext = MESH_PATH_NIL; /* memset zeroed hnext to 0; restore the sentinel */
         victim->used = true;
         mac_addr_copy(victim->dest, dest);
+        mesh_path_hash_insert(victim); /* index the new dest */
     }
     return victim;
 }
@@ -2978,7 +3040,7 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
      * centre/primary channel number both equal s1g_chan_num for a 1 MHz channel. */
     memset(&mesh_ctx, 0, sizeof(mesh_ctx));
     memset(mesh_peers, 0, sizeof(mesh_peers)); /* fresh peer table for this MBSS */
-    memset(mesh_paths, 0, sizeof(mesh_paths)); /* fresh HWMP path table */
+    mesh_path_tbl_reset(); /* fresh HWMP path table (NILs the hash buckets — not a bare memset) */
     memset(mesh_rmc, 0, sizeof(mesh_rmc));     /* fresh duplicate cache */
     mesh_ctx.vif_id = vif_id;
     /* The mesh vif's MAC = the address it was created with: the app's if_addr, or the
