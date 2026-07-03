@@ -25,6 +25,7 @@
 #include "common/morse_commands.h"
 #include "mmdrv.h"
 #include "mmhal_wlan.h"
+#include "mmrc.h" /* P6c airtime metric: mmrc_calculate_theoretical_throughput + MMRC_MCS/BW/GUARD */
 #include "mmlog.h"
 #include "mmosal.h"
 #include "dot11/dot11.h"
@@ -359,13 +360,26 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 #define HWMP_MPATH_PREQ                   (0)
 #define HWMP_MPATH_PREP                   (1)
 
-/* Mesh path table (mesh_pathtbl.c) + HWMP on-demand routing. We keep a small path table and a
- * simplified metric (a fixed per-hop cost; mac80211 uses airtime) — sufficient for a line
- * topology with no competing paths. */
+/* Mesh path table (mesh_pathtbl.c) + HWMP on-demand routing. We keep a small path table and a per-link
+ * airtime metric (P6c) — a port of net/mac80211 airtime_link_metric_get (mesh_hwmp.c:338-381): the exact
+ * fixed-point ETT, fed a per-link rate seeded from the peer's RX RSSI (mesh_last_hop_metric below). Same
+ * metric scale as Linux nodes' airtime, so a mixed ESP/Linux mesh accumulates comparably. */
 #define MESH_MAX_PATHS        (8)
-#define MESH_PATH_LINK_METRIC (100)
+/* airtime_link_metric_get constants (mesh_hwmp.c:14-16, verified on the pinned rpi-linux). */
+#define MESH_METRIC_TEST_FRAME_LEN (8192u)
+#define MESH_METRIC_MAX            (0xffffffffu)
+#define MESH_METRIC_ARITH_SHIFT    (8)
+/* RSSI->rate seed tiers, mirroring mmrc_init_rates (mmrc.c:213/218, which are .c-local, so copied here):
+ * >= -70 dBm -> MCS7, >= -85 -> MCS3, else MCS0. */
+#define MESH_METRIC_RSSI_MCS7 (-70)
+#define MESH_METRIC_RSSI_MCS3 (-85)
+#define MESH_RSSI_NONE        ((int16_t)0x7FFF) /* no RSSI sampled yet for a peer */
 #define MESH_PATH_LIFETIME_MS (30000) /* refresh well before traffic stalls */
 #define MESH_PATH_REFRESH_MS  (6000)  /* preemptively refresh an active path in its final ~20% (== mac80211 path_refresh_time) */
+/* net_traversal_time analog (mesh_hwmp.c): the target-SN bump is rate-limited to at most once per this
+ * window, so every copy of ONE PREQ flood replies with a stable target_sn (the originator then picks by
+ * metric, not SN). Chosen >> a single flood's arrival spread (tens of ms) and << the ~24 s refresh. */
+#define MESH_HWMP_NET_TRAVERSAL_MS (500)
 #define MESH_PREQ_MIN_GAP_MS  (250)   /* rate-limit path discovery per destination */
 /* The PREQ Lifetime field is in TUs, not ms (mesh_hwmp.c `MSEC_TO_TU(x) = x*1000/1024`). */
 #define MESH_MSEC_TO_TU(ms)   ((uint32_t)((ms) * 1000u / 1024u))
@@ -434,6 +448,7 @@ struct mesh_peer
     enum mesh_plink_state state;
     uint8_t retries; /* Open retransmits (or holding ticks while HOLDING) */
     uint32_t last_rx_ms; /* last frame heard from this peer (mac80211 sta last_rx) */
+    int16_t last_rssi_dbm; /* RSSI of this peer's last HWMP frame (P6c airtime metric); MESH_RSSI_NONE until sampled */
     struct umac_sta_data *stad; /* per-peer host stad: pairwise+group-RX keychain, seq/replay */
     /* AMPE key material (P2). my_nonce is generated once per (re)alloc and carried in our Open/Confirm;
      * peer_nonce is learned from the peer's. At ESTAB the per-pair MTK + AEK are derived from them
@@ -561,6 +576,7 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
              * supplicant, so we self-assign from the fixed peer pool (platform divergence). */
             p->aid = (uint16_t)(i + 1);
             p->last_rx_ms = mmosal_get_time_ms();
+            p->last_rssi_dbm = MESH_RSSI_NONE; /* P6c: no airtime sample until the first HWMP frame */
             /* A non-zero local link id, generated per peer (mac80211 mesh_plink_open). */
             do
             {
@@ -1779,6 +1795,8 @@ static bool mesh_process_ampe(struct mesh_peer *peer, const uint8_t *body, uint3
 
 static uint32_t mesh_hwmp_sn;      /* our sequence number (ifmsh->sn equivalent) */
 static uint32_t mesh_hwmp_preq_id; /* PREQ id generator */
+static uint32_t mesh_hwmp_last_sn_update_ms; /* ifmsh->last_sn_update — timestamp of the last target-SN bump */
+static bool mesh_hwmp_sn_bumped;             /* false until the first bump — avoids the ms==0 sentinel alias at the clock wrap */
 
 struct mesh_path_entry
 {
@@ -1841,22 +1859,53 @@ static struct mesh_path_entry *mesh_path_get_or_add(const uint8_t *dest)
     return victim;
 }
 
-/* Install/refresh a path to `dest` reachable via `next_hop` — "fresh info" rule from
- * hwmp_route_info_get: take it if the path is inactive, the SN is newer, or the SN is equal
- * and the metric is better. */
-static void mesh_path_update(const uint8_t *dest, const uint8_t *next_hop, uint32_t sn,
+/* mult_frac(m, 10, 9) with a 64-bit intermediate + saturation (mesh_hwmp.c hysteresis constant). Lower
+ * metric = better, so inflating the incoming metric ~11% before the compare means a same-SN copy must
+ * beat the stored path by more than the hysteresis margin to be taken. */
+static uint32_t mesh_metric_mul_10_9(uint32_t m)
+{
+    uint64_t v = ((uint64_t)m * 10u) / 9u;
+    return v > MESH_METRIC_MAX ? MESH_METRIC_MAX : (uint32_t)v;
+}
+
+/* Install/refresh a path to `dest` reachable via `next_hop` — "fresh info" rule from hwmp_route_info_get
+ * (net/mac80211/mesh_hwmp.c): take the update if the path is inactive, the SN is strictly newer, or the
+ * SN is EQUAL and the metric is better — by the 10/9 (~11%) hysteresis margin when the copy arrived via a
+ * DIFFERENT next hop (a same-next-hop refresh compares raw). A stale SN, or an equal-SN copy that is not
+ * better, is NOT fresh. Returns whether the path was (re)installed — the PREQ handler gates its PREP
+ * reply + re-flood on this (mac80211: hwmp_route_info_get==0 => the caller does nothing, which is the
+ * only duplicate-PREQ suppressor). */
+static bool mesh_path_update(const uint8_t *dest, const uint8_t *next_hop, uint32_t sn,
                              uint32_t metric, uint8_t hop_count)
 {
     if (memcmp(dest, mesh_ctx.mesh_mac, MMWLAN_MAC_ADDR_LEN) == 0)
     {
-        return; /* never a path to ourselves */
+        return false; /* never a path to ourselves */
     }
     struct mesh_path_entry *p = mesh_path_get_or_add(dest);
     if (p == NULL)
     {
-        return;
+        return false;
     }
-    bool fresh = !p->active || MESH_SN_GT(sn, p->sn) || (sn == p->sn && metric < p->metric);
+    /* mac80211 hwmp_route_info_get adopt rule: reject if the stored SN is strictly newer (incoming is
+     * stale); otherwise — incoming SN equal OR newer — adopt only via the SAME next hop, or when the
+     * incoming metric beats the stored one by the 10/9 (~11%) hysteresis. The hysteresis applies to
+     * BOTH equal- and newer-SN copies (mac80211 ORs the metric test independently of the SN test), so a
+     * newer-SN worse different-hop copy cannot transiently steal the path. */
+    bool fresh;
+    if (!p->active)
+    {
+        fresh = true;
+    }
+    else if (MESH_SN_GT(p->sn, sn))
+    {
+        fresh = false; /* stored SN strictly newer — incoming is stale */
+    }
+    else
+    {
+        bool same_nh = memcmp(p->next_hop, next_hop, MMWLAN_MAC_ADDR_LEN) == 0;
+        fresh = same_nh || p->metric == 0 || mesh_metric_mul_10_9(metric) < p->metric;
+    }
     if (fresh)
     {
         mac_addr_copy(p->next_hop, next_hop);
@@ -1866,6 +1915,7 @@ static void mesh_path_update(const uint8_t *dest, const uint8_t *next_hop, uint3
         p->active = true;
         p->expiry_ms = mmosal_get_time_ms() + MESH_PATH_LIFETIME_MS;
     }
+    return fresh;
 }
 
 bool umac_mesh_lookup_next_hop(const uint8_t *dest, uint8_t *next_hop_out)
@@ -2127,6 +2177,64 @@ static void umac_mesh_invalidate_paths_via(const uint8_t *next_hop)
     }
 }
 
+/* ---- P6c: mesh airtime link metric (port of net/mac80211 airtime_link_metric_get) --------------
+ * Replaces the old fixed per-hop cost. The formula (mesh_hwmp.c:338-381) is reproduced exactly; only the
+ * rate input is approximated: mesh peers never start rate control (mmrc), so instead of mac80211's learned
+ * sta_get_expected_throughput we seed a rate from the peer's last RX RSSI via mmrc's own cold-start tiers
+ * (mmrc_init_rates, mmrc.c:1287) run through the same mmrc_calculate_theoretical_throughput. Divergences:
+ * RSSI-seeded (not learned) rate; err/fail-ratio structurally 0; fixed 1 MHz BW. See
+ * docs/mesh-ap/rimba-mesh-80211s-code-map.md (P6c). */
+
+/* airtime_link_metric_get() fixed-point ETT (mesh_hwmp.c:359-380), given the expected throughput in Kbps
+ * (== sta_get_expected_throughput units). Lower = better — the mesh_path_update fresh-info compare relies
+ * on it. */
+static uint32_t mesh_airtime_from_thr_kbps(uint32_t thr_kbps)
+{
+    uint32_t rate = (thr_kbps + 99u) / 100u; /* DIV_ROUND_UP(thr,100): rate in units of 100 Kbps (:359) */
+    if (rate == 0u)
+        return MESH_METRIC_MAX; /* :368 !rate -> MAX_METRIC (defensive; our thr is always > 0) */
+    uint32_t s_unit = 1u << MESH_METRIC_ARITH_SHIFT;
+    uint32_t err = 0u; /* rate>0 => err=0; the fail_avg fallback (:361-372) is not ported (divergence) */
+    /* :377 device_constant + 10*test_frame_len/rate — Linux associativity is (10*tfl)/rate (left-to-right),
+     * NOT 10*(tfl/rate); they differ by ≤1 unit at some rates. 10*(8192<<8)=20971520 fits u32. */
+    uint32_t tx_time = (1u << MESH_METRIC_ARITH_SHIFT)
+                       + 10u * (MESH_METRIC_TEST_FRAME_LEN << MESH_METRIC_ARITH_SHIFT) / rate;
+    uint32_t estimated_retx = (1u << (2 * MESH_METRIC_ARITH_SHIFT)) / (s_unit - err); /* :378 */
+    uint64_t result = ((uint64_t)tx_time * estimated_retx) >> (2 * MESH_METRIC_ARITH_SHIFT); /* :379 */
+    return (uint32_t)result;
+}
+
+/* RSSI -> expected throughput (Kbps): mmrc's cold-start RSSI tiers (mmrc_init_rates) fed through the same
+ * mmrc_calculate_theoretical_throughput morse's get_expected_throughput uses, at the mesh operating point
+ * (1 MHz, long GI, single spatial stream). Yields 3000/1200/300 Kbps for MCS7/MCS3/MCS0. */
+static uint32_t mesh_thr_kbps_from_rssi(int16_t rssi_dbm)
+{
+    struct mmrc_rate r = { 0 };
+    r.guard = MMRC_GUARD_LONG;         /* mesh mgmt TX = long GI */
+    r.ss    = MMRC_SPATIAL_STREAM_1;   /* single stream */
+    r.bw    = MMRC_BW_1MHZ;            /* mesh is single-channel 1 MHz (divergence: BW held constant) */
+    if (rssi_dbm >= MESH_METRIC_RSSI_MCS7)
+        r.rate = MMRC_MCS7;
+    else if (rssi_dbm >= MESH_METRIC_RSSI_MCS3)
+        r.rate = MMRC_MCS3;
+    else
+        r.rate = MMRC_MCS0;
+    return mmrc_calculate_theoretical_throughput(r) / 1000u; /* bits/sec -> Kbps (== BPS_TO_KBPS) */
+}
+
+/* Last-hop metric for the link a frame arrived over (transmitter = frame_sa) — the analog of
+ * airtime_link_metric_get(local, sta) with sta = the immediate transmitter (ESTAB gate mesh_hwmp.c:350). */
+static uint32_t mesh_last_hop_metric(const uint8_t *frame_sa)
+{
+    struct mesh_peer *p = mesh_peer_find(frame_sa);
+    if (p == NULL || p->state != MESH_PLINK_ESTAB)
+        return MESH_METRIC_MAX; /* :351 plink != ESTAB -> MAX_METRIC */
+    int16_t rssi = p->last_rssi_dbm;
+    if (rssi == MESH_RSSI_NONE)
+        rssi = MESH_METRIC_RSSI_MCS3; /* link exists but not yet sampled: assume the mid tier */
+    return mesh_airtime_from_thr_kbps(mesh_thr_kbps_from_rssi(rssi));
+}
+
 static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const uint8_t *frame_sa)
 {
     /* Only learn paths from an allowed neighbour (the immediate transmitter). With a forced
@@ -2161,14 +2269,42 @@ static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const 
             uint8_t target_flags = e[26];
             const uint8_t *target_addr = &e[27];
             uint32_t target_sn = mesh_rd32(&e[33]);
-            uint32_t new_metric = metric + MESH_PATH_LINK_METRIC;
+            uint32_t new_metric = metric + mesh_last_hop_metric(frame_sa);
+            if (new_metric < metric) /* overflow clamp (mesh_hwmp.c:480) */
+                new_metric = MESH_METRIC_MAX;
 
             /* Reverse path: the originator is reachable via the immediate sender. */
-            mesh_path_update(orig_addr, frame_sa, orig_sn, new_metric, (uint8_t)(hop_count + 1));
+            bool fresh = mesh_path_update(orig_addr, frame_sa, orig_sn, new_metric,
+                                          (uint8_t)(hop_count + 1));
+            /* mac80211 hwmp_preq_frame_process: hwmp_route_info_get returning 0 — a stale/duplicate copy
+             * that did not improve the reverse path — means NO PREP reply and NO re-flood. This is the
+             * only duplicate-PREQ suppressor; a genuinely newer orig_sn (or a same-SN better-metric copy)
+             * is fresh and still processed below. */
+            if (!fresh)
+            {
+                return;
+            }
 
             if (memcmp(target_addr, mesh_ctx.mesh_mac, MMWLAN_MAC_ADDR_LEN) == 0)
             {
-                /* We are the target — reply with a PREP back toward the originator. */
+                /* We are the target — reply with a PREP back toward the originator. target_sn = our OWN
+                 * current SN (ifmsh->sn), NOT ++ per reply: adopt a higher requested target_sn, then bump
+                 * at most once per net-traversal window. So every copy of ONE discovery carries a STABLE
+                 * target_sn and the originator selects by metric, not SN (a same-SN better-metric reply
+                 * advertises the better path without bumping the SN → no flapping). */
+                if (MESH_SN_GT(target_sn, mesh_hwmp_sn))
+                {
+                    mesh_hwmp_sn = target_sn;
+                }
+                uint32_t now = mmosal_get_time_ms();
+                int32_t since = (int32_t)(now - mesh_hwmp_last_sn_update_ms);
+                if (!mesh_hwmp_sn_bumped ||
+                    since >= (int32_t)MESH_HWMP_NET_TRAVERSAL_MS || since < 0) /* since<0: clock wrap */
+                {
+                    ++mesh_hwmp_sn;
+                    mesh_hwmp_last_sn_update_ms = now;
+                    mesh_hwmp_sn_bumped = true;
+                }
                 struct hwmp_frame_params prep = { .action = HWMP_MPATH_PREP,
                                                   .da = frame_sa,
                                                   .flags = 0,
@@ -2177,7 +2313,7 @@ static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const 
                                                   .orig_sn = orig_sn,
                                                   .lifetime = lifetime,
                                                   .metric = 0,
-                                                  .target_sn = ++mesh_hwmp_sn };
+                                                  .target_sn = mesh_hwmp_sn };
                 mac_addr_copy(prep.orig_addr, orig_addr);
                 mac_addr_copy(prep.target_addr, mesh_ctx.mesh_mac);
                 umac_mesh_tx_hwmp(&prep);
@@ -2216,10 +2352,19 @@ static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const 
             uint32_t metric = mesh_rd32(&e[17]);
             const uint8_t *orig_addr = &e[21];
             uint32_t orig_sn = mesh_rd32(&e[27]);
-            uint32_t new_metric = metric + MESH_PATH_LINK_METRIC;
+            uint32_t new_metric = metric + mesh_last_hop_metric(frame_sa);
+            if (new_metric < metric) /* overflow clamp (mesh_hwmp.c:480) */
+                new_metric = MESH_METRIC_MAX;
 
             /* Forward path: the target is reachable via the immediate sender. */
-            mesh_path_update(target_addr, frame_sa, target_sn, new_metric, (uint8_t)(hop_count + 1));
+            bool fresh = mesh_path_update(target_addr, frame_sa, target_sn, new_metric,
+                                          (uint8_t)(hop_count + 1));
+            /* mac80211 gates PREP processing on hwmp_route_info_get too — a stale/duplicate PREP that did
+             * not improve the forward path is not re-forwarded (nor re-logged). */
+            if (!fresh)
+            {
+                return;
+            }
 
             if (memcmp(orig_addr, mesh_ctx.mesh_mac, MMWLAN_MAC_ADDR_LEN) == 0)
             {
@@ -2507,6 +2652,13 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     {
         if (body[1] == WLAN_MESH_ACTION_HWMP_PATH_SEL)
         {
+            /* P6c: sample THIS PREQ/PREP's RX RSSI onto the sender's peer, so mesh_last_hop_metric()
+             * charges the last hop by the RSSI of the frame that traversed it (mirrors IBSS
+             * umac_ibss_record_peer_rx). */
+            struct mesh_peer *sp = mesh_peer_find(dot11_get_sa(hdr));
+            const struct mmdrv_rx_metadata *rxmeta = mmdrv_get_rx_metadata(mmpkt_from_view(rxbufview));
+            if (sp != NULL && rxmeta != NULL)
+                sp->last_rssi_dbm = rxmeta->rssi;
             umac_mesh_handle_hwmp(body, body_len, dot11_get_sa(hdr));
         }
         return;
