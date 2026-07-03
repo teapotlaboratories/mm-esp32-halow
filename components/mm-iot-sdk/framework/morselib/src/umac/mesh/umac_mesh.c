@@ -364,8 +364,8 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
  * airtime metric (P6c) — a port of net/mac80211 airtime_link_metric_get (mesh_hwmp.c:338-381): the exact
  * fixed-point ETT, fed a per-link rate seeded from the peer's RX RSSI (mesh_last_hop_metric below). Same
  * metric scale as Linux nodes' airtime, so a mixed ESP/Linux mesh accumulates comparably. */
-#define MESH_MAX_PATHS        (64)            /* path pool: one entry per reachable dest (was 8) */
-#define MESH_PATH_BUCKETS     (64)            /* dest-MAC hash buckets; power of two, >= MESH_MAX_PATHS */
+#define MESH_MAX_PATHS        (256)           /* path pool: one entry per reachable dest (8 -> 64 -> 256) */
+#define MESH_PATH_BUCKETS     (256)           /* dest-MAC hash buckets; power of two, >= MESH_MAX_PATHS */
 #define MESH_PATH_NIL         ((int16_t)-1)   /* empty-bucket / end-of-chain sentinel */
 /* airtime_link_metric_get constants (mesh_hwmp.c:14-16, verified on the pinned rpi-linux). */
 #define MESH_METRIC_TEST_FRAME_LEN (8192u)
@@ -494,7 +494,7 @@ static void mesh_derive_aek(struct mesh_peer *peer);
 
 /* Optional peer allowlist — used to force a test topology (e.g. line/multi-hop) on a bench
  * where all nodes are in range. Empty (count 0) = peer with anyone, the normal behaviour. */
-#define MESH_ALLOWLIST_MAX (8)
+#define MESH_ALLOWLIST_MAX (16)
 static uint8_t mesh_allowlist[MESH_ALLOWLIST_MAX][MMWLAN_MAC_ADDR_LEN];
 static uint8_t mesh_allowlist_count;
 
