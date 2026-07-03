@@ -95,7 +95,7 @@ struct umac_sta_data *umac_mesh_get_common_stad(void);
 /** Maximum number of mesh peer links — the single source of truth for the per-peer stad arrays
  *  (MESH_MAX_PEERS in umac_mesh.c is defined from this). The mesh TX scheduler iterates
  *  [0, UMAC_MESH_MAX_PEERS) over umac_mesh_peer_stad_at(). */
-#define UMAC_MESH_MAX_PEERS (4)
+#define UMAC_MESH_MAX_PEERS (8)
 
 /** The per-peer stad for an ESTAB unicast peer (its pairwise+group-RX keychain), or NULL so the
  *  datapath falls back to the common stad. Used by the mesh unicast TX/RX stad lookups. */

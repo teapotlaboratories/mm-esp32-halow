@@ -494,7 +494,7 @@ static void mesh_derive_aek(struct mesh_peer *peer);
 
 /* Optional peer allowlist — used to force a test topology (e.g. line/multi-hop) on a bench
  * where all nodes are in range. Empty (count 0) = peer with anyone, the normal behaviour. */
-#define MESH_ALLOWLIST_MAX (4)
+#define MESH_ALLOWLIST_MAX (8)
 static uint8_t mesh_allowlist[MESH_ALLOWLIST_MAX][MMWLAN_MAC_ADDR_LEN];
 static uint8_t mesh_allowlist_count;
 
