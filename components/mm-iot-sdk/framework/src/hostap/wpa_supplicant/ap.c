@@ -728,10 +728,30 @@ static int wpa_supplicant_conf_ap(struct wpa_supplicant *wpa_s,
 	else if (wpa_s->conf->dtim_period)
 		bss->dtim_period = wpa_s->conf->dtim_period;
 
+#ifdef CONFIG_WNM_AP
+	/* Enable the WNM-sleep-mode responder so power-saving STAs can enter and
+	 * (crucially) exit extended sleep against this AP. Linux hostapd sets this
+	 * via "wnm_sleep_mode=1" in its config; wpa_supplicant AP mode has no such
+	 * knob, so enable it here whenever the responder is compiled in. Without it,
+	 * ieee802_11_rx_wnmsleep_req() early-returns and the STA is trapped asleep. */
+	bss->wnm_sleep_mode = 1;
+#endif /* CONFIG_WNM_AP */
+
 	if (ssid->beacon_int)
 		conf->beacon_int = ssid->beacon_int;
 	else if (wpa_s->conf->beacon_int)
 		conf->beacon_int = wpa_s->conf->beacon_int;
+
+	/* The S1G Beacon Compatibility element advertises the full-beacon interval as
+	 * short_beacon_int * beacon_int (hostapd_eid_s1g_beacon_compat, ieee802_11_s1g.c:118).
+	 * short_beacon_int has no default and is 0 in wpa_supplicant AP mode, so the element
+	 * carries beacon_interval=0 on-air (confirmed on a HaLow monitor) -- a STA's on-chip PS
+	 * engine cannot compute its beacon/wake schedule from a zero interval and refuses to
+	 * doze (stays at ~66 mA). Set it to 1 (one full beacon per beacon interval, matching a
+	 * Linux hostapd_s1g AP which advertises 1*100=100) so the STA can lock the schedule and
+	 * enter dynamic PS / WNM sleep. */
+	if (!bss->short_beacon_int)
+		bss->short_beacon_int = 1;
 
 #ifdef CONFIG_P2P
 	if (ssid->mode == WPAS_MODE_P2P_GO ||

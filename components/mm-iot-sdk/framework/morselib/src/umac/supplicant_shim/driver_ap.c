@@ -11,6 +11,7 @@
 #include "common/consbuf.h"
 #include "common/mac_address.h"
 #include "dot11/dot11.h"
+#include "dot11/dot11_utils.h"
 #include "umac/data/umac_data.h"
 #include "umac/ap/umac_ap.h"
 #include "umac/config/umac_config.h"
@@ -470,6 +471,56 @@ static int mmwpas_send_mlme(void *priv,
     return 0;
 }
 
+/* AP-side action-frame TX. hostapd's hapd_drv_send_action() silently no-ops (returns 0
+ * WITHOUT sending) when the driver has no .send_action op, so an AP could never transmit
+ * an action frame it originates -- e.g. the WNM-Sleep-Mode Response. hostapd hands us just
+ * the action body (category + fields); build the PV0 mgmt header around it (mirrors
+ * frame_action_build) and TX to the destination STA via the same AP mgmt path send_mlme
+ * uses. Enables the WNM-sleep (and any AP-originated action) responder on the ESP32 AP. */
+static int mmwpas_send_action_ap(void *priv,
+                                 unsigned int freq,
+                                 unsigned int wait_time,
+                                 const u8 *dst,
+                                 const u8 *src,
+                                 const u8 *bssid,
+                                 const u8 *data,
+                                 size_t data_len,
+                                 int no_cck)
+{
+    MM_UNUSED(freq);
+    MM_UNUSED(wait_time);
+    MM_UNUSED(no_cck);
+
+    struct umac_data *umacd = (struct umac_data *)priv;
+
+    /* Reserve CCMP header headroom + MIC tailroom (MGMT pool), mirroring the proven STA mgmt path
+     * (frame_constructor.c): when this robust action frame is HW-CCMP-encrypted (e.g. the WNM-Sleep
+     * Response to a PMF STA, see umac_datapath_tx_mgmt_frame_ap), the FW prepends an 8-byte CCMP
+     * header and appends the MIC in place. Without the headroom/tailroom the encrypted frame is
+     * malformed on-air and the STA drops it PRE-ACK -> the AP MAC retransmits the same un-ACKed MPDU
+     * (constant-PN copies). Slack is harmless for unencrypted / FW-crypto frames. */
+    struct mmpkt *tx_pkt = umac_datapath_alloc_raw_tx_mmpkt(
+        MMDRV_PKT_CLASS_MGMT, DOT11_CCMP_HEADER_LEN,
+        sizeof(struct dot11_hdr) + data_len + DOT11_CCMP_256_MIC_LEN);
+    if (tx_pkt == NULL)
+    {
+        MMLOG_INF("Failed to allocate AP action frame (len %u)\n", data_len);
+        return -1;
+    }
+
+    struct dot11_hdr hdr;
+    dot11_build_pv0_mgmt_header(&hdr, DOT11_FC_SUBTYPE_ACTION, 0, dst, src, bssid);
+
+    struct mmpktview *tx_pktview = mmpkt_open(tx_pkt);
+    mmpkt_append_data(tx_pktview, (const uint8_t *)&hdr, sizeof(hdr));
+    mmpkt_append_data(tx_pktview, data, data_len);
+    mmpkt_close(&tx_pktview);
+
+    umac_datapath_tx_mgmt_frame_ap(umacd, tx_pkt, NULL);
+
+    return 0;
+}
+
 #pragma GCC diagnostic pop
 
 static int mmwpas_set_country(void *priv, const char *alpha2)
@@ -655,6 +706,7 @@ const struct wpa_driver_ops mmwlan_wpas_ops_ap = {
     .get_bssid = mmwpas_get_bssid_ap,
     .set_key = mmwpas_set_key_ap,
     .send_mlme = mmwpas_send_mlme,
+    .send_action = mmwpas_send_action_ap,
     .set_ap = mmwpas_set_ap,
     .sta_set_flags = mmwpas_sta_set_flags,
     .set_country = mmwpas_set_country,

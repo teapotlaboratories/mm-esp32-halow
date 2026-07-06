@@ -14,6 +14,8 @@
 #include "dot11/dot11.h"
 #include "dot11/dot11_utils.h"
 #include "umac/ap/umac_ap.h"
+#include "umac/frames/frames_common.h"
+#include "umac/keys/umac_keys.h"
 #include "umac/core/umac_core.h"
 #include "common/mac_address.h"
 #include "umac/stats/umac_stats.h"
@@ -137,6 +139,33 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame_ap(struct umac_data *umacd,
 
 
 
+
+    /* PMF: a robust UNICAST management frame to a PMF-required STA (e.g. the WNM-Sleep-Mode
+     * Response) MUST be CCMP-protected, or an SAE/PMF STA silently drops it as an unprotected
+     * robust management frame (RX mirror at umac_datapath.c process_rx_mgmt_frame). The AP
+     * mgmt-TX path previously ALWAYS sent unprotected (key_id was hardcoded -1) -- this is why
+     * the ESP32 AP's WNM-Sleep responder appeared to reply (send returned OK) yet the STA never
+     * saw it and retried forever. Mirror the proven STA-side protect block (umac_datapath.c
+     * ~2450). The `stad` above is the common stad (mgmt seq-num space only); look up the
+     * DESTINATION stad for its pairwise key. HW crypto is safe: AP<->STA unicast has
+     * A2=TA=BSSID, so the mesh #20 A4!=TA FW-withhold does not apply (infra AP, no SW-CCMP). */
+    struct umac_sta_data *dst_stad = data->ops->lookup_stad_by_peer_addr(umacd, header->addr1);
+    if (dst_stad != NULL &&
+        !mm_mac_addr_is_multicast(header->addr1) &&
+        umac_sta_data_pmf_is_required(dst_stad) &&
+        frame_is_robust_mgmt(txbufview))
+    {
+        header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+        key_id = umac_keys_get_active_key_id(dst_stad, UMAC_KEY_TYPE_PAIRWISE);
+        if (key_id < 0)
+        {
+            MMLOG_WRN("AP: no key to encrypt protected mgmt frame, dropping\n");
+            mmpkt_close(&txbufview);
+            mmpkt_release(txbuf);
+            return MMWLAN_ERROR;
+        }
+        umac_keys_increment_tx_seq(dst_stad, key_id);
+    }
 
     tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
     if (key_id >= 0)
