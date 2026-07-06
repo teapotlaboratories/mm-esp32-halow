@@ -91,6 +91,7 @@ if(CONFIG_HALOW_AP_MODE)
         ${ROOT_DIR}/src/ap/drv_callbacks.c
         ${ROOT_DIR}/src/ap/eap_user_db.c
         ${ROOT_DIR}/src/ap/ieee802_11.c
+        ${ROOT_DIR}/src/ap/wnm_ap.c
         ${ROOT_DIR}/src/ap/ieee802_11_ht.c
         ${ROOT_DIR}/src/ap/ieee802_11_shared.c
         ${ROOT_DIR}/src/ap/neighbor_db.c
@@ -146,6 +147,7 @@ if(CONFIG_HALOW_AP_MODE)
     list(APPEND BUILD_DEFINES
         CONFIG_AP=1
         NEED_AP_MLME=1
+        CONFIG_WNM_AP=1
     )
 endif()
 
