@@ -30,6 +30,17 @@ struct umac_interface_data
 
     uint8_t mac_addr[DOT11_MAC_ADDR_LEN];
 
+    /*
+     * Mesh+AP concurrency (Stage 1): the primary vif above carries mesh/STA;
+     * a concurrent SoftAP is added as a SECOND vif and lives here. ap_vif_id is
+     * UMAC_INTERFACE_VIF_ID_INVALID whenever no concurrent (secondary) AP vif is
+     * allocated — a standalone AP still uses the primary vif_id. Mirrors the
+     * Linux Mesh-gate recipe: mesh on primary wlan1, AP on secondary ap0.
+     */
+    uint16_t ap_vif_id;
+
+    uint8_t ap_mac_addr[DOT11_MAC_ADDR_LEN];
+
     struct mmdrv_fw_version fw_version;
 
     uint32_t morse_chip_id;

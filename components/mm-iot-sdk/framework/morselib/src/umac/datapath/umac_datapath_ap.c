@@ -21,7 +21,7 @@
 #include "umac/stats/umac_stats.h"
 #include "umac/rc/umac_rc.h"
 
-static void umac_datapath_process_rx_mgmt_frame_ap(struct umac_data *umacd,
+void umac_datapath_process_rx_mgmt_frame_ap(struct umac_data *umacd,
                                                    struct umac_sta_data *stad,
                                                    struct mmpktview *rxbufview)
 {
@@ -64,9 +64,9 @@ static void umac_datapath_process_rx_mgmt_frame_ap(struct umac_data *umacd,
 }
 
 
-static void umac_datapath_construct_80211_data_header_ap(struct umac_sta_data *stad,
-                                                         const struct umac_8023_hdr *hdr_8023,
-                                                         struct dot11_data_hdr *data_hdr)
+void umac_datapath_construct_80211_data_header_ap(struct umac_sta_data *stad,
+                                                  const struct umac_8023_hdr *hdr_8023,
+                                                  struct dot11_data_hdr *data_hdr)
 {
     uint16_t frame_control = DOT11_MASK_FC_FROM_DS |
                              DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
@@ -121,7 +121,13 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame_ap(struct umac_data *umacd,
     int key_id = -1;
 
 
-    struct umac_sta_data *stad = data->ops->lookup_stad_by_peer_addr(umacd, NULL);
+    /* The mgmt seq-num space comes from the AP's OWN common stad. In a gateway data->ops is the
+     * gateway table, whose NULL-addr peer lookup yields the MESH common (wrong seq space + a
+     * cross-task writer); resolve straight to the AP sta_common there. Standalone-AP and the shared
+     * IBSS caller (gateway_active == false) keep the existing data->ops path. */
+    struct umac_sta_data *stad = umac_datapath_gateway_active(umacd)
+                                     ? umac_ap_lookup_sta_by_addr(umacd, NULL)
+                                     : data->ops->lookup_stad_by_peer_addr(umacd, NULL);
     MMOSAL_DEV_ASSERT(stad != NULL);
     if (stad == NULL)
     {
@@ -175,6 +181,15 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame_ap(struct umac_data *umacd,
     }
 
     tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+
+    /* Stamp the AP's egress vif so these mgmt responses leave on the AP vif, not the FW default
+     * (vif 0 = the mesh primary in a gateway) — mirrors umac_ap_get_beacon. Only when an AP is
+     * active: umac_ap_get_vif_id returns INVALID for the shared IBSS caller, which stays on vif 0. */
+    uint16_t ap_tx_vif_id = umac_ap_get_vif_id(umacd);
+    if (ap_tx_vif_id != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        tx_metadata->vif_id = ap_tx_vif_id;
+    }
 
     if (mmrc_rate_override == NULL)
     {
@@ -240,6 +255,15 @@ const struct umac_datapath_ops datapath_ops_ap = {
 void umac_datapath_configure_ap_mode(struct umac_data *umacd)
 {
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+
+    /* Concurrent AP-alongside-mesh (the Mesh-gate): install the gateway ops that serve BOTH the
+     * AP-client and mesh-peer stad sets, instead of the AP-only ops that would make mesh RX/TX
+     * invisible. Standalone AP keeps the plain AP ops. */
+    if (umac_datapath_gateway_active(umacd))
+    {
+        umac_datapath_configure_gateway_mode(umacd);
+        return;
+    }
 
     data->ops = &datapath_ops_ap;
     MMLOG_INF("Datapath configured for AP mode\n");

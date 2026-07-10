@@ -598,7 +598,7 @@ int l2_packet_send(struct l2_packet_data *l2,
     mmpkt_close(&txbufview);
     mmdrv_get_tx_metadata(txbuf)->tid = 0;
 
-    umac_datapath_tx_frame(l2->umacd, txbuf, ENCRYPTION_AUTO, NULL);
+    umac_datapath_tx_frame(l2->umacd, txbuf, ENCRYPTION_AUTO, NULL, MMWLAN_VIF_UNSPECIFIED);
     ret = 0;
 fail:
     return ret;

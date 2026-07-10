@@ -891,6 +891,7 @@ static void convert_tx_metadata_to_tx_info(struct morse_skb_tx_info *tx_info,
             skb_rate->count = 0;
         }
     }
+
 }
 
 static void morse_skbq_ensure_word_alignment(struct mmpktview *view,

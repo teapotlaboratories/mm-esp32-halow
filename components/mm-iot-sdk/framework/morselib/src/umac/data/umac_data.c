@@ -247,6 +247,23 @@ struct umac_sta_data *umac_sta_data_alloc_static(struct umac_data *umacd)
     return stad;
 }
 
+/*
+ * The single static above is shared by the STA / AP / IBSS "common" stads, which is safe only
+ * because those roles are mutually exclusive. Mesh + AP concurrency (the all-ESP Mesh-gate) breaks
+ * that invariant: bringing the AP up second would memset & reconfigure the mesh's common stad
+ * (keys/BSSID/vif_id) as AP, corrupting the mesh data AND control plane. So the mesh common stad
+ * gets its OWN dedicated backing store, distinct from the AP sta_common.
+ */
+static struct umac_sta_data umac_mesh_common_sta_data;
+
+struct umac_sta_data *umac_sta_data_alloc_static_mesh(struct umac_data *umacd)
+{
+    struct umac_sta_data *stad = &umac_mesh_common_sta_data;
+    memset(stad, 0, sizeof(*stad));
+    stad->umacd = umacd;
+    return stad;
+}
+
 struct umac_sta_data *umac_sta_data_alloc(struct umac_data *umacd)
 {
 #if defined(CONFIG_HALOW_STA_DATA_IN_PSRAM) && CONFIG_HALOW_STA_DATA_IN_PSRAM

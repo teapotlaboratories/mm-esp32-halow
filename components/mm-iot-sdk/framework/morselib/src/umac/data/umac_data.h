@@ -89,6 +89,10 @@ struct umac_sta_data;
 
 struct umac_sta_data *umac_sta_data_alloc_static(struct umac_data *umacd);
 
+/* Dedicated static backing for the MESH common stad — must be distinct from the shared static
+ * (umac_sta_data_alloc_static) so a concurrent AP cannot memset/reconfigure the mesh common. */
+struct umac_sta_data *umac_sta_data_alloc_static_mesh(struct umac_data *umacd);
+
 
 struct umac_sta_data *umac_sta_data_alloc(struct umac_data *umacd);
 

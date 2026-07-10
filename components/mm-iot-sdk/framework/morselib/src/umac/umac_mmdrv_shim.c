@@ -206,13 +206,30 @@ void mmdrv_host_stats_increment_datapath_driver_rx_read_failures(void)
     umac_stats_increment_datapath_driver_rx_read_failures(umacd);
 }
 
-struct mmpkt *mmdrv_host_get_beacon(void)
+struct mmpkt *mmdrv_host_get_beacon(uint16_t vif_id)
 {
     struct umac_data *umacd = umac_data_get_umacd();
+
+    /* IBSS is exclusive (single vif); keep the legacy global dispatch. */
     if (umac_ibss_is_active())
     {
         return umac_ibss_get_beacon(umacd);
     }
+
+    /* Mesh + AP can beacon concurrently on separate vifs: dispatch by the vif
+     * that requested a beacon rather than by a single global "active" type. */
+    uint16_t vif_types = umac_interface_get_vif_type_mask(umacd, vif_id);
+    if (vif_types & UMAC_INTERFACE_MESH)
+    {
+        return umac_mesh_get_beacon(umacd);
+    }
+    if (vif_types & UMAC_INTERFACE_AP)
+    {
+        return umac_ap_get_beacon(umacd);
+    }
+
+    /* Fallback preserves the legacy single-vif behaviour if the vif->type
+     * lookup comes back empty (e.g. a beacon in flight during teardown). */
     if (umac_mesh_is_active())
     {
         return umac_mesh_get_beacon(umacd);

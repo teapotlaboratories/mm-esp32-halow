@@ -72,6 +72,26 @@ struct umac_datapath_ops
 };
 
 
+/*
+ * Per-vif 802.11 data-header builders, exposed so the common TX path can pick the
+ * builder by the frame's egress vif TYPE when a mesh and a concurrent AP are up at
+ * once (the single global data->ops can't serve both). Mirrors mac80211 selecting
+ * the header format by sdata->vif.type.
+ */
+void umac_datapath_construct_80211_data_header_ap(struct umac_sta_data *stad,
+                                                  const struct umac_8023_hdr *hdr_8023,
+                                                  struct dot11_data_hdr *data_hdr);
+
+void umac_datapath_construct_80211_data_header_mesh(struct umac_sta_data *stad,
+                                                    const struct umac_8023_hdr *hdr_8023,
+                                                    struct dot11_data_hdr *data_hdr);
+
+/* AP RX mgmt handler, exposed so the gateway ops can route an AP-vif mgmt frame to it. */
+void umac_datapath_process_rx_mgmt_frame_ap(struct umac_data *umacd,
+                                            struct umac_sta_data *stad,
+                                            struct mmpktview *rxbufview);
+
+
 void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
                                            struct umac_sta_data *stad,
                                            struct mmpktview *rxbufview);

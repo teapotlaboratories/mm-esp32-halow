@@ -1443,11 +1443,13 @@ void mmdrv_host_stats_increment_datapath_driver_rx_read_failures(void);
 int mmdrv_set_listen_interval_sleep(uint16_t vif, uint16_t listen_interval);
 
 /**
- * Retrieve a beacon for transmission.
+ * Retrieve a beacon for transmission for the given vif.
  *
+ * @param vif_id  The vif whose beacon IRQ fired (selects mesh vs AP beacon when
+ *                both beacon concurrently).
  * @returns An mmpkt containing the beacon to be transmitted (or @c NULL on failure).
  */
-struct mmpkt *mmdrv_host_get_beacon(void);
+struct mmpkt *mmdrv_host_get_beacon(uint16_t vif_id);
 
 /**
  * Set the bandwidth of control response preambles.

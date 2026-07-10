@@ -2976,14 +2976,22 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
     }
 }
 
-/* MESH is mutually exclusive with the other vif types: remove anything active. */
+/*
+ * MESH must own the primary vif, so tear down any boot-time STA/SCAN/ADHOC
+ * before it. A concurrent AP is deliberately NOT torn down: mesh+AP co-channel
+ * is supported (the Mesh-gate), with AP on its own secondary vif. In the
+ * supported mesh-first bring-up no AP is up yet when this runs; and adding mesh
+ * on top of an existing AP is rejected earlier by
+ * umac_interface_type_is_compatible_with_active(), so an AP here would only
+ * arise from an unsupported ordering — leave it to the caller rather than
+ * silently destroying it.
+ */
 static void umac_mesh_tear_down_active_interfaces(struct umac_data *umacd)
 {
     struct umac_interface_data *iface = umac_data_get_interface(umacd);
     const enum umac_interface_type maybe_active[] = {
         UMAC_INTERFACE_STA,
         UMAC_INTERFACE_SCAN,
-        UMAC_INTERFACE_AP,
         UMAC_INTERFACE_ADHOC,
         UMAC_INTERFACE_NONE,
     };
@@ -3097,11 +3105,15 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
      * representing the mesh BSS, plus the mesh datapath ops. Without this the datapath
      * ops are NULL and any mgmt TX (e.g. Mesh Peering action frames) crashes. The mesh
      * BSSID is this node's own MAC. */
-    mesh_ctx.common_stad = umac_sta_data_alloc_static(umacd);
+    mesh_ctx.common_stad = umac_sta_data_alloc_static_mesh(umacd);
     if (mesh_ctx.common_stad != NULL)
     {
         umac_sta_data_set_bssid(mesh_ctx.common_stad, mesh_ctx.mesh_mac);
         umac_sta_data_set_peer_addr(mesh_ctx.common_stad, mesh_ctx.mesh_mac);
+        /* Tie the common stad to the mesh vif (mirrors the per-peer stads at :602 and Gap A's AP
+         * clients) so the gateway TX framing reads MESH from its vif_id rather than relying on the
+         * mesh primary vif happening to be 0. */
+        umac_sta_data_set_vif_id(mesh_ctx.common_stad, mesh_ctx.vif_id);
 #if MMWLAN_MESH_SEC_PHASE1
         /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB). */
         umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);

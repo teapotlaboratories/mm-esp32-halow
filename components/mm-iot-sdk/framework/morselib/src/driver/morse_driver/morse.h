@@ -193,8 +193,16 @@ struct driver_data
 
     struct
     {
-        uint16_t vif_id;
-        bool enabled;
+        /*
+         * Per-vif beaconing (mesh + AP concurrency). The firmware exposes one
+         * beacon IRQ per vif (MORSE_INT_BEACON_BASE_NUM + vif_id, up to
+         * MORSE_INT_BEACON_VIF_MASK_ALL = 8 vifs), so multiple interfaces can
+         * beacon at once. enabled_vif_mask: bit v set => beaconing on vif v.
+         * pending_vif_mask: bit v set by the beacon ISR, drained by the beacon
+         * work handler (atomic so the ISR OR and the task exchange don't race).
+         */
+        uint8_t enabled_vif_mask;
+        volatile atomic_uint_least32_t pending_vif_mask;
         uint32_t count;
         int (*beacon_work_fn)(struct driver_data *driverd);
     } beacon;
