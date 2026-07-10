@@ -53,7 +53,10 @@ static inline const char *umac_interface_type_to_str(enum umac_interface_type ty
 
 void umac_interface_init(struct umac_data *umacd)
 {
-    MM_UNUSED(umacd);
+    struct umac_interface_data *data = umac_data_get_interface(umacd);
+    /* 0 is a valid FW-assigned vif_id, so a zero-initialised struct would read
+     * as "AP secondary vif 0". Mark "no concurrent AP vif" explicitly. */
+    data->ap_vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
 }
 
 static void umac_interface_populate_device_mac_addr(struct umac_interface_data *data,
@@ -177,8 +180,17 @@ bool umac_interface_type_is_compatible_with_active(struct umac_interface_data *d
         return false;
     }
 
-    /* MESH is likewise exclusive with every other active type. */
-    if ((data->active_interface_types & UMAC_INTERFACE_MESH) && type != UMAC_INTERFACE_MESH)
+    /*
+     * MESH is exclusive with every other active type EXCEPT a concurrent AP.
+     * Mesh + AP co-channel on one radio (the "Mesh-gate") mirrors the Linux
+     * morse_driver iface_combination {AP, MESH} with num_different_channels = 1.
+     * Our host abstraction requires mesh to own the PRIMARY vif (a mesh on a
+     * secondary vif never joins — Linux recipe note), so ONLY the mesh-first
+     * ordering is supported: adding AP while MESH is active is allowed; adding
+     * MESH on top of an active AP is not (the second test below rejects it).
+     */
+    if ((data->active_interface_types & UMAC_INTERFACE_MESH) &&
+        type != UMAC_INTERFACE_MESH && type != UMAC_INTERFACE_AP)
     {
         return false;
     }
@@ -209,7 +221,38 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
     }
 
 
-    if (mac_addr != NULL)
+    /*
+     * A SoftAP added while a MESH is already active becomes a concurrent SECOND
+     * vif (the Mesh-gate): the mesh keeps the primary vif_id, the AP gets its
+     * own ap_vif_id. All other cases (device boot, STA<->AP swap on the primary
+     * vif) keep the legacy single-vif behaviour.
+     */
+    const bool ap_secondary = (type == UMAC_INTERFACE_AP) &&
+                              (data->active_interface_types & UMAC_INTERFACE_MESH);
+
+    if (ap_secondary)
+    {
+        /*
+         * Route the requested BSSID to the AP vif; do NOT clobber the mesh MAC.
+         * The AP MAC must differ from the mesh MAC — derive a distinct
+         * locally-administered address if the caller did not supply a usable one
+         * (mirrors the Linux recipe's `sed 's/^../3a/'` locally-admin AP MAC).
+         */
+        uint8_t derived[DOT11_MAC_ADDR_LEN];
+        const uint8_t *ap_mac = mac_addr;
+        if (ap_mac == NULL || mm_mac_addr_is_zero(ap_mac) ||
+            mm_mac_addr_is_equal(ap_mac, data->mac_addr))
+        {
+            /* Same convention as umac_ap_enable's fallback BSSID (bssid[0] ^= 0x02):
+             * flip the locally-administered bit so the AP vif MAC matches the BSSID
+             * the AP code advertises, while staying distinct from the mesh MAC. */
+            mac_addr_copy(derived, data->mac_addr);
+            derived[0] ^= 0x02;
+            ap_mac = derived;
+        }
+        mac_addr_copy(data->ap_mac_addr, ap_mac);
+    }
+    else if (mac_addr != NULL)
     {
         mac_addr_copy(data->mac_addr, mac_addr);
     }
@@ -277,6 +320,21 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
         ret = mmdrv_get_capabilities(data->vif_id, &data->capabilities);
         MMOSAL_ASSERT(ret == 0);
     }
+    else if (ap_secondary)
+    {
+        /*
+         * Concurrent AP alongside the active mesh: add a SECOND firmware vif and
+         * keep it in ap_vif_id. The mesh vif (data->vif_id) is left untouched, so
+         * unlike the swap branches below there is no rm_if / umac_ps_reset here.
+         */
+        ret = mmdrv_add_if(&data->ap_vif_id, data->ap_mac_addr, MMDRV_INTERFACE_TYPE_AP);
+        MMOSAL_ASSERT(ret == 0);
+        MMLOG_INF("Added concurrent AP vif_id=%u mac=" MM_MAC_ADDR_FMT
+                  " alongside mesh vif_id=%u\n",
+                  data->ap_vif_id,
+                  MM_MAC_ADDR_VAL(data->ap_mac_addr),
+                  data->vif_id);
+    }
     else if (!(data->active_interface_types & VIF_STA_INTERFACE_TYPES_MASK) &&
              (type & VIF_STA_INTERFACE_TYPES_MASK))
     {
@@ -307,11 +365,13 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
 
     data->active_interface_types |= type;
 
+    /* Non-secondary types drive the primary vif; a concurrent AP drives ap_vif_id. */
+    uint16_t used_vif_id = ap_secondary ? data->ap_vif_id : data->vif_id;
 
-    umac_interface_init_vif(umacd, type, data->vif_id);
+    umac_interface_init_vif(umacd, type, used_vif_id);
     if (vif_id)
     {
-        *vif_id = data->vif_id;
+        *vif_id = used_vif_id;
     }
 
     MMLOG_INF("%s interface added successfully (active=%x)\n",
@@ -342,6 +402,41 @@ void umac_interface_remove(struct umac_data *umacd, enum umac_interface_type typ
     if ((data->active_interface_types & type) == 0)
     {
         umac_interface_execute_inactive_cb(data);
+        return;
+    }
+
+    /*
+     * Removing the primary interface (mesh/STA) while a concurrent AP is still
+     * up would orphan the AP's secondary vif in the firmware. Tear the AP down
+     * first. The supported teardown order is AP-before-mesh, mirroring the
+     * mesh-before-AP bring-up; this keeps any order safe.
+     */
+    if (!(type & UMAC_INTERFACE_AP) &&
+        (data->active_interface_types & UMAC_INTERFACE_AP) &&
+        data->ap_vif_id != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        MMLOG_WRN("Removing primary %s with a concurrent AP active; tearing down AP first\n",
+                  umac_interface_type_to_str(type));
+        umac_interface_remove(umacd, UMAC_INTERFACE_AP);
+    }
+
+    /*
+     * Concurrent AP on the secondary vif: remove just that vif and leave the
+     * primary (mesh) interface running — no full driver deinit here.
+     */
+    if ((type & UMAC_INTERFACE_AP) && data->ap_vif_id != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        umac_twt_deinit_vif(umacd, &data->ap_vif_id);
+
+        int ret = mmdrv_rm_if(data->ap_vif_id);
+        if (ret != 0)
+        {
+            MMLOG_WRN("Failed to remove concurrent AP vif %u (%d)\n", data->ap_vif_id, ret);
+        }
+        data->ap_vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
+        data->active_interface_types &= ~((uint16_t)UMAC_INTERFACE_AP);
+
+        MMLOG_DBG("Removed concurrent AP vif, active=%u\n", data->active_interface_types);
         return;
     }
 
@@ -399,6 +494,7 @@ void umac_interface_remove(struct umac_data *umacd, enum umac_interface_type typ
         memcpy(&data->fw_version, &fw_version, sizeof(fw_version));
         data->morse_chip_id_string = chip_id_string;
         memcpy(&data->morse_chip_id, &chip_id, sizeof(chip_id));
+        data->ap_vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
 
         umac_ps_reset(umacd);
     }
@@ -413,6 +509,15 @@ bool umac_interface_is_active(struct umac_data *umacd)
 uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask)
 {
     struct umac_interface_data *data = umac_data_get_interface(umacd);
+
+    /* A concurrent AP lives on its own secondary vif; resolve AP requests there. */
+    if ((type_mask & UMAC_INTERFACE_AP) &&
+        (data->active_interface_types & UMAC_INTERFACE_AP) &&
+        data->ap_vif_id != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        return data->ap_vif_id;
+    }
+
     if (type_mask & data->active_interface_types)
     {
         return data->vif_id;
@@ -426,9 +531,24 @@ uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask)
 uint16_t umac_interface_get_vif_type_mask(struct umac_data *umacd, uint16_t vif_id)
 {
     struct umac_interface_data *data = umac_data_get_interface(umacd);
+
+    /* The secondary vif only ever serves the concurrent AP. */
+    if (data->ap_vif_id != UMAC_INTERFACE_VIF_ID_INVALID && vif_id == data->ap_vif_id)
+    {
+        return UMAC_INTERFACE_AP;
+    }
+
     if (data->vif_id == vif_id)
     {
-        return data->active_interface_types;
+        uint16_t mask = data->active_interface_types;
+        /* When an AP is concurrent it lives on the secondary vif, so the primary
+         * vif's type must not report AP (keeps supplicant TX-status routing to
+         * the mesh/STA context, not the AP context). */
+        if (data->ap_vif_id != UMAC_INTERFACE_VIF_ID_INVALID)
+        {
+            mask &= ~(uint16_t)UMAC_INTERFACE_AP;
+        }
+        return mask;
     }
     else
     {

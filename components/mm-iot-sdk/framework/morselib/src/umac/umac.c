@@ -1298,6 +1298,17 @@ enum mmwlan_status mmwlan_ap_enable(const struct mmwlan_ap_args *args)
 
 enum mmwlan_status mmwlan_ap_disable(void)
 {
+    /*
+     * Still a stub (Stage 2 follow-up). Runtime AP teardown is not on the
+     * mesh+AP bring-up path (the gateway runs both interfaces continuously), and
+     * a correct implementation must unwind the supplicant AP iface
+     * (umac_supp_remove_ap_interface -> wpa_supplicant_remove_iface) in the right
+     * order relative to umac_interface_remove(UMAC_INTERFACE_AP) to avoid a
+     * double vif remove / double free — that ordering needs on-air validation on
+     * the bench before it can ship. See docs/mesh-ap/rimba-mesh-ap-milestones.md
+     * §A3 Stage 2. The concurrent-AP secondary vif itself IS torn down correctly
+     * by umac_interface_remove() when the primary interface is removed.
+     */
     return MMWLAN_UNAVAILABLE;
 }
 
@@ -1394,9 +1405,12 @@ enum mmwlan_status mmwlan_tx_pkt(struct mmpkt *pkt, const struct mmwlan_tx_metad
 
     if (metadata->vif == MMWLAN_VIF_STA)
     {
-        if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA) == UMAC_INTERFACE_VIF_ID_INVALID)
+        /* A mesh gateway's mesh netif transmits on the STA host-slot (matching the RX
+         * demux), so accept STA-slot TX when either a STA or a mesh vif is active. */
+        if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA) == UMAC_INTERFACE_VIF_ID_INVALID &&
+            umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) == UMAC_INTERFACE_VIF_ID_INVALID)
         {
-            MMLOG_WRN("Unable to TX on STA VIF: not active\n");
+            MMLOG_WRN("Unable to TX on STA/mesh host-slot: not active\n");
             mmpkt_release(pkt);
             return MMWLAN_VIF_ERROR;
         }
@@ -1405,13 +1419,13 @@ enum mmwlan_status mmwlan_tx_pkt(struct mmpkt *pkt, const struct mmwlan_tx_metad
     {
         if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) == UMAC_INTERFACE_VIF_ID_INVALID)
         {
-            MMLOG_WRN("Unable to TX on STA VIF: not active\n");
+            MMLOG_WRN("Unable to TX on AP VIF: not active\n");
             mmpkt_release(pkt);
             return MMWLAN_VIF_ERROR;
         }
     }
 
-    return umac_datapath_tx_frame(umacd, pkt, ENCRYPTION_ENABLED, metadata->ra);
+    return umac_datapath_tx_frame(umacd, pkt, ENCRYPTION_ENABLED, metadata->ra, metadata->vif);
 }
 
 enum mmwlan_status mmwlan_tx_wait_until_ready(uint32_t timeout_ms)

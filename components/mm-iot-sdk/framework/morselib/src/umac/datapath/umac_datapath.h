@@ -88,10 +88,27 @@ enum umac_datapath_frame_encryption
 };
 
 
+/*
+ * @param vif  The egress vif the caller is transmitting on (the analog of
+ *             mac80211's info->control.vif). Used, when a mesh and a concurrent AP
+ *             are both up, to scope the stad lookup to the right interface so e.g. a
+ *             broadcast can be attributed to the AP subnet vs the mesh subnet. The
+ *             mesh netif uses MMWLAN_VIF_STA (the same host-slot the RX demux maps
+ *             mesh to); MMWLAN_VIF_UNSPECIFIED falls back to dest-MAC disambiguation.
+ */
 enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
                                           struct mmpkt *txbuf,
                                           enum umac_datapath_frame_encryption enc,
-                                          const uint8_t *ra);
+                                          const uint8_t *ra,
+                                          enum mmwlan_vif vif);
+
+/* True when a mesh and a concurrent AP are both active (the all-ESP Mesh-gate). */
+bool umac_datapath_gateway_active(struct umac_data *umacd);
+
+/* Install the gateway datapath ops (every stad-facing op dispatches by the stad's vif so BOTH
+ * the AP-client and mesh-peer stad sets are served). Called from configure_ap_mode when a mesh
+ * is already active. */
+void umac_datapath_configure_gateway_mode(struct umac_data *umacd);
 
 
 enum mmwlan_status umac_datapath_wait_for_tx_ready(struct umac_data *umacd, uint32_t timeout_ms);

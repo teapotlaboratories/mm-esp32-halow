@@ -342,7 +342,8 @@ int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
     driver_data.cfg = mmhal_get_chip();
     MMOSAL_ASSERT(driver_data.cfg != NULL);
 
-    driver_data.beacon.vif_id = 0xffff;
+    /* No vif is beaconing until morse_beacon_start(); memset above cleared the
+     * enabled/pending masks. */
 
     result = morse_trns_start(&driver_data);
     if (result != MORSE_SUCCESS)
@@ -705,9 +706,9 @@ int mmdrv_rm_if(uint16_t vif_id)
         return -ENODEV;
     }
 
-    if (vif_id == driver_data.beacon.vif_id)
+    if (driver_data.beacon.enabled_vif_mask & (uint8_t)(1u << vif_id))
     {
-        morse_beacon_stop(&driver_data);
+        morse_beacon_stop(&driver_data, vif_id);
     }
 
     struct morse_cmd_req_remove_interface cmd =

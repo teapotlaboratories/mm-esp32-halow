@@ -9,6 +9,7 @@
 #include "umac_keys_data.h"
 #include "connection_keys.h"
 #include "umac/mesh/umac_mesh.h"
+#include "umac/interface/umac_interface.h"
 #include "mmdrv.h"
 #include "mmlog.h"
 
@@ -19,14 +20,23 @@ void umac_keys_init(struct umac_sta_data *stad)
 }
 
 
-static enum mmwlan_status umac_keys_mmdrv_install_key(uint16_t vif_id,
+static enum mmwlan_status umac_keys_mmdrv_install_key(struct umac_data *umacd,
+                                                      uint16_t vif_id,
                                                       uint16_t aid,
                                                       struct umac_key *key)
 {
     /* #P5b — mesh SW crypto: keep the CCMP data keys (pairwise MTK / group MGTK) host-side only; do NOT
      * offload to the firmware. With no FW key the MM6108 delivers protected mesh frames raw to the host
-     * (#20 no-key test), which is what lets the host decrypt a forwarded A4!=TA frame the FW can't. */
-    if (umac_mesh_is_active() && umac_mesh_sw_crypto_enabled() &&
+     * (#20 no-key test), which is what lets the host decrypt a forwarded A4!=TA frame the FW can't.
+     *
+     * This must be scoped to the MESH vif's keys ONLY, not "any key while a mesh is active". In the
+     * all-ESP Mesh-gate a mesh (SW crypto) and a concurrent AP (FW HW crypto) run together: gating on
+     * umac_mesh_is_active() alone wrongly skipped the AP client's FW key install too, leaving the AP's
+     * HW_ENC downlink with no firmware key -> the MM6108 silently drops it. The AP vif uses HW crypto
+     * like morse_driver, so only the mesh vif's keys stay host-side. */
+    bool key_on_mesh_vif =
+        (umac_interface_get_vif_type_mask(umacd, vif_id) & UMAC_INTERFACE_MESH) != 0;
+    if (key_on_mesh_vif && umac_mesh_sw_crypto_enabled() &&
         ((key->key_type == UMAC_KEY_TYPE_PAIRWISE) || (key->key_type == UMAC_KEY_TYPE_GROUP)))
     {
         MMLOG_DBG("Mesh SW crypto: key %u (type %u) kept host-side, no FW offload\n",
@@ -77,7 +87,7 @@ enum mmwlan_status umac_keys_install_key(struct umac_sta_data *stad,
 
     MMLOG_DBG("Installing key %u\n", key->key_id);
 
-    return umac_keys_mmdrv_install_key(vif_id, aid, key);
+    return umac_keys_mmdrv_install_key(umac_sta_data_get_umacd(stad), vif_id, aid, key);
 }
 
 enum mmwlan_status umac_keys_uninstall_key(struct umac_sta_data *stad,
@@ -120,7 +130,8 @@ enum mmwlan_status umac_keys_reinstall_keys(struct umac_sta_data *stad, uint16_t
         struct umac_key *key = sta_data->keys.keys[ii];
         if (key != NULL)
         {
-            enum mmwlan_status status = umac_keys_mmdrv_install_key(vif_id, aid, key);
+            enum mmwlan_status status =
+                umac_keys_mmdrv_install_key(umac_sta_data_get_umacd(stad), vif_id, aid, key);
             if (status != MMWLAN_SUCCESS)
             {
                 MMLOG_ERR("Failed to reinstall key %u\n", key->key_id);

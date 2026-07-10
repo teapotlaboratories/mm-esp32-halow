@@ -224,6 +224,11 @@ enum mmwlan_status umac_ap_start(struct umac_data *umacd, const struct umac_ap_c
         goto failure;
     }
 
+    /* sta_common carries group-addressed / fallback TX for this AP; tie it to the
+     * AP vif too (data->vif_id is now resolved, = ap_vif_id when secondary). Same
+     * sta->sdata->vif linkage as the per-client stads in umac_ap_add_sta. */
+    umac_sta_data_set_vif_id(data->sta_common, data->vif_id);
+
     umac_datapath_configure_ap_mode(umacd);
 
     const struct dot11_ie_s1g_operation *dot11_s1g_op =
@@ -582,6 +587,13 @@ enum mmwlan_status umac_ap_add_sta(struct umac_data *umacd,
     umac_sta_data_set_bssid(stad, data->config.bssid);
     umac_sta_data_set_peer_addr(stad, sta_info->mac_addr);
     umac_sta_data_set_security(stad, data->args.security_type, data->args.pmf_mode);
+    /* Tie the client to the vif it associated on — the analog of mac80211's
+     * sta->sdata->vif linkage (morse_driver tags each TX frame with the egress
+     * vif's id, mac.c:978). Mirrors the mesh path (umac_mesh.c sets the peer
+     * stad's vif_id). data->vif_id is ap_vif_id when the AP is the concurrent
+     * secondary vif (Stage 1), so this is what lets the datapath frame + tag AP
+     * traffic on the AP vif rather than defaulting to the primary (mesh) vif. */
+    umac_sta_data_set_vif_id(stad, data->vif_id);
 
 
     uint8_t sgi_flags = 0;

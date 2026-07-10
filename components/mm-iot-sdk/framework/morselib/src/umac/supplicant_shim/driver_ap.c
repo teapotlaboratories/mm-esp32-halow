@@ -654,7 +654,8 @@ static int mmwpas_hapd_send_eapol(void *priv,
         umac_datapath_tx_frame(umacd,
                                txbuf,
                                encrypt ? ENCRYPTION_ENABLED : ENCRYPTION_DISABLED,
-                               NULL);
+                               NULL,
+                               MMWLAN_VIF_UNSPECIFIED);
     if (status == MMWLAN_SUCCESS)
     {
         return 0;
