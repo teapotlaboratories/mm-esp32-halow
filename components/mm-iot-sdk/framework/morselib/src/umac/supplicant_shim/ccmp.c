@@ -8,16 +8,145 @@
 
 #include "umac/keys/umac_keys.h"
 #include "dot11/dot11.h"
+#include <mbedtls/aes.h>
 
-/* AES-CCM (RFC 3610) from the hostap lib (P5a), via the mmint_ shim. ae: encrypt+auth; ad:
- * decrypt+verify (0 = MIC OK). NOT in-place safe: aes_ccm_encr writes the keystream into `out` before
- * XOR-ing `in`, so out==in yields zeros — callers must pass non-aliasing in/out buffers. */
-extern int mmint_aes_ccm_ae(const uint8_t *key, size_t key_len, const uint8_t *nonce, size_t M,
-                            const uint8_t *plain, size_t plain_len, const uint8_t *aad, size_t aad_len,
-                            uint8_t *crypt, uint8_t *auth);
-extern int mmint_aes_ccm_ad(const uint8_t *key, size_t key_len, const uint8_t *nonce, size_t M,
-                            const uint8_t *crypt, size_t crypt_len, const uint8_t *aad, size_t aad_len,
-                            const uint8_t *auth, uint8_t *plain);
+/* ===== Bulk-DMA AES-CCM (RFC 3610) for the mesh datapath ========================================
+ * Replaces hostap aes-ccm.c's ~2·ceil(len/16) single-block HW-AES-ECB ops (each paying the full esp_aes
+ * acquire/DMA-setup/heap/release wrapper + AES_LOCK churn) with THREE bulk HW-AES passes: one
+ * mbedtls_aes_crypt_cbc (CBC-MAC over [B0 | len16‖AAD zero-pad | plaintext zero-pad], IV=0; MAC = last
+ * block), one mbedtls_aes_crypt_ctr (from counter A_1), one ECB for S_0; MIC = T^S_0. Byte-identical to
+ * hostap/mbedtls CCM (RFC-3610 KAT in esp_mesh_ccm_selftest) so MICs interop with Linux/mac80211. L=2,
+ * aad<=30, M in {8,16}. Called ONLY from the single-task mesh datapath, so the static CBC scratch is
+ * race-free. IN-PLACE SAFE: the CBC-MAC is taken over the scratch copy before the in==out-safe CTR pass,
+ * so body_out == body_in is fine (the datapath crypts directly in the mmpkt). */
+#define ESP_CCM_BODY_MAX 1600
+#define ESP_CCM_CBC_MAX  (16 + 32 + (((ESP_CCM_BODY_MAX) + 15) & ~15))
+
+static void esp_ccm_cbc_mac(mbedtls_aes_context *ctx, size_t M, const uint8_t *nonce,
+                            const uint8_t *aad, size_t aad_len, const uint8_t *data, size_t data_len,
+                            uint8_t T[16])
+{
+    static uint8_t cbc_in[ESP_CCM_CBC_MAX];
+    static uint8_t cbc_out[ESP_CCM_CBC_MAX];
+    size_t off;
+    cbc_in[0] = (uint8_t)((aad_len ? 0x40 : 0) | (((M - 2) / 2) << 3) | 1u /* L-1 */);
+    memcpy(&cbc_in[1], nonce, 13);
+    cbc_in[14] = (uint8_t)((data_len >> 8) & 0xff);
+    cbc_in[15] = (uint8_t)(data_len & 0xff);
+    off = 16;
+    if (aad_len)
+    {
+        cbc_in[off] = (uint8_t)((aad_len >> 8) & 0xff);
+        cbc_in[off + 1] = (uint8_t)(aad_len & 0xff);
+        memcpy(&cbc_in[off + 2], aad, aad_len);
+        size_t at = 2 + aad_len;
+        size_t ap = (at + 15) & ~(size_t)15;
+        memset(&cbc_in[off + at], 0, ap - at);
+        off += ap;
+    }
+    memcpy(&cbc_in[off], data, data_len);
+    size_t dp = (data_len + 15) & ~(size_t)15;
+    memset(&cbc_in[off + data_len], 0, dp - data_len);
+    off += dp;
+    uint8_t iv[16] = { 0 };
+    mbedtls_aes_crypt_cbc(ctx, MBEDTLS_AES_ENCRYPT, off, iv, cbc_in, cbc_out);
+    memcpy(T, &cbc_out[off - 16], 16);
+}
+
+static int esp_mesh_ccm_ae(const uint8_t *key, size_t key_len, const uint8_t *nonce, size_t M,
+                           const uint8_t *plain, size_t plain_len, const uint8_t *aad, size_t aad_len,
+                           uint8_t *crypt, uint8_t *auth)
+{
+    if (aad_len > 30 || M > 16 || plain_len > ESP_CCM_BODY_MAX)
+    {
+        return -1;
+    }
+    mbedtls_aes_context ctx;
+    mbedtls_aes_init(&ctx);
+    if (mbedtls_aes_setkey_enc(&ctx, key, key_len * 8) != 0)
+    {
+        mbedtls_aes_free(&ctx);
+        return -1;
+    }
+    uint8_t T[16];
+    esp_ccm_cbc_mac(&ctx, M, nonce, aad, aad_len, plain, plain_len, T);
+    uint8_t A1[16];
+    A1[0] = 1u; /* Flags = L-1 */
+    memcpy(&A1[1], nonce, 13);
+    A1[14] = 0;
+    A1[15] = 1;
+    uint8_t stream[16];
+    size_t nc_off = 0;
+    mbedtls_aes_crypt_ctr(&ctx, plain_len, &nc_off, A1, stream, plain, crypt);
+    uint8_t A0[16], S0[16];
+    memcpy(A0, A1, 16);
+    A0[14] = 0;
+    A0[15] = 0;
+    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, A0, S0);
+    for (size_t i = 0; i < M; i++)
+    {
+        auth[i] = (uint8_t)(T[i] ^ S0[i]);
+    }
+    mbedtls_aes_free(&ctx);
+    return 0;
+}
+
+static int esp_mesh_ccm_ad(const uint8_t *key, size_t key_len, const uint8_t *nonce, size_t M,
+                           const uint8_t *crypt, size_t crypt_len, const uint8_t *aad, size_t aad_len,
+                           const uint8_t *auth, uint8_t *plain)
+{
+    if (aad_len > 30 || M > 16 || crypt_len > ESP_CCM_BODY_MAX)
+    {
+        return -1;
+    }
+    mbedtls_aes_context ctx;
+    mbedtls_aes_init(&ctx);
+    if (mbedtls_aes_setkey_enc(&ctx, key, key_len * 8) != 0)
+    {
+        mbedtls_aes_free(&ctx);
+        return -1;
+    }
+    uint8_t A1[16];
+    A1[0] = 1u;
+    memcpy(&A1[1], nonce, 13);
+    A1[14] = 0;
+    A1[15] = 1;
+    uint8_t stream[16];
+    size_t nc_off = 0;
+    mbedtls_aes_crypt_ctr(&ctx, crypt_len, &nc_off, A1, stream, crypt, plain); /* CTR is symmetric */
+    uint8_t T[16];
+    esp_ccm_cbc_mac(&ctx, M, nonce, aad, aad_len, plain, crypt_len, T);
+    uint8_t A0[16], S0[16];
+    memcpy(A0, A1, 16);
+    A0[14] = 0;
+    A0[15] = 0;
+    mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, A0, S0);
+    mbedtls_aes_free(&ctx);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < M; i++)
+    {
+        diff |= (uint8_t)((T[i] ^ S0[i]) ^ auth[i]); /* constant-time MIC compare */
+    }
+    return diff ? -1 : 0;
+}
+
+/* RFC-3610 Packet-Vector-#1 known-answer test + decrypt round-trip. Returns 0 = PASS. Not called at
+ * runtime by default (correctness is proven); available for a boot check. */
+int esp_mesh_ccm_selftest(void)
+{
+    static const uint8_t key[16] = { 0xC0,0xC1,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xCB,0xCC,0xCD,0xCE,0xCF };
+    static const uint8_t nonce[13] = { 0x00,0x00,0x00,0x03,0x02,0x01,0x00,0xA0,0xA1,0xA2,0xA3,0xA4,0xA5 };
+    static const uint8_t aad[8] = { 0,1,2,3,4,5,6,7 };
+    static const uint8_t pt[23] = { 8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30 };
+    static const uint8_t exp_ct[23] = { 0x58,0x8C,0x97,0x9A,0x61,0xC6,0x63,0xD2,0xF0,0x66,0xD0,0xC2,0xC0,0xF9,0x89,0x80,0x6D,0x5F,0x6B,0x61,0xDA,0xC3,0x84 };
+    static const uint8_t exp_mic[8] = { 0x17,0xE8,0xD1,0x2C,0xFD,0xF9,0x26,0xE0 };
+    uint8_t ct[23], mic[8], dec[23];
+    int bad = esp_mesh_ccm_ae(key, 16, nonce, 8, pt, 23, aad, 8, ct, mic) != 0 ||
+              memcmp(ct, exp_ct, 23) != 0 || memcmp(mic, exp_mic, 8) != 0 ||
+              esp_mesh_ccm_ad(key, 16, nonce, 8, ct, 23, aad, 8, mic, dec) != 0 ||
+              memcmp(dec, pt, 23) != 0;
+    return bad ? -1 : 0;
+}
 
 
 #define CCMP_HEADER_KEY_OCT_KEY_ID 0xC0
@@ -161,7 +290,7 @@ int mesh_ccmp_encrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, uint
     size_t aad_len;
     mesh_ccmp_write_header(ccmp_hdr, pn, key_id);
     mesh_ccmp_aad_nonce(hdr, ccmp_hdr, aad, &aad_len, nonce);
-    return mmint_aes_ccm_ae(tk, tk_len, nonce, mlen, body_in, body_len, aad, aad_len, body_out, mic);
+    return esp_mesh_ccm_ae(tk, tk_len, nonce, mlen, body_in, body_len, aad, aad_len, body_out, mic);
 }
 
 /* Decrypt `ct_in[0..ct_len)` into `pt_out` under `tk` + verify `mic` (M bytes). `ccmp_hdr` is the
@@ -173,5 +302,5 @@ int mesh_ccmp_decrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, cons
     uint8_t aad[30], nonce[13];
     size_t aad_len;
     mesh_ccmp_aad_nonce(hdr, ccmp_hdr, aad, &aad_len, nonce);
-    return mmint_aes_ccm_ad(tk, tk_len, nonce, mlen, ct_in, ct_len, aad, aad_len, mic, pt_out);
+    return esp_mesh_ccm_ad(tk, tk_len, nonce, mlen, ct_in, ct_len, aad, aad_len, mic, pt_out);
 }
