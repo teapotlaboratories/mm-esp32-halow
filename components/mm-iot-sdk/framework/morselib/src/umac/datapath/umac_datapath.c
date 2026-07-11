@@ -671,14 +671,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     struct umac_8023_hdr header_8023 = { 0 };
     bool mesh_ctrl_present = false;
 
-    /* Forced-topology test: drop mesh data frames whose immediate transmitter (TA) isn't an
-     * allowed neighbour, so a node only exchanges data via its chosen relay even though all
-     * bench nodes are in RF range. No-op when the allowlist is empty (normal operation). */
-    if (umac_mesh_is_active() && !umac_mesh_peer_allowed(dot11_get_ta(header)))
-    {
-        goto drop;
-    }
-
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
         const struct dot11_qos_ctrl *qos_control =
@@ -693,6 +685,16 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
             tid_index = dot11_qos_control_get_tid(qos_control->field);
         }
+    }
+
+    /* Forced-topology test (bench): drop MESH data frames whose immediate transmitter (TA) isn't an
+     * allowed neighbour, so a node exchanges mesh data only via its chosen relay even though all bench
+     * nodes are in RF range. Gated on mesh_ctrl_present (802.11s Mesh Control header) so it applies ONLY
+     * to mesh frames — NOT to concurrent AP-client frames on a mesh+AP node (an AP client's data has no
+     * Mesh Control header, so it is never filtered here). No-op when the allowlist is empty (normal ops). */
+    if (mesh_ctrl_present && !umac_mesh_peer_allowed(dot11_get_ta(header)))
+    {
+        goto drop;
     }
 
 
