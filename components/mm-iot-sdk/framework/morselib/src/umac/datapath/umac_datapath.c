@@ -522,8 +522,6 @@ static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
 static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmpktview *view,
                                           enum umac_key_type key_type, int key_id)
 {
-    static uint8_t ct_scratch[MESH_SW_CCMP_BODY_MAX];
-
     const uint8_t *tk = umac_keys_get_key_data(stad, (uint8_t)key_id);
     size_t tk_len = umac_keys_get_key_len(stad, (uint8_t)key_id);
     if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
@@ -546,9 +544,9 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
         return false;
     }
     size_t body_len = total - hdr_total;
-    if (body_len > sizeof(ct_scratch))
+    if (body_len > MESH_SW_CCMP_BODY_MAX)
     {
-        MMLOG_WRN("Mesh SW CCMP TX: body %u > scratch\n", (unsigned)body_len);
+        MMLOG_WRN("Mesh SW CCMP TX: body %u > max\n", (unsigned)body_len);
         return false;
     }
 
@@ -558,8 +556,11 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
     uint8_t ccmp_hdr[DOT11_CCMP_HEADER_LEN];
     uint8_t mic[DOT11_CCMP_256_MIC_LEN];
     uint8_t *body = hdr + hdr_total;
+    /* Encrypt the body IN PLACE (bulk CCM CTR is in==out safe; the CBC-MAC is taken over a scratch copy
+     * before the CTR overwrites). The prepend+memmove below shifts only the MAC header, so the ciphertext
+     * stays put right after the opened CCMP slot — no copy-back needed. */
     if (mesh_ccmp_encrypt(tk, tk_len, hdr, ccmp_hdr, pn, (uint8_t)key_id,
-                          body, ct_scratch, body_len, mic) != 0)
+                          body, body, body_len, mic) != 0)
     {
         return false;
     }
@@ -579,7 +580,7 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
     memmove(start, start + DOT11_CCMP_HEADER_LEN, hdr_total);
     uint8_t *ccmp_slot = start + hdr_total;
     memcpy(ccmp_slot, ccmp_hdr, DOT11_CCMP_HEADER_LEN);
-    memcpy(ccmp_slot + DOT11_CCMP_HEADER_LEN, ct_scratch, body_len);
+    /* ciphertext already in place at ccmp_slot + CCMP_HEADER_LEN (encrypted in-place above) */
     memcpy(mmpkt_append(view, mic_len), mic, mic_len);
     return true;
 }
@@ -595,8 +596,6 @@ static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmp
                                           const struct dot11_data_hdr *data_hdr,
                                           enum umac_key_rx_counter_space space)
 {
-    static uint8_t pt_scratch[MESH_SW_CCMP_BODY_MAX];
-
     size_t avail = mmpkt_get_data_length(view);
     if (avail < DOT11_CCMP_HEADER_LEN)
     {
@@ -618,15 +617,17 @@ static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmp
         return false;
     }
     size_t body_len = avail - DOT11_CCMP_HEADER_LEN - mic_len;
-    if (body_len > sizeof(pt_scratch))
+    if (body_len > MESH_SW_CCMP_BODY_MAX)
     {
         return false;
     }
-    const uint8_t *ct = ccmp_hdr + DOT11_CCMP_HEADER_LEN;
+    uint8_t *ct = ccmp_hdr + DOT11_CCMP_HEADER_LEN;
     const uint8_t *mic = ct + body_len;
 
+    /* Decrypt IN PLACE (bulk CCM CTR is in==out safe); after stripping the CCMP header below, the
+     * plaintext is already where the data starts — no copy-back. */
     if (mesh_ccmp_decrypt(tk, tk_len, (const uint8_t *)data_hdr, ccmp_hdr,
-                          ct, pt_scratch, body_len, mic) != 0)
+                          ct, ct, body_len, mic) != 0)
     {
         return false; /* MIC failure */
     }
@@ -637,7 +638,7 @@ static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmp
     }
 
     (void)mmpkt_remove_from_start(view, DOT11_CCMP_HEADER_LEN);
-    memcpy(mmpkt_get_data_start(view), pt_scratch, body_len);
+    /* plaintext already in place (decrypted in-place above); just drop the CCMP header + MIC */
     if (mmpkt_remove_from_end(view, mic_len) == NULL)
     {
         return false;
