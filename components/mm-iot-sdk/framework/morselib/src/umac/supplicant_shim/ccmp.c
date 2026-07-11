@@ -18,7 +18,13 @@
  * hostap/mbedtls CCM (RFC-3610 KAT in esp_mesh_ccm_selftest) so MICs interop with Linux/mac80211. L=2,
  * aad<=30, M in {8,16}. Called ONLY from the single-task mesh datapath, so the static CBC scratch is
  * race-free. IN-PLACE SAFE: the CBC-MAC is taken over the scratch copy before the in==out-safe CTR pass,
- * so body_out == body_in is fine (the datapath crypts directly in the mmpkt). */
+ * so body_out == body_in is fine (the datapath crypts directly in the mmpkt).
+ *
+ * Provenance: original implementation of RFC 3610 (CCM), structured for BYTE-PARITY with the per-block
+ * hostap aes-ccm.c it replaces (framework/src/hostap/src/crypto/aes-ccm.c) so MICs still match Linux/
+ * mac80211; built on the mbedtls bulk-AES primitives. NOT derived from mbedtls_ccm.c (which loops
+ * per-block ECB = the overhead removed) — that + the RFC-3610 Packet-Vector-#1 KAT are used only as
+ * oracles in esp_mesh_ccm_selftest. Full provenance + rationale: PR teapotlaboratories/mm-esp32-halow#22. */
 #define ESP_CCM_BODY_MAX 1600
 #define ESP_CCM_CBC_MAX  (16 + 32 + (((ESP_CCM_BODY_MAX) + 15) & ~15))
 
