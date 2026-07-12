@@ -371,7 +371,8 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
          * dropped here and we never emit a PREP, so a Linux peer can't resolve a path to us. */
         if (!dot11_frame_control_get_protected(frame_control_le) &&
             umac_sta_data_pmf_is_required(stad) &&
-            !frame_is_mesh_action(rxbufview))
+            !frame_is_mesh_action(rxbufview) &&
+            !frame_is_block_ack_action(rxbufview))
         {
             const uint8_t *frame_data = mmpkt_get_data_start(rxbufview) + sizeof(*header);
             size_t frame_data_len = mmpkt_get_data_length(rxbufview) - sizeof(*header);
@@ -3640,6 +3641,25 @@ static void umac_datapath_process_rx_mgmt_frame_mesh(struct umac_data *umacd,
 
     if (subtype == DOT11_FC_SUBTYPE_ACTION)
     {
+        /* Block Ack action frames (ADDBA req/resp, DELBA) drive the per-peer BA session for A-MPDU:
+         * route them to the BA state machine keyed on the TRANSMITTING peer's stad, mirroring
+         * net/mac80211 ieee80211_rx_h_action's `case WLAN_CATEGORY_BACK` (rx.c) which is reached for a
+         * MESH_POINT vif. The passed stad is the mesh common stad (MM_UNUSED); the BA agreement is
+         * per-link, so resolve the peer stad from the frame's SA (A2 = the transmitting neighbour).
+         * Everything else (MPM/AMPE peering, HWMP path selection) stays with the mesh action handler. */
+        const struct dot11_action *action =
+            (const struct dot11_action *)mmpkt_get_data_start(rxbufview);
+        if (action->field.category == DOT11_ACTION_CATEGORY_BLOCK_ACK)
+        {
+            struct umac_sta_data *peer_stad = umac_mesh_get_peer_stad(dot11_get_sa(header));
+            if (peer_stad != NULL)
+            {
+                umac_ba_process_rx_frame(peer_stad,
+                                         mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            }
+            return;
+        }
         umac_mesh_handle_action(umacd, rxbufview);
     }
     else if (subtype == DOT11_FC_SUBTYPE_AUTH)
