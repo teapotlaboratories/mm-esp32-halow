@@ -371,8 +371,7 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
          * dropped here and we never emit a PREP, so a Linux peer can't resolve a path to us. */
         if (!dot11_frame_control_get_protected(frame_control_le) &&
             umac_sta_data_pmf_is_required(stad) &&
-            !frame_is_mesh_action(rxbufview) &&
-            !frame_is_block_ack_action(rxbufview))
+            !frame_is_mesh_action(rxbufview))
         {
             const uint8_t *frame_data = mmpkt_get_data_start(rxbufview) + sizeof(*header);
             size_t frame_data_len = mmpkt_get_data_length(rxbufview) - sizeof(*header);

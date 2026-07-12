@@ -604,7 +604,14 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             umac_sta_data_set_bssid(p->stad, mesh_ctx.mesh_mac);
             umac_sta_data_set_peer_addr(p->stad, mac);
 #if MMWLAN_MESH_SEC_PHASE1
-            umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+            /* MFP=no (PMF_DISABLED), matching net/mac80211: a mesh peer's sta is MFP=no, so mac80211 sends
+             * ALL mesh management UNPROTECTED (HWMP PREQ/PREP, MPM/AMPE, Block Ack ADDBA/DELBA) and gates
+             * its unprotected-robust-mgmt RX drop on WLAN_STA_MFP. Keeping SAE (security_type != OPEN) still
+             * installs the pairwise/group keys for DATA CCMP — only pmf_is_required (management protection,
+             * umac_datapath.c:2584 TX / :373 RX) is turned off, so we stop pairwise-encrypting unicast robust
+             * mesh mgmt. That fixes the interop asymmetry where the ESP transmitted ADDBA/unicast-PREP
+             * CCMP-protected while a MFP=no Linux peer sends them in the clear (and would reject ours). */
+            umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
             /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
              * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
             mmint_crypto_get_random(p->my_nonce, sizeof(p->my_nonce));
@@ -3115,8 +3122,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
          * mesh primary vif happening to be 0. */
         umac_sta_data_set_vif_id(mesh_ctx.common_stad, mesh_ctx.vif_id);
 #if MMWLAN_MESH_SEC_PHASE1
-        /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB). */
-        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+        /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB).
+         * PMF_DISABLED (MFP=no) matches net/mac80211 — mesh management is sent unprotected; see the
+         * per-peer set_security rationale above. */
+        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
         /* P2c: generate this node's own MGTK once per mesh session, before any peering Open carries
          * it (mac80211 __mesh_rsn_auth_init). The install onto the common stad stays deferred to first
          * ESTAB (umac_mesh_install_common_keys) — a group key at start breaks OPEN peering (P1 gotcha). */

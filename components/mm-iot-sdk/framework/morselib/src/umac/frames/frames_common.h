@@ -33,9 +33,4 @@ bool frame_is_group_privacy_action(struct mmpktview *view);
  * from the unprotected-robust-mgmt RX drop. Broader than frame_is_group_privacy_action (no group-DA req). */
 bool frame_is_mesh_action(struct mmpktview *view);
 
-/* Block Ack (category 3) Action frame — ADDBA req/resp, DELBA. Mesh peers exchange these MFP=no, so
- * mac80211 delivers them unprotected (drop gated on WLAN_STA_MFP); exempt from the unprotected-robust-mgmt
- * RX drop so a mesh BA session can complete (A-MPDU). */
-bool frame_is_block_ack_action(struct mmpktview *view);
-
 

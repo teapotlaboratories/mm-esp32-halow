@@ -89,27 +89,6 @@ bool frame_is_mesh_action(struct mmpktview *view)
            frame->field.category == DOT11_ACTION_CATEGORY_MULTIHOP;
 }
 
-/* A Block Ack (category 3) Action frame — ADDBA request/response, DELBA. Like the mesh path-selection
- * actions above, mesh peers exchange these with MFP=no (chronite `iw station dump` -> `MFP: no`), so
- * net/mac80211 never subjects them to the unprotected-robust-mgmt RX drop: ieee80211_drop_unencrypted_mgmt
- * gates that drop on test_sta_flag(rx->sta, WLAN_STA_MFP), false for a mesh peer, so an unprotected BACK
- * from a mesh peer reaches ieee80211_rx_h_action's `case WLAN_CATEGORY_BACK` (rx.c). Block Ack is otherwise
- * robust (frame_is_robust_action -> default true), and the morse mesh stad is (incorrectly) PMF_REQUIRED, so
- * we mirror mac80211's behaviour by exempting it from the drop — without which the peer's ADDBA response is
- * dropped and no BA session can ever complete on a mesh link (no A-MPDU). */
-bool frame_is_block_ack_action(struct mmpktview *view)
-{
-    const struct dot11_action *frame = (struct dot11_action *)mmpkt_get_data_start(view);
-
-    if (!(dot11_frame_control_get_type(frame->hdr.frame_control) == DOT11_FC_TYPE_MGMT) ||
-        !(dot11_frame_control_get_subtype(frame->hdr.frame_control) == DOT11_FC_SUBTYPE_ACTION))
-    {
-        return false;
-    }
-
-    return frame->field.category == DOT11_ACTION_CATEGORY_BLOCK_ACK;
-}
-
 void frame_action_build(struct umac_data *umacd, struct consbuf *buf, void *args)
 {
     MM_UNUSED(umacd);
