@@ -207,6 +207,11 @@ void mmhal_wlan_send_training_seq(void)
     spi_master_rw(buf, NULL, BYTE_TRAIN);
 }
 
+/* FIX-1 invariant (load-bearing): gpio_isr_handler_add here sets the per-pin int_ena for SPI_IRQ. The
+ * bus-preserving soft hw_restart (morse_trns_soft_stop/start) NEVER removes this handler, so int_ena
+ * persists across a soft restart and gpio_set_intr_type(GPIO_INTR_LOW_LEVEL) in mmhal_wlan_set_spi_irq_enabled
+ * alone re-arms the interrupt. Any change that removes the SPI_IRQ handler on the soft path
+ * (gpio_isr_handler_remove / gpio_intr_disable) would clear int_ena and SILENTLY KILL RX with no crash. */
 void mmhal_wlan_register_spi_irq_handler(mmhal_irq_handler_t handler)
 {
     spi_irq_handler = handler;

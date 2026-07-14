@@ -412,10 +412,17 @@ static void umac_mesh_invalidate_paths_via(const uint8_t *next_hop);
 #define MESH_PLINK_MAX_RETRIES       (16)  /* ~5 s of silence (counter resets on any RX) before
                                             * giving up — avoids tearing down an active handshake */
 #define MESH_PLINK_HOLDING_TICKS     (2)
-/* Established-peer inactivity (mac80211 mesh_sta_cleanup / ieee80211_sta_expire with
- * mshcfg.plink_timeout). With ~100 ms beacons, no frame from a peer for this long means the
- * link is broken: close it, flush paths through it (-> PERR), and free the slot. */
-#define MESH_PLINK_INACTIVITY_MS     (6000)
+/* Established-peer inactivity teardown — mirror Linux mac80211 mesh housekeeping. Linux expires a
+ * mesh peer only after mshcfg.plink_timeout of no activity (ieee80211_sta_expire, sta_info.c:1616;
+ * driven by ieee80211_mesh_housekeeping, mesh.c:911), default MESH_DEFAULT_PLINK_TIMEOUT = 1800 s
+ * (net/wireless/mesh.c:26), evaluated lazily on a 60 s housekeeping tick (mesh.h:221). "Activity" is
+ * last_rx, refreshed by the peer's beacon (mesh_plink.c:446, our umac_mesh_handle_peer_beacon) AND by
+ * ANY received frame incl. data (rx.c:4810 fast-RX / rx.c:1770, our umac_mesh_note_peer_rx).
+ * The prior 6000 ms was ~300x too aggressive: at ~100 ms beacons it tolerated only ~60 missed beacons,
+ * so a brief RX fade tore the link down and forced a fresh SAE re-peer (under user-MPM secured mesh,
+ * __mesh_plink_deactivate silently destroys the sta, mesh_plink.c:410 — no Close, full re-SAE to recover).
+ * Match Linux's window so marginal RX rides through; close + flush paths (-> PERR) only after this. */
+#define MESH_PLINK_INACTIVITY_MS     (1800u * 1000u) /* 1800 s = Linux MESH_DEFAULT_PLINK_TIMEOUT */
 
 /* Peer-link states (mirror NL80211_PLINK_*). */
 enum mesh_plink_state
@@ -630,6 +637,10 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
 /* Release a peer slot, freeing its per-peer stad (heap; the common_stad is static — never freed). */
 static void mesh_peer_free(struct mesh_peer *peer)
 {
+    if (peer->state == MESH_PLINK_ESTAB)
+    {
+        g_plink_close++; /* TEMP plink-flap telemetry: an ESTABLISHED plink is being torn down */
+    }
     /* Free the SAE protocol instance (sae_data + bignum scratch) — mirrors sta_info.c:427-428. This
      * single site covers every teardown path (HOLDING, inactivity, CLOSE RX, llid mismatch, stop). */
     if (peer->sae != NULL)
@@ -1379,6 +1390,24 @@ uint8_t mmwlan_mesh_peer_count(uint8_t estab_macs[][6])
         }
     }
     return n;
+}
+
+/* Refresh a peer's liveness on ANY received (decrypted) frame from it, mirroring Linux updating
+ * sta->deflink.rx_stats.last_rx on every frame (rx.c:4810 fast-RX path / rx.c:1771 general path).
+ * Called from the mesh data RX path with the frame's TA (immediate transmitter = the peer we heard
+ * from). Without this the ESP counted only beacons/peering/SAE as activity, so a peer actively
+ * sending us data whose beacons we happened to miss could wrongly hit MESH_PLINK_INACTIVITY_MS. */
+void umac_mesh_note_peer_rx(const uint8_t *ta)
+{
+    if (!mesh_ctx.active || ta == NULL)
+    {
+        return;
+    }
+    struct mesh_peer *peer = mesh_peer_find(ta);
+    if (peer != NULL)
+    {
+        peer->last_rx_ms = mmosal_get_time_ms();
+    }
 }
 
 void umac_mesh_handle_peer_beacon(const uint8_t *peer_mac, const uint8_t *ies, uint32_t ies_len)
@@ -2581,9 +2610,11 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     {
         return false;
     }
+    g_mesh_fwd_dbg[FDBG_FWD_ENTRY]++;
     uint8_t next_hop[MMWLAN_MAC_ADDR_LEN];
     if (!umac_mesh_lookup_next_hop(mesh_da, next_hop))
     {
+        g_mesh_fwd_dbg[FDBG_LOOKUP_MISS]++;
         umac_mesh_start_discovery(mesh_da); /* no path yet — drop, resolve for next time */
         return false;
     }
@@ -2594,6 +2625,7 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(next_hop);
     if (nh_stad == NULL)
     {
+        g_mesh_fwd_dbg[FDBG_NHSTAD_NULL]++;
         return false; /* next hop is not an established peer — can't forward */
     }
     struct mesh_forward_params p = { .mesh_da = mesh_da,
@@ -2604,14 +2636,34 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     mac_addr_copy(p.next_hop, next_hop);
 
     struct umac_data *umacd = umac_data_get_umacd();
+    /* S3 — allocate the forwarded unicast on the per-TID data class so the FW enqueues it on the
+     * aggregating data queue (build_mesh_data_frame) instead of the mgmt queue (build_mgmt_frame), which
+     * never A-MPDUs. umac_datapath_tx_mesh_unicast_frame then marks it A-MPDU-eligible on the next hop. */
+#if MESH_FWD_DATA_AGGREGATE
+    struct mmpkt *frame = build_mesh_data_frame(umacd, umac_mesh_build_forward, &p, MESH_FWD_TID);
+#else
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_forward, &p);
+#endif
     if (frame == NULL)
     {
+        g_mesh_fwd_dbg[FDBG_BUILD_NULL]++;
         return false;
     }
     mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
     (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
     return true;
+}
+
+/* TEMP 2026-07-12 — forward-drop instrumentation getter (see umac_mesh.h).
+ * NB: g_mesh_fwd_dbg is DEFINED in the app as RTC_NOINIT_ATTR so it survives the INT-WDT crash-reboot
+ * (SW reset preserves RTC RAM) and the accumulated counts can be read AFTER the crash-loop. morselib
+ * only references it (extern in umac_mesh.h); the ESP-specific RTC attribute stays in the app layer. */
+void mmwlan_mesh_get_fwd_dbg(uint32_t *out)
+{
+    for (int i = 0; i < FDBG_COUNT; i++)
+    {
+        out[i] = g_mesh_fwd_dbg[i];
+    }
 }
 
 /* --- Group-addressed mesh forwarding + duplicate cache (RMC) ----------------
@@ -2889,6 +2941,23 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         return;
     }
 
+    /* Peer-link-id (plid) match, == mac80211 mesh_plink_get_event (mesh_plink.c:1077-1088): once we've
+     * recorded the peer's link id, an OPEN/CONFIRM carrying a DIFFERENT plid is OPN_IGNR/CNF_IGNR — the
+     * peer re-alloc'd its llid (restarted / raced a new session) while we still hold the old plink. Drop
+     * it WITHOUT learning the new plid or (below) the new AMPE nonce: the per-pair MTK is derived once at
+     * ESTAB from the recorded nonce+lid, so adopting the peer's new nonce/plid into a still-ESTAB peer
+     * silently desyncs our key from theirs (we keep the old MTK; they moved to a new one) -> every
+     * forwarded frame then fails its SW-CCMP MIC. A genuine restart still recovers: the peer's re-SAE
+     * Commit frees this peer via the reauth path (plid resets to 0), after which the next Open re-peers
+     * cleanly and both ends re-derive a matching MTK. mac80211 only re-peers from a plid==0 (freed) sta. */
+    if ((action == WLAN_SP_MESH_PEERING_OPEN || action == WLAN_SP_MESH_PEERING_CONFIRM) &&
+        peer->plid != 0 && peer_plid != peer->plid)
+    {
+        MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " plid mismatch rx=0x%04x ours=0x%04x; ignoring (OPN/CNF_IGNR)\n",
+                  MM_MAC_ADDR_VAL(sa), (unsigned)peer_plid, (unsigned)peer->plid);
+        return;
+    }
+
     /* Learn the peer's link id; a received peering frame is forward progress, so reset the
      * retransmit counter and mark the peer live (mac80211 last_rx). */
     peer->plid = peer_plid;
@@ -2944,6 +3013,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         if (action == WLAN_SP_MESH_PEERING_CONFIRM)
         {
             peer->state = MESH_PLINK_ESTAB;
+            g_plink_estab++; /* TEMP plink-flap telemetry: stable=1, flapping=climbs */
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
             umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */
@@ -2962,6 +3032,7 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         {
             (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_CONFIRM, peer, 0);
             peer->state = MESH_PLINK_ESTAB;
+            g_plink_estab++; /* TEMP plink-flap telemetry: stable=1, flapping=climbs */
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
             umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */

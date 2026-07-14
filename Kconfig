@@ -65,4 +65,22 @@ menu "Wi-Fi HaLow Connection Manager"
             pool. Allocation is strict PSRAM with no internal-SRAM fallback. Requires
             CONFIG_SPIRAM.
 
+    config HALOW_SOFT_HW_RESTART
+        bool "Bus-preserving HW restart over live SPI (FIX-1)"
+        default n
+        help
+            When set, a hardware restart (morse_reset_chip -> hw_restart) resets the
+            MM6108 + reloads FW over the EXISTING ESP SPI2_HOST bus instead of tearing
+            down and re-initialising the SPI host controller. This avoids the cross-core
+            esp_intr_free/alloc (esp_ipc holding the global intr-alloc spinlock) that
+            trips the interrupt watchdog under sustained relay-forward load (FIX-1,
+            docs/worklog/2026-07-12-mesh-relay-intwdt-rootcause.md).
+
+            This option only selects the COMPILE-TIME DEFAULT of the runtime global
+            g_mmdrv_soft_hw_restart; the value can still be flipped at runtime for A/B
+            benching. Default n: the code is present but DORMANT (hw_restart uses the
+            legacy full teardown/reinit) until this is set y — deliberately, because the
+            bus-preserving path is delicate and NOT YET bench-verified. Set y to enable
+            + bench-verify (see the FIX-1 validation hooks in the worklog).
+
 endmenu
