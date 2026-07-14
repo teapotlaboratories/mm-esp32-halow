@@ -34,12 +34,25 @@
 #include "umac/ies/mmie.h"
 #include "umac/frames/disassociation.h"
 #include "umac/frames/deauthentication.h"
+#include "umac/frames/frames_common.h"
+#include "common/consbuf.h"
 
 #define UMAC_802_1_HEADER_LEN 8
 static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
 
 #define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl))
+
+
+/* Max host-built 802.11 frame length (MAC header + body, WITHOUT the FCS the FW appends) that the MM6108
+ * FW transmits in ONE PPDU at the worst supported rate (1 MHz / MCS0). From morse_driver beacon.c
+ * DOT11AH_1MHZ_MCS0_MAX_BEACON_LENGTH = 764 - 36: the driver rejects a 1 MHz beacon whose skb->len (which
+ * EXCLUDES the FCS) is >= this. A larger frame is FRAGMENTED by the FW *after* the host computed the CCMP
+ * MIC over the whole (unfragmented) FC — the peer's MIC check then fails (moreFrag is CCMP-AAD-covered). So
+ * for the host SW-CCMP mesh path we fragment in the host so every fragment stays below this (fragment ->
+ * encrypt), mirroring net/mac80211 (ieee80211_tx_h_fragment before ieee80211_tx_h_encrypt). All lengths in
+ * the fragmentation path are FCS-less (the FW appends the FCS to whatever host frame it transmits). */
+#define MESH_FRAG_MPDU_MAX (728)
 
 
 #define ETHERTYPE_THRESHOLD 1536
@@ -583,6 +596,142 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
     /* ciphertext already in place at ccmp_slot + CCMP_HEADER_LEN (encrypted in-place above) */
     memcpy(mmpkt_append(view, mic_len), mic, mic_len);
     return true;
+}
+
+/* Host 802.11 fragmentation for the mesh SW-CCMP TX path (fragment -> encrypt), mirroring net/mac80211
+ * ieee80211_fragment + ieee80211_tx_h_fragment. Each fragment replicates the MAC header + QoS (hdr) with
+ * its own fragment number and MoreFragments bit; the sequence number is identical across fragments (copied
+ * from the original header). Each fragment is then CCMP-encrypted individually with its own PN/MIC. */
+struct mesh_frag_build_params
+{
+    const uint8_t *hdr; uint32_t hdr_len;   /* MAC header + QoS, replicated per fragment */
+    const uint8_t *chunk; uint32_t chunk_len;
+    uint8_t frag_num; bool more_frags;
+};
+
+static void umac_datapath_build_mesh_fragment(struct umac_data *umacd, struct consbuf *buf, void *params)
+{
+    (void)umacd;
+    const struct mesh_frag_build_params *p = (const struct mesh_frag_build_params *)params;
+
+    uint8_t *hdr = consbuf_reserve(buf, p->hdr_len);
+    if (hdr)
+    {
+        memcpy(hdr, p->hdr, p->hdr_len);
+        /* frame_control + sequence_control live in the first 24 bytes regardless of 4-addr/QoS. */
+        struct dot11_hdr *d11 = (struct dot11_hdr *)hdr;
+        uint16_t fc = le16toh(d11->frame_control);
+        if (p->more_frags)
+        {
+            fc |= DOT11_MASK_FC_MORE_FRAGMENTS;
+        }
+        else
+        {
+            fc &= ~DOT11_MASK_FC_MORE_FRAGMENTS;
+        }
+        d11->frame_control = htole16(fc);
+        DOT11_SEQUENCE_CONTROL_SET_FRAGMENT_NUMBER(d11->sequence_control, p->frag_num);
+    }
+    consbuf_append(buf, p->chunk, p->chunk_len);
+}
+
+/* Split a built-but-UNencrypted mesh frame ([MAC hdr|QoS|mesh-ctrl|SNAP|payload], `hdr_total` = MAC hdr +
+ * QoS) into <=MESH_FRAG_MPDU_MAX MPDUs, CCMP-encrypting each fragment individually under `key_stad`'s
+ * `key_type`/`key_id` key (own PN/MIC, mirroring ieee80211_crypto_ccmp_encrypt per fragment). `meta_tmpl`
+ * is copied onto every fragment (aid/rc_data/vif_id/key_idx/reorder_buf) with A-MPDU cleared, and each
+ * fragment goes on the MGMT (non-aggregating) queue. Does NOT touch the caller's `view`/txbuf — the caller
+ * releases the original. mmdrv_tx_frame CONSUMES each fragment mmpkt (even on failure). */
+static enum mmwlan_status umac_datapath_tx_fragment_and_encrypt(
+    struct umac_data *umacd, struct umac_sta_data *key_stad, struct mmpktview *view,
+    size_t hdr_total, enum umac_key_type key_type, int key_id,
+    const struct mmdrv_tx_metadata *meta_tmpl)
+{
+    size_t tk_len = umac_keys_get_key_len(key_stad, (uint8_t)key_id);
+    size_t mic_len = (tk_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+
+    if (hdr_total > MAX_QOS_DATA_MAC_HEADER_LEN)
+    {
+        MMLOG_WRN("Mesh frag: hdr_total %u too large\n", (unsigned)hdr_total);
+        return MMWLAN_ERROR;
+    }
+
+    /* FCS-less: MESH_FRAG_MPDU_MAX is the FW's FCS-less 1MHz/MCS0 frame limit; the FW appends the FCS. Keep
+     * each fragment's frame (hdr + CCMP + chunk + MIC) strictly UNDER the limit (the driver's own check is
+     * `>=`), so `-1`. */
+    size_t overhead = (size_t)DOT11_CCMP_HEADER_LEN + mic_len;
+    if (hdr_total + overhead + 1 >= MESH_FRAG_MPDU_MAX)
+    {
+        MMLOG_WRN("Mesh frag: header (%u) leaves no room under the fragment threshold\n",
+                  (unsigned)hdr_total);
+        return MMWLAN_ERROR;
+    }
+    size_t per_fragm = MESH_FRAG_MPDU_MAX - 1 - hdr_total - overhead;
+
+    uint8_t hdr_copy[MAX_QOS_DATA_MAC_HEADER_LEN];
+    const uint8_t *data_start = mmpkt_get_data_start(view);
+    size_t data_length = mmpkt_get_data_length(view);
+    if (data_length < hdr_total)
+    {
+        return MMWLAN_ERROR;
+    }
+    memcpy(hdr_copy, data_start, hdr_total);
+
+    const uint8_t *body = data_start + hdr_total;
+    size_t body_len = data_length - hdr_total;
+    size_t nfrags = (body_len + per_fragm - 1) / per_fragm;
+    if (nfrags == 0)
+    {
+        nfrags = 1; /* a zero-length body would degenerate to no fragments; keep at least one */
+    }
+    /* The 802.11 fragment number is a 4-bit field (0..15). A frame needing >16 fragments cannot be
+     * addressed (frag 16 would wrap to 0 and corrupt the RX chain). Unreachable at the ~1514 B TX cap
+     * (per_fragm ~680 -> <=3 fragments), but drop defensively rather than emit a wrapped fragment. */
+    if (nfrags > 16)
+    {
+        MMLOG_WRN("Mesh frag: %u fragments exceeds the 4-bit fragment-number field\n", (unsigned)nfrags);
+        return MMWLAN_ERROR;
+    }
+
+    for (size_t i = 0; i < nfrags; i++)
+    {
+        size_t offset = i * per_fragm;
+        size_t chunk_len = (body_len - offset < per_fragm) ? (body_len - offset) : per_fragm;
+        struct mesh_frag_build_params p = {
+            .hdr = hdr_copy,
+            .hdr_len = (uint32_t)hdr_total,
+            .chunk = body + offset,
+            .chunk_len = (uint32_t)chunk_len,
+            .frag_num = (uint8_t)i,
+            .more_frags = (i + 1 < nfrags),
+        };
+
+        /* MGMT class -> non-aggregating queue; CCMP head/tailroom is reserved by build_mgmt_frame. */
+        struct mmpkt *frag = build_mgmt_frame(umacd, umac_datapath_build_mesh_fragment, &p);
+        if (frag == NULL)
+        {
+            return MMWLAN_ERROR;
+        }
+        *mmdrv_get_tx_metadata(frag) = *meta_tmpl;
+        mmdrv_get_tx_metadata(frag)->flags &= ~MMDRV_TX_FLAG_AMPDU_ENABLED;
+
+        struct mmpktview *fragview = mmpkt_open(frag);
+        umac_keys_increment_tx_seq(key_stad, (uint8_t)key_id);
+        if (!umac_datapath_sw_ccmp_encrypt(key_stad, fragview, key_type, key_id))
+        {
+            mmpkt_close(&fragview);
+            mmpkt_release(frag);
+            return MMWLAN_ERROR;
+        }
+        mmpkt_close(&fragview);
+
+        /* mmdrv_tx_frame takes ownership of the fragment mmpkt (destroys it or returns it via the
+         * TX-status handler) even on failure — never release it after this call. is_mgmt = true. */
+        if (mmdrv_tx_frame(frag, true) < 0)
+        {
+            return MMWLAN_ERROR;
+        }
+    }
+    return MMWLAN_SUCCESS;
 }
 
 /* RX: the FW delivered a protected mesh frame raw (no FW key). On entry the 802.11 header + QoS have
@@ -1249,7 +1398,16 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
 
     reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, tid_index);
 
-    if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0)
+    /* A fragmented MPDU (More Fragments set, or fragment number != 0) is never BA-reordered: 802.11 makes
+     * A-MPDU and fragmentation mutually exclusive, and our host fragmentation (fragment -> encrypt) can emit
+     * fragments during the ADDBA-handshake window (originator BA not yet SUCCESS but the recipient already
+     * built a reorder buffer). Deliver them straight to the after-reorder path so decrypt + datapath_defrag
+     * reassemble them — the BA window advances per-MSDU sequence number, so a same-seq# frag1+ would
+     * otherwise be dropped as "outdated". No-op for unfragmented frames. */
+    bool is_fragment = dot11_frame_control_get_more_fragments(header->frame_control) ||
+                       (dot11_sequence_control_get_fragment_number(header->sequence_control) != 0);
+
+    if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0 || is_fragment)
     {
         umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
         return;
@@ -2260,8 +2418,25 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     mmpkt_prepend_data(txbufview, (uint8_t *)&qos_ctrl.field, sizeof(qos_ctrl));
     mmpkt_prepend_data(txbufview, (uint8_t *)&data_hdr, data_hdr_len);
 
+    /* Host 802.11 fragmentation decision (mesh SW-CCMP unicast only). If the whole MPDU would exceed the
+     * 1 MHz/MCS0 single-PPDU limit AND this frame is not A-MPDU-eligible (mac80211 skips fragmentation for
+     * aggregated frames), the FW would fragment it after the host CCMP MIC is computed over the whole FC ->
+     * the peer MIC-fails. So fragment in the host below. The metadata below is populated first (the
+     * fragments copy tx_metadata); the whole-frame encrypt is skipped for do_fragment and the fragment
+     * helper is invoked at the send point. hdr_total = MAC header + QoS (mesh-ctrl is fragmented body). */
+    bool ampdu_eligible = (!is_multicast) && umac_ba_is_ampdu_permitted(key_stad, tid);
+    bool mesh_swccmp = tx_is_mesh_frame && umac_mesh_sw_crypto_enabled() &&
+                       (key_id >= 0) && !is_multicast;
+    size_t frag_hdr_total = (size_t)data_hdr_len + sizeof(struct dot11_qos_ctrl);
+    size_t frag_mic_len =
+        (key_len == UMAC_KEY_AES_256_LEN) ? DOT11_CCMP_256_MIC_LEN : DOT11_CCMP_128_MIC_LEN;
+    /* FCS-less on-air frame length (the FW appends the FCS). Fragment if the whole frame would reach the
+     * FW's 1MHz/MCS0 single-PPDU limit (>= : the driver's own beacon check uses >=). */
+    size_t frag_frame_len = mmpkt_get_data_length(txbufview) + DOT11_CCMP_HEADER_LEN + frag_mic_len;
+    bool do_fragment = mesh_swccmp && !ampdu_eligible && (frag_frame_len >= MESH_FRAG_MPDU_MAX);
+
     tx_metadata->flags = 0;
-    if (key_id >= 0)
+    if (key_id >= 0 && !do_fragment)
     {
         /* #P5c — locally-originated mesh data: encrypt on the host (FW has no key). Otherwise FW HW.
          * Keyed on the frame's egress vif (tx_is_mesh_frame) so a concurrent AP's downlink uses HW
@@ -2291,7 +2466,9 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
          * session (where aggr_check opened it), so a multi-hop origin's frames are marked A-MPDU-eligible.
          * key_stad == stad off the multi-hop mesh path. */
         tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(key_stad, tid);
-        if (umac_ba_is_ampdu_permitted(key_stad, tid))
+        /* ampdu_eligible == umac_ba_is_ampdu_permitted(key_stad, tid) here (both inside !is_multicast) —
+         * cached above for the fragmentation gate; the AMPDU flag stays off on the fragment path. */
+        if (ampdu_eligible)
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
         }
@@ -2331,6 +2508,23 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
                                      &tx_metadata->rc_data,
                                      rts_required,
                                      mmpkt_get_data_length(txbufview));
+    }
+
+    if (do_fragment)
+    {
+        /* tx_metadata is fully populated above (the fragments copy it). The original txbuf was never
+         * encrypted (the whole-frame encrypt is skipped for do_fragment); the helper builds, encrypts and
+         * sends each fragment, then we release the original here. */
+        status = umac_datapath_tx_fragment_and_encrypt(umacd, key_stad, txbufview, frag_hdr_total,
+                                                        UMAC_KEY_TYPE_PAIRWISE, key_id, tx_metadata);
+        umac_stats_update_last_tx_time(umacd);
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        if (status != MMWLAN_SUCCESS)
+        {
+            umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        }
+        return status;
     }
 
     MMLOG_DBG("Transmitting frame %p\n", txbuf);
@@ -2775,8 +2969,27 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
         }
     }
 
+    /* Host 802.11 fragmentation decision (same gate as the origin path). Only a forwarded UNICAST
+     * (key_type == PAIRWISE; stad is the next-hop peer) is a mesh SW-CCMP frame here — a re-broadcast
+     * GROUP frame is never fragmented (mac80211 DONTFRAG for multicast). Fragment iff not A-MPDU-eligible
+     * and the whole MPDU exceeds the 1 MHz/MCS0 single-PPDU limit. hdr_total = MAC header + QoS. */
+    bool fwd_ampdu_eligible = fwd_aggregate && umac_ba_is_ampdu_permitted(stad, fwd_tid);
+    bool fwd_mesh_swccmp =
+        (key_type == UMAC_KEY_TYPE_PAIRWISE) && umac_mesh_sw_crypto_enabled() && (key_id >= 0);
+    uint32_t fwd_data_hdr_len = dot11_data_hdr_get_len((const struct dot11_data_hdr *)header);
+    size_t fwd_hdr_total = (size_t)fwd_data_hdr_len + sizeof(struct dot11_qos_ctrl);
+    size_t fwd_mic_len = DOT11_CCMP_128_MIC_LEN;
+    if (key_id >= 0 &&
+        umac_keys_get_key_len(stad, (uint8_t)key_id) == UMAC_KEY_AES_256_LEN)
+    {
+        fwd_mic_len = DOT11_CCMP_256_MIC_LEN;
+    }
+    /* FCS-less on-air frame length (the FW appends the FCS). */
+    size_t fwd_frame_len = mmpkt_get_data_length(txbufview) + DOT11_CCMP_HEADER_LEN + fwd_mic_len;
+    bool do_fragment = fwd_mesh_swccmp && !fwd_ampdu_eligible && (fwd_frame_len >= MESH_FRAG_MPDU_MAX);
+
     tx_metadata->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
-    if (key_id >= 0)
+    if (key_id >= 0 && !do_fragment)
     {
         /* #P5c — forwarded unicast (next-hop MTK) / re-broadcast group (own MGTK): encrypt on the host
          * so a forwarded A4!=TA frame (which the FW withholds in HW-crypto mode, #20) is protected
@@ -2805,7 +3018,9 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     if (fwd_aggregate)
     {
         tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, fwd_tid);
-        if (umac_ba_is_ampdu_permitted(stad, fwd_tid))
+        /* fwd_ampdu_eligible == umac_ba_is_ampdu_permitted(stad, fwd_tid) here (inside fwd_aggregate) —
+         * cached above for the fragmentation gate; the AMPDU flag stays off on the fragment path. */
+        if (fwd_ampdu_eligible)
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
         }
@@ -2816,6 +3031,23 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
      * Falls back to the mgmt table until RC is started on this stad (umac_rc.c:437-442). */
     umac_rc_init_rate_table_data(stad, &tx_metadata->rc_data, false,
                                  mmpkt_get_data_length(txbufview));
+
+    if (do_fragment)
+    {
+        /* tx_metadata is fully populated above (the fragments copy it). The original txbuf was never
+         * encrypted (the whole-frame encrypt is skipped for do_fragment); the helper builds, encrypts and
+         * sends each fragment on the MGMT queue, then we release the original here. */
+        status = umac_datapath_tx_fragment_and_encrypt(umacd, stad, txbufview, fwd_hdr_total,
+                                                       UMAC_KEY_TYPE_PAIRWISE, key_id, tx_metadata);
+        umac_stats_update_last_tx_time(umacd);
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        if (status != MMWLAN_SUCCESS)
+        {
+            umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        }
+        return status;
+    }
 
     umac_stats_update_last_tx_time(umacd);
 
