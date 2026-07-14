@@ -296,10 +296,6 @@ int mesh_ccmp_encrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, uint
     size_t aad_len;
     mesh_ccmp_write_header(ccmp_hdr, pn, key_id);
     mesh_ccmp_aad_nonce(hdr, ccmp_hdr, aad, &aad_len, nonce);
-    /* TEMP 2026-07-12 — capture the FIRST multi-hop (A3!=A1) frame's crypto inputs for the dual-side
-     * MIC-fail diagnosis (board0 side = encrypt). See app mmwlan_ccmp_dbg_capture. */
-    extern void mmwlan_ccmp_dbg_capture(int, const uint8_t *, const uint8_t *, uint32_t, const uint8_t *);
-    if (!(hdr[4] & 0x01) && memcmp(hdr + 4, hdr + 16, 6) != 0) { mmwlan_ccmp_dbg_capture(1, tk, aad, (uint32_t)aad_len, nonce); }
     return esp_mesh_ccm_ae(tk, tk_len, nonce, mlen, body_in, body_len, aad, aad_len, body_out, mic);
 }
 
@@ -312,10 +308,5 @@ int mesh_ccmp_decrypt(const uint8_t *tk, size_t tk_len, const uint8_t *hdr, cons
     uint8_t aad[30], nonce[13];
     size_t aad_len;
     mesh_ccmp_aad_nonce(hdr, ccmp_hdr, aad, &aad_len, nonce);
-    int rc = esp_mesh_ccm_ad(tk, tk_len, nonce, mlen, ct_in, ct_len, aad, aad_len, mic, pt_out);
-    /* TEMP 2026-07-12 — on a multi-hop (A3!=A1) MIC failure, capture the crypto inputs board2 used to
-     * DECRYPT (dual-side diagnosis). Diff CCMP-DEC (board2) vs CCMP-ENC (board0) to pin the differing byte. */
-    extern void mmwlan_ccmp_dbg_capture(int, const uint8_t *, const uint8_t *, uint32_t, const uint8_t *);
-    if (rc != 0 && !(hdr[4] & 0x01) && memcmp(hdr + 4, hdr + 16, 6) != 0) { mmwlan_ccmp_dbg_capture(0, tk, aad, (uint32_t)aad_len, nonce); }
-    return rc;
+    return esp_mesh_ccm_ad(tk, tk_len, nonce, mlen, ct_in, ct_len, aad, aad_len, mic, pt_out);
 }

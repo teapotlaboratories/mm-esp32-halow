@@ -629,13 +629,11 @@ static bool umac_datapath_sw_ccmp_decrypt(struct umac_sta_data *stad, struct mmp
     if (mesh_ccmp_decrypt(tk, tk_len, (const uint8_t *)data_hdr, ccmp_hdr,
                           ct, ct, body_len, mic) != 0)
     {
-        g_mesh_fwd_dbg[FDBG_RX_SW_MIC_FAIL]++; /* TEMP: wrong key / AAD / nonce */
         return false; /* MIC failure */
     }
     /* MIC verified -> now it's safe to advance the replay counter. */
     if (!ccmp_is_valid(stad, ccmp_hdr, space))
     {
-        g_mesh_fwd_dbg[FDBG_RX_SW_REPLAY_FAIL]++; /* TEMP: PN old / duplicate */
         return false; /* replay */
     }
 
@@ -695,10 +693,8 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
      * nodes are in RF range. Gated on mesh_ctrl_present (802.11s Mesh Control header) so it applies ONLY
      * to mesh frames — NOT to concurrent AP-client frames on a mesh+AP node (an AP client's data has no
      * Mesh Control header, so it is never filtered here). No-op when the allowlist is empty (normal ops). */
-    if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_MESH_SEEN]++; } /* TEMP rx-drop denominator */
     if (mesh_ctrl_present && !umac_mesh_peer_allowed(dot11_get_ta(header)))
     {
-        g_mesh_fwd_dbg[FDBG_RX_ALLOWLIST]++; /* TEMP */
         goto drop;
     }
 
@@ -707,7 +703,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         !dot11_frame_control_get_protected(header->frame_control) &&
         !umac_datapath_is_eapol_frame(rxbufview))
     {
-        if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_PLAINTEXT]++; } /* TEMP */
         MMLOG_INF("Received NON EAPOL frame in plain text.\n");
         goto drop;
     }
@@ -721,7 +716,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             if (ccmp_header == NULL ||
                 !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
             {
-                if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_HW_CCMP_FAIL]++; } /* TEMP */
                 umac_stats_increment_datapath_rx_ccmp_failures(umacd);
                 goto drop;
             }
@@ -742,21 +736,18 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, data_hdr,
                                                UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
             {
-                if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_SW_CCMP_FAIL]++; } /* TEMP */
                 umac_stats_increment_datapath_rx_ccmp_failures(umacd);
                 goto drop;
             }
         }
         else
         {
-            if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_NO_DECRYPT]++; } /* TEMP */
             MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x, SEQ: 0x%04x).\n",
                       le16toh(header->frame_control),
                       le16toh(header->sequence_control));
             goto drop;
         }
     }
-    if (mesh_ctrl_present) { g_mesh_fwd_dbg[FDBG_RX_DECRYPT_OK]++; } /* TEMP — survived decrypt */
 
     if (mesh_ctrl_present)
     {
@@ -881,7 +872,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         else if (!umac_interface_addr_matches_mac_addr(stad, mesh_da))
         {
-            g_mesh_fwd_dbg[FDBG_RX_FWD_REACHED]++; /* TEMP fwd-drop instrumentation */
             MMLOG_INF("MESH relay " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT "\n",
                       MM_MAC_ADDR_VAL(mesh_sa), MM_MAC_ADDR_VAL(mesh_da));
             (void)umac_mesh_forward_data(mesh_da, mesh_sa, mmpkt_get_data_start(rxbufview),
@@ -2180,17 +2170,6 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     if (tx_is_mesh_frame && !is_multicast)
     {
         struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(ra);
-        /* TEMP 2026-07-12 — key_stad confirmation. For a multi-hop unicast (RA=next-hop != final DA),
-         * record whether the crypto key correctly overrides to the next-hop peer (per-link MTK) or falls
-         * back to the dest stad (wrong link MTK -> the next hop MIC-fails). Confirms the per-link-MTK
-         * hypothesis for the ~99% forward MIC drop. */
-        if (memcmp(ra, header_8023->dest_addr, DOT11_MAC_ADDR_LEN) != 0)
-        {
-            g_mesh_fwd_dbg[FDBG_TX_MULTIHOP]++;
-            if (nh_stad == NULL)       { g_mesh_fwd_dbg[FDBG_TX_NH_NULL]++; }
-            else if (nh_stad == stad)  { g_mesh_fwd_dbg[FDBG_TX_NH_EQ_STAD]++; }
-            else                       { g_mesh_fwd_dbg[FDBG_TX_NH_OK]++; }
-        }
         if (nh_stad != NULL)
         {
             key_stad = nh_stad;
@@ -2742,8 +2721,6 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(txbufview);
     struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
 
-    if (key_type == UMAC_KEY_TYPE_PAIRWISE) { g_mesh_fwd_dbg[FDBG_KEYED_ENTRY]++; } /* TEMP fwd-drop */
-
     /* S3 (relay onto the aggregation-eligible data path, blocker B6). A forwarded UNICAST (key_type ==
      * PAIRWISE, from umac_datapath_tx_mesh_unicast_frame) rides the next hop's per-TID QoS-data seqno
      * space and opens a BA session on the next hop, so the FW A-MPDUs it — mirroring the local-origin
@@ -2769,7 +2746,6 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     status = umac_datapath_wait_for_tx_ready_(data, MESH_FWD_TX_TIMEOUT_MS, pause_mask);
     if (status != MMWLAN_SUCCESS)
     {
-        if (key_type == UMAC_KEY_TYPE_PAIRWISE) { g_mesh_fwd_dbg[FDBG_TXREADY_TIMEOUT]++; } /* TEMP fwd-drop */
         mmpkt_close(&txbufview);
         mmpkt_release(txbuf);
         umac_stats_increment_datapath_txq_frames_dropped(umacd);
@@ -2810,7 +2786,6 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
             umac_keys_increment_tx_seq(stad, key_id);
             if (!umac_datapath_sw_ccmp_encrypt(stad, txbufview, key_type, key_id))
             {
-                if (key_type == UMAC_KEY_TYPE_PAIRWISE) { g_mesh_fwd_dbg[FDBG_ENCRYPT_FAIL]++; } /* TEMP */
                 mmpkt_close(&txbufview);
                 mmpkt_release(txbuf);
                 umac_stats_increment_datapath_txq_frames_dropped(umacd);
@@ -2852,10 +2827,8 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
      * an ACK that never comes, so group must not go there. */
     if (mmdrv_tx_frame(txbuf, !fwd_aggregate) < 0)
     {
-        if (key_type == UMAC_KEY_TYPE_PAIRWISE) { g_mesh_fwd_dbg[FDBG_MMDRV_FAIL]++; } /* TEMP */
         return MMWLAN_ERROR;
     }
-    if (key_type == UMAC_KEY_TYPE_PAIRWISE) { g_mesh_fwd_dbg[FDBG_MMDRV_OK]++; } /* TEMP fwd-drop */
 
     return MMWLAN_SUCCESS;
 }

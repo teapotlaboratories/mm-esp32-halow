@@ -44,65 +44,6 @@
  * goes out (and can aggregate) while capping any evtloop stall well under the 300 ms interrupt-WDT window. */
 #define MESH_FWD_TX_TIMEOUT_MS 250
 
-/* TEMP 2026-07-12 — forward-drop instrumentation (bench-verify S3). Counters incremented at each point on the
- * relay forward path so an iperf run pins WHERE the relay drops forwards (the app dumps them via ESP_LOGI —
- * MMLOG is not on the UART). Remove after the drop point is confirmed. Order = along the code path. */
-enum mesh_fwd_dbg_idx {
-    FDBG_RX_FWD_REACHED,  /* umac_datapath.c: RX reached the umac_mesh_forward_data call */
-    FDBG_FWD_ENTRY,       /* umac_mesh.c: entered forward_data past the multihop/active guards */
-    FDBG_LOOKUP_MISS,     /* umac_mesh.c: next-hop lookup failed (D4) */
-    FDBG_NHSTAD_NULL,     /* umac_mesh.c: next-hop stad NULL (D5) */
-    FDBG_BUILD_NULL,      /* umac_mesh.c: forward frame build failed (buffer exhaustion) */
-    FDBG_KEYED_ENTRY,     /* umac_datapath.c: entered tx_mesh_keyed_frame */
-    FDBG_TXREADY_TIMEOUT, /* umac_datapath.c: wait_for_tx_ready dropped (D6b — leading) */
-    FDBG_ENCRYPT_FAIL,    /* umac_datapath.c: SW-CCMP encrypt failed (D6a) */
-    FDBG_MMDRV_FAIL,      /* umac_datapath.c: mmdrv_tx_frame < 0 (D6c) */
-    FDBG_MMDRV_OK,        /* umac_datapath.c: mmdrv_tx_frame >= 0 — handed to FW (S1 fork) */
-    /* RX-path counters (2026-07-12 pass 2 — the drop is BEFORE the forward call, rx_reached=6/~342) */
-    FDBG_RX_MESH_SEEN,    /* umac_datapath.c: a mesh data frame reached the allowlist gate (denominator) */
-    FDBG_RX_ALLOWLIST,    /* umac_datapath.c:696 allowlist drop (TA not allowed) */
-    FDBG_RX_PLAINTEXT,    /* umac_datapath.c:707 non-EAPOL plaintext drop */
-    FDBG_RX_HW_CCMP_FAIL, /* umac_datapath.c:721 FW-HW-decrypt ccmp_is_valid fail (incl. replay) */
-    FDBG_RX_SW_CCMP_FAIL, /* umac_datapath.c:741 host SW-CCMP decrypt fail (incl. replay) */
-    FDBG_RX_NO_DECRYPT,   /* umac_datapath.c:750 protected but no decrypt path -> drop */
-    FDBG_RX_DECRYPT_OK,   /* umac_datapath.c: survived the decrypt block (past :752) */
-    /* TEMP 2026-07-12 pass-3 — split the SW-CCMP drop (FDBG_RX_SW_CCMP_FAIL) into its two causes so the
-     * ~99% forward drop is pinned as wrong-key/AAD (MIC) vs PN/ordering (replay). Incremented inside
-     * umac_datapath_sw_ccmp_decrypt at each return-false. */
-    FDBG_RX_SW_MIC_FAIL,    /* mesh_ccmp_decrypt MIC failed (wrong key / AAD / nonce mismatch) */
-    FDBG_RX_SW_REPLAY_FAIL, /* MIC ok but ccmp_is_valid replay-window reject (PN old / duplicate) */
-    /* TEMP 2026-07-12 pass-4 — board0 TX key_stad confirmation for the multi-hop MIC failure. For a mesh
-     * multi-hop unicast (RA=next-hop != final DA), does key_stad override to the next-hop peer (correct
-     * per-link MTK) or fall back to the dest stad (wrong link MTK -> the next hop MIC-fails the frame)? */
-    FDBG_TX_MULTIHOP,    /* mesh unicast where RA (next-hop) != final DA */
-    FDBG_TX_NH_NULL,     /* get_peer_stad(RA) == NULL -> key_stad falls back to dest stad (BUG) */
-    FDBG_TX_NH_EQ_STAD,  /* get_peer_stad(RA) == stad (dest) -> key_stad still == dest (also wrong) */
-    FDBG_TX_NH_OK,       /* get_peer_stad(RA) resolved to a distinct next-hop stad -> correct link key */
-    FDBG_COUNT
-};
-/* DEFINED in the app as RTC_NOINIT_ATTR (survives the INT-WDT crash-reboot so the accumulated counts
- * can be read AFTER the relay crash-loop). morselib only references it; the app zeroes it on cold boot. */
-extern uint32_t g_mesh_fwd_dbg[FDBG_COUNT];
-
-/* TEMP 2026-07-12 — FIX-1 verification telemetry (RTC_NOINIT, defined in the app; survives a crash-reboot).
- * g_hwr_boot_count: app_main entries (crash-reboots increment it). g_hwr_attempts: hw_restart_evt_handler
- * entries. g_hwr_completions: restarts that returned success. DEFINITIVE FIX-1 test: boot_count stays ~1
- * while attempts>0 and completions==attempts => hw_restart fired AND the ESP did NOT reboot (crash fixed).
- * boot_count climbing with attempts => still crash-rebooting. attempts==0 => the flap wasn't the crash. */
-extern uint32_t g_hwr_boot_count;
-extern uint32_t g_hwr_attempts;
-extern uint32_t g_hwr_completions;
-
-/* TEMP 2026-07-12 — mesh-plink flap telemetry (RTC_NOINIT, app-defined). g_plink_estab: # times a peer
- * reached MESH_PLINK_ESTAB (a STABLE link establishes ONCE => count 1; a FLAPPING link re-establishes =>
- * count climbs). g_plink_close: # times an ESTABLISHED plink was torn down (mesh_peer_free while ESTAB).
- * Read from the ESP's own side (survives the console-open warm-reset), so ESP<->ESP peering stability can
- * be measured without a Linux peer or the monitor. */
-extern uint32_t g_plink_estab;
-extern uint32_t g_plink_close;
-/* Copy the forward-drop counters into out[FDBG_COUNT] (app dumps them after an iperf run). */
-void mmwlan_mesh_get_fwd_dbg(uint32_t *out);
-
 /* ---- public API (mirrors mmwlan_ibss_*) ----------------------------------- */
 
 /** Arguments to bring up an 802.11s mesh interface. */

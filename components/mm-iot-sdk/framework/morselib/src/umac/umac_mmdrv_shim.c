@@ -84,8 +84,6 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
             return;
         }
 
-        g_hwr_attempts++;   /* TEMP FIX-1 telemetry: a hw_restart is being attempted */
-
         if (g_mmdrv_soft_hw_restart)
         {
             /* FIX-1: bus-preserving restart — resets the chip + reloads FW over the live SPI bus, avoiding
@@ -98,8 +96,6 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
             mmdrv_deinit();
             MMOSAL_ASSERT(mmdrv_init(NULL, country_code) == 0);
         }
-
-        g_hwr_completions++;   /* TEMP FIX-1 telemetry: the restart returned (no INT-WDT reboot) */
 
         umac_interface_configure_periodic_health_check(umacd);
         umac_stats_increment_hw_restart_counter(umacd);

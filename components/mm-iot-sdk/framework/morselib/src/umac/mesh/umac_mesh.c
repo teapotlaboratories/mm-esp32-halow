@@ -637,10 +637,6 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
 /* Release a peer slot, freeing its per-peer stad (heap; the common_stad is static — never freed). */
 static void mesh_peer_free(struct mesh_peer *peer)
 {
-    if (peer->state == MESH_PLINK_ESTAB)
-    {
-        g_plink_close++; /* TEMP plink-flap telemetry: an ESTABLISHED plink is being torn down */
-    }
     /* Free the SAE protocol instance (sae_data + bignum scratch) — mirrors sta_info.c:427-428. This
      * single site covers every teardown path (HOLDING, inactivity, CLOSE RX, llid mismatch, stop). */
     if (peer->sae != NULL)
@@ -2610,11 +2606,9 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     {
         return false;
     }
-    g_mesh_fwd_dbg[FDBG_FWD_ENTRY]++;
     uint8_t next_hop[MMWLAN_MAC_ADDR_LEN];
     if (!umac_mesh_lookup_next_hop(mesh_da, next_hop))
     {
-        g_mesh_fwd_dbg[FDBG_LOOKUP_MISS]++;
         umac_mesh_start_discovery(mesh_da); /* no path yet — drop, resolve for next time */
         return false;
     }
@@ -2625,7 +2619,6 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(next_hop);
     if (nh_stad == NULL)
     {
-        g_mesh_fwd_dbg[FDBG_NHSTAD_NULL]++;
         return false; /* next hop is not an established peer — can't forward */
     }
     struct mesh_forward_params p = { .mesh_da = mesh_da,
@@ -2646,24 +2639,11 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
 #endif
     if (frame == NULL)
     {
-        g_mesh_fwd_dbg[FDBG_BUILD_NULL]++;
         return false;
     }
     mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
     (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
     return true;
-}
-
-/* TEMP 2026-07-12 — forward-drop instrumentation getter (see umac_mesh.h).
- * NB: g_mesh_fwd_dbg is DEFINED in the app as RTC_NOINIT_ATTR so it survives the INT-WDT crash-reboot
- * (SW reset preserves RTC RAM) and the accumulated counts can be read AFTER the crash-loop. morselib
- * only references it (extern in umac_mesh.h); the ESP-specific RTC attribute stays in the app layer. */
-void mmwlan_mesh_get_fwd_dbg(uint32_t *out)
-{
-    for (int i = 0; i < FDBG_COUNT; i++)
-    {
-        out[i] = g_mesh_fwd_dbg[i];
-    }
 }
 
 /* --- Group-addressed mesh forwarding + duplicate cache (RMC) ----------------
@@ -3013,7 +2993,6 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         if (action == WLAN_SP_MESH_PEERING_CONFIRM)
         {
             peer->state = MESH_PLINK_ESTAB;
-            g_plink_estab++; /* TEMP plink-flap telemetry: stable=1, flapping=climbs */
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
             umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */
@@ -3032,7 +3011,6 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         {
             (void)umac_mesh_tx_peering(WLAN_SP_MESH_PEERING_CONFIRM, peer, 0);
             peer->state = MESH_PLINK_ESTAB;
-            g_plink_estab++; /* TEMP plink-flap telemetry: stable=1, flapping=climbs */
             MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " ESTABLISHED\n", MM_MAC_ADDR_VAL(sa));
             umac_mesh_link_up_once();
             umac_mesh_peer_rc_start(peer); /* P6c real-RC: start mmrc learning on this link */
