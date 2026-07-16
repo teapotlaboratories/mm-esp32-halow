@@ -2204,7 +2204,9 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         {
             if (umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
             {
-                status = MMWLAN_SUCCESS; /* D1: dropped pending path discovery (see helper) */
+                /* D1: dropped pending path discovery (see helper); counted like any other TX drop. */
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                status = MMWLAN_SUCCESS;
                 goto error;
             }
             umac_datapath_construct_80211_data_header_mesh(stad, header_8023, &data_hdr);
@@ -2223,7 +2225,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         if (tx_is_mesh_frame &&
             umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
         {
-            status = MMWLAN_SUCCESS; /* D1: consumed — dropped pending path discovery, not an error */
+            /* D1: count it like every other TX drop (mirrors the forward path's drop, :2856) so that
+             * "the first packets to a new multi-hop dest vanish" is VISIBLE in stats instead of silent.
+             * SUCCESS, not ERROR: the frame is deliberately consumed while path discovery is in flight —
+             * that is not a TX failure the caller can act on or retry differently. */
+            umac_stats_increment_datapath_txq_frames_dropped(umacd);
+            status = MMWLAN_SUCCESS;
             goto error;
         }
         data->ops->construct_80211_data_header(stad, header_8023, &data_hdr);
