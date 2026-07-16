@@ -2124,6 +2124,31 @@ static void umac_datapath_aggr_check(struct umac_data *umacd,
     umac_ba_session_init(stad, tid, ssc, DOT11_BLOCK_ACK_TIMEOUT_DISABLED);
 }
 
+/* D1 (follow-Linux mesh_nexthop_resolve, mesh_hwmp.c): a mesh UNICAST DATA frame whose destination has
+ * no resolved HWMP path AND is not a direct peer is undeliverable right now. Linux buffers it + issues a
+ * PREQ; we have no mesh pending queue, so we DROP it and kick discovery — instead of the old fallback that
+ * transmitted RA=destination (only correct for a direct peer; for a multi-hop-only dest it wastes airtime
+ * on an unreachable RA + loses first packets). EAPOL (peering) and group/multicast are never dropped here.
+ * Side effect: kicks (rate-limited) path discovery when it returns true, so subsequent frames resolve. */
+static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h8023, bool is_eapol)
+{
+    if (is_eapol || mm_mac_addr_is_multicast(h8023->dest_addr))
+    {
+        return false;
+    }
+    uint8_t next_hop[DOT11_MAC_ADDR_LEN];
+    if (umac_mesh_lookup_next_hop(h8023->dest_addr, next_hop))
+    {
+        return false; /* a multi-hop path is resolved */
+    }
+    if (umac_mesh_get_peer_stad(h8023->dest_addr) != NULL)
+    {
+        return false; /* dest is a direct peer -> RA=dest is correct (single-hop, no path needed) */
+    }
+    umac_mesh_start_discovery(h8023->dest_addr);
+    return true;
+}
+
 enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
                                                   struct umac_sta_data *stad,
                                                   struct mmpktview *txbufview)
@@ -2177,6 +2202,11 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
             (umac_interface_get_vif_type_mask(umacd, stad_vif_id) & UMAC_INTERFACE_MESH) != 0;
         if (tx_is_mesh_frame)
         {
+            if (umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
+            {
+                status = MMWLAN_SUCCESS; /* D1: dropped pending path discovery (see helper) */
+                goto error;
+            }
             umac_datapath_construct_80211_data_header_mesh(stad, header_8023, &data_hdr);
         }
         else
@@ -2190,6 +2220,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 #endif
     {
         tx_is_mesh_frame = umac_mesh_is_active();
+        if (tx_is_mesh_frame &&
+            umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
+        {
+            status = MMWLAN_SUCCESS; /* D1: consumed — dropped pending path discovery, not an error */
+            goto error;
+        }
         data->ops->construct_80211_data_header(stad, header_8023, &data_hdr);
     }
     const uint32_t data_hdr_len = dot11_data_hdr_get_len(&data_hdr);
