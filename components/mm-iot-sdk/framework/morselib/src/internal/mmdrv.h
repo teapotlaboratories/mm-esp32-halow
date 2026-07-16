@@ -206,21 +206,6 @@ void mmdrv_init_for_unit_tests(void);
 void mmdrv_deinit(void);
 
 /**
- * FIX-1 (bus-preserving hw_restart). Re-runs mmdrv_deinit()+mmdrv_init() but routes the transport
- * teardown/bring-up through morse_trns_soft_stop/start, so the ESP SPI2_HOST bus + spi_handle + bus_lock +
- * spi_irq_semb + both GPIO ISR handlers stay allocated across the chip reset + FW reload. This removes the
- * spi_bus_free/initialize (= cross-core esp_intr_free/alloc) that trips the interrupt watchdog. Invoked only
- * from hw_restart_evt_handler when g_mmdrv_soft_hw_restart is true.
- *
- * @param country_code  Two-char country code + NUL (same contract as mmdrv_init).
- * @returns 0 on success, else an error code (caller reboots on failure).
- */
-int mmdrv_soft_restart(const char *country_code);
-
-/** Runtime A/B toggle for FIX-1; compile-time default from CONFIG_HALOW_SOFT_HW_RESTART. Defined in driver.c. */
-extern bool g_mmdrv_soft_hw_restart;
-
-/**
  * Read metadata from the board configuration file (BCF).
  *
  * @param metadata  Pointer to a metadata data structure to be filled out on success.

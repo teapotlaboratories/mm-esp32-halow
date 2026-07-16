@@ -5,7 +5,6 @@
 
 #include <errno.h>
 
-#include "sdkconfig.h"   /* FIX-1: CONFIG_HALOW_SOFT_HW_RESTART (compile-time default of the runtime toggle) */
 #include "common/morse_commands.h"
 #include "common/morse_command_utils.h"
 #include "common/mac_address.h"
@@ -42,19 +41,6 @@ SPINLOCK_TRACE_DECLARE
 
 
 static struct driver_data driver_data;
-
-/* FIX-1 (bus-preserving hw_restart) toggles. g_mmdrv_soft_hw_restart is the runtime A/B switch read by
- * hw_restart_evt_handler (compile-time default from CONFIG_HALOW_SOFT_HW_RESTART). g_mmdrv_bus_persistent
- * routes the 3 transport call-sites in mmdrv_init/deinit to the soft primitives; it is set true only
- * transiently inside mmdrv_soft_restart (which runs in the umac-core task, serialized against genuine
- * first-boot/shutdown — see the invariant note on mmdrv_soft_restart). */
-bool g_mmdrv_soft_hw_restart =
-#if defined(CONFIG_HALOW_SOFT_HW_RESTART) && CONFIG_HALOW_SOFT_HW_RESTART
-    true;
-#else
-    false;
-#endif
-static bool g_mmdrv_bus_persistent = false;
 
 void mmdrv_pre_init(void)
 {
@@ -359,11 +345,7 @@ int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
     /* No vif is beaconing until morse_beacon_start(); memset above cleared the
      * enabled/pending masks. */
 
-    /* FIX-1: on a bus-preserving soft restart, bring the transport up over the LIVE SPI bus
-     * (morse_trns_soft_start = no spi_bus_initialize / esp_intr_alloc). g_mmdrv_bus_persistent is set only
-     * inside mmdrv_soft_restart; the genuine first-boot path leaves it false and uses morse_trns_start. */
-    result = g_mmdrv_bus_persistent ? morse_trns_soft_start(&driver_data)
-                                    : morse_trns_start(&driver_data);
+    result = morse_trns_start(&driver_data);
     if (result != MORSE_SUCCESS)
     {
         MMLOG_ERR("Transport init failed\n");
@@ -499,18 +481,7 @@ error_pageset:
     driver_task_stop(&driver_data);
 error_task:
 error_firmware:
-    /* FIX-1: mirror the soft path on this unwind (reached only for failures AFTER a successful
-     * morse_trns_soft_start, e.g. morse_firmware_init) so the SPI-host teardown INT_WDT does not fire here.
-     * A soft_start failure at the transport site jumps straight to error_transport (skipping this) and is
-     * self-unwound inside morse_trns_soft_start. */
-    if (g_mmdrv_bus_persistent)
-    {
-        morse_trns_soft_stop(&driver_data);
-    }
-    else
-    {
-        morse_trns_stop(&driver_data);
-    }
+    morse_trns_stop(&driver_data);
 error_transport:
     memset(&driver_data, 0, sizeof(driver_data));
     return result;
@@ -552,44 +523,13 @@ void mmdrv_deinit(void)
 
     driver_data.cfg->ops->finish(&driver_data);
 
-    /* FIX-1: on a bus-preserving soft restart, quiesce the transport without freeing the SPI host / its
-     * interrupts (morse_trns_soft_stop = no spi_bus_free / esp_intr_free / gpio_isr_handler_remove). The
-     * genuine shutdown path leaves g_mmdrv_bus_persistent false and uses morse_trns_stop. */
-    if (g_mmdrv_bus_persistent)
-    {
-        morse_trns_soft_stop(&driver_data);
-    }
-    else
-    {
-        morse_trns_stop(&driver_data);
-    }
+    morse_trns_stop(&driver_data);
 
     morse_ps_deinit(&driver_data);
 
     memset(&driver_data, 0, sizeof(driver_data));
 
     DRV_TRACE("deinit done");
-}
-
-int mmdrv_soft_restart(const char *country_code)
-{
-    /* FIX-1: reuse the proven mmdrv_deinit()/mmdrv_init() bodies verbatim; g_mmdrv_bus_persistent only swaps
-     * the transport primitive (soft_stop/soft_start) so the ESP SPI2_HOST bus + spi_handle + bus_lock +
-     * spi_irq_semb + both GPIO ISR handlers survive the chip reset + FW reload. The driver_data memset in
-     * deinit/init does NOT disturb the persistent transport: bus_lock/spi_irq_semb/spi_irq_task_handle
-     * (sdio.c file-statics) and spi_handle (mmhal_wlan.c) are NOT fields of driver_data.
-     *
-     * INVARIANT (residual risk, grep-verify before enabling): the caller (hw_restart_evt_handler, umac-core
-     * task) must be serialized against mmwlan first-boot/shutdown so a concurrent genuine mmdrv_deinit can
-     * never observe g_mmdrv_bus_persistent==true and mis-route to morse_trns_soft_stop. If that cannot be
-     * guaranteed, thread bus_persistent as an explicit argument through mmdrv_deinit/init instead of this
-     * file-static. The legacy full-teardown hw_restart already relies on the same serialization. */
-    int r;
-    g_mmdrv_bus_persistent = true;
-    mmdrv_deinit();
-    r = mmdrv_init(NULL, country_code);
-    g_mmdrv_bus_persistent = false;
-    return r;
 }
 
 int mmdrv_get_bcf_metadata(struct mmwlan_bcf_metadata *metadata)

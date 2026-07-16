@@ -696,11 +696,6 @@ static morse_error_t morse_trns_reset(struct driver_data *driverd)
     if (ret != 0)
     {
         MMLOG_WRN("Initial communication with chip failed\n");
-        /* FIX-1: release bus_lock (claimed at the top of this function) on this early return. The full
-         * path throws bus_lock away in morse_trns_stop (mmosal_mutex_delete), but the soft path PRESERVES
-         * bus_lock — so without this the next morse_trns_claim by this task would assert (self-held) and
-         * wedge the bus. Harmless on the full path. */
-        morse_trns_release(driverd);
         return MORSE_FAILED;
     }
 
@@ -859,95 +854,6 @@ void morse_trns_stop(struct driver_data *driverd)
     spi_irq_semb = NULL;
 
     mmhal_wlan_deinit();
-}
-
-void morse_trns_soft_stop(struct driver_data *driverd)
-{
-    /* FIX-1: the task-quiesce HALF of morse_trns_stop ONLY. Deliberately OMITS mmosal_mutex_delete(bus_lock),
-     * mmosal_semb_delete(spi_irq_semb) and mmhal_wlan_deinit() — that omission keeps SPI2_HOST/spi_handle
-     * (mmhal_wlan.c), bus_lock/spi_irq_semb (this file) and BOTH GPIO ISR handlers allocated, avoiding the
-     * spi_bus_free / esp_intr_free / gpio_isr_handler_remove that trips the interrupt watchdog.
-     * INVARIANT: do NOT gpio_isr_handler_remove / gpio_intr_disable SPI_IRQ here. Only gpio_isr_handler_add
-     * (mmhal_wlan_register_spi_irq_handler) sets the per-pin int_ena, so masking via gpio_set_intr_type(DISABLE)
-     * leaves int_ena intact and SPI_IRQ re-arms with just gpio_set_intr_type(LOW_LEVEL) in
-     * morse_trns_set_irq_enabled(true). Removing the handler would silently kill RX (int_ena=0) with no crash.
-     * Joins the spi_irq worker before returning so mmdrv_deinit's driver_data memset can't race a live task. */
-    morse_trns_set_irq_enabled(driverd, false);   /* mask level-low SPI_IRQ (int_ena preserved) */
-    spi_irq_task_run = false;
-    mmosal_semb_give(spi_irq_semb);
-    while (!spi_irq_task_has_finished)
-    {
-        mmosal_task_sleep(1);
-    }
-}
-
-morse_error_t morse_trns_soft_start(struct driver_data *driverd)
-{
-    uint8_t bic;
-    morse_error_t result;
-
-    /* FIX-1: morse_trns_start MINUS mmhal_wlan_init (no spi_bus_initialize / spi_bus_add_device /
-     * esp_intr_alloc) and MINUS the bus_lock/spi_irq_semb create (both preserved by soft_stop). */
-
-    /* (1) Reset the MM6108 over the LIVE bus (RESET_N toggle + SDIO startup + chip-id verify); touches no
-     *     esp_intr / GPIO ISR service. morse_trns_reset releases bus_lock on either exit (leak fixed above). */
-    result = morse_trns_reset(driverd);
-    if (result != MORSE_SUCCESS)
-    {
-        return MORSE_FAILED;   /* worker not yet recreated; bus_lock free */
-    }
-
-    /* (2) Recreate the spi_irq worker (task lifecycle only; no esp_intr). */
-    spi_irq_task_run = true;
-    spi_irq_task_has_finished = false;
-    spi_irq_task_handle = mmosal_task_create(morse_spi_irq_main,
-                                             driverd,
-                                             SPI_IRQ_TASK_PRIORITY,
-                                             SPI_IRQ_TASK_STACK,
-                                             "spi_irq");
-    if (spi_irq_task_handle == NULL)
-    {
-        spi_irq_task_run = false;
-        return MORSE_FAILED;
-    }
-
-    /* (3) Re-arm the CCCR IEN/BIC wiped by RESET_N (mirrors morse_trns_start:807-827 so that stays
-     *     byte-identical). Wrapped in claim/release — a safe divergence from morse_trns_start's un-claimed
-     *     use; SPI_IRQ is masked here so the just-recreated worker cannot contend on the bus. */
-    morse_trns_claim(driverd);
-    result = morse_cmd52_write(SDIO_CCCR_IEN_ADDR,
-                               SDIO_CCCR_IEN_IENM | SDIO_CCCR_IEN_IEN1,
-                               MMHAL_SDIO_FUNCTION_0);
-    if (result == MORSE_SUCCESS)
-    {
-        result = morse_cmd52_read(SDIO_CCCR_BIC_ADDR, &bic, MMHAL_SDIO_FUNCTION_0);
-    }
-    if (result == MORSE_SUCCESS)
-    {
-        bic |= SDIO_CCCR_BIC_ECSI;
-        result = morse_cmd52_write(SDIO_CCCR_BIC_ADDR, bic, MMHAL_SDIO_FUNCTION_0);
-    }
-    morse_trns_release(driverd);
-
-    if (result != MORSE_SUCCESS)
-    {
-        /* FIX-1 self-unwind: a soft_start failure at mmdrv_init's transport site does `goto error_transport`
-         * (SKIPS the error-unwind morse_trns_stop) then memsets driver_data — so soft_start must join the
-         * worker it just created before returning, else that worker derefs a memset'd driver_data. Caller
-         * reboots via the MMOSAL_ASSERT in hw_restart_evt_handler. */
-        spi_irq_task_run = false;
-        mmosal_semb_give(spi_irq_semb);
-        while (!spi_irq_task_has_finished)
-        {
-            mmosal_task_sleep(1);
-        }
-        return MORSE_FAILED;
-    }
-
-    /* Do NOT re-register the SPI_IRQ GPIO handler (it persists across the soft restart) and do NOT re-enable
-     * SPI_IRQ here — mmdrv_init re-enables it (morse_trns_set_irq_enabled(true)) after FW reload/chip-ready.
-     * Do NOT call mmhal_wlan_init / spi_bus_initialize / spi_bus_add_device. */
-    return MORSE_SUCCESS;
 }
 
 void morse_trns_set_irq_enabled(struct driver_data *driverd, bool enabled)
