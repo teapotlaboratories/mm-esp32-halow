@@ -707,7 +707,63 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         goto drop;
     }
 
-    if (dot11_frame_control_get_protected(header->frame_control))
+    /* Defrag-before-decrypt for mesh SW-CCMP (encrypt-then-fragment). The host encrypts the WHOLE frame
+     * (one CCMP header + one MIC, computed over the unfragmented FC), then the MM6108 FW fragments it —
+     * replicating the MAC header per fragment but leaving the CCMP header only on fragment 0 and the MIC
+     * only on the last fragment. So each fragment is NOT independently decryptable; the correct order is
+     * reassemble the raw (still-encrypted) fragments, then decrypt the whole once. (mac80211's
+     * decrypt-then-defrag order is for fragment->encrypt = host-side fragmentation, which this FW mangles
+     * — see the reverted 9c7daabd.) Only for a protected, FW-raw-delivered, mesh SW-CCMP UNICAST fragment;
+     * everything else keeps the normal decrypt-then-defrag path below. */
+    bool reassembled = false;
+    if (dot11_frame_control_get_protected(header->frame_control) &&
+        !(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) &&
+        umac_mesh_is_active() && umac_mesh_sw_crypto_enabled() && mesh_ctrl_present &&
+        !mm_mac_addr_is_multicast(dot11_get_da(header)) &&
+        (dot11_frame_control_get_more_fragments(header->frame_control) ||
+         dot11_sequence_control_get_fragment_number(header->sequence_control) != 0))
+    {
+        /* Save the full [MAC header + QoS Control] CONTIGUOUSLY for the CCMP AAD before reassembling.
+         * datapath_defrag re-prepends only the MAC header (dot11_data_hdr_get_len omits the separate 2-byte
+         * QoS Control, which was peeled from the view above), so in the reassembled buffer the byte after
+         * the MAC header is the CCMP PN — but mesh_ccmp_aad_nonce reads the QoS/TID contiguously after the
+         * header. Copy header+QoS here (still adjacent in this fragment's buffer) and clear MoreFragments +
+         * fragment# = 0 so the AAD matches the unfragmented header the host authenticated over. Both resets
+         * are REQUIRED: mesh_ccmp_aad_nonce masks neither MoreFragments nor the frag# (it masks only the
+         * sequence number), and aad_hdr was copied from a fragment carrying MoreFrags/frag#!=0. */
+        uint8_t aad_hdr[MAX_QOS_DATA_MAC_HEADER_LEN];
+        size_t aad_hdr_len = data_hdr_len + sizeof(struct dot11_qos_ctrl);
+        MMOSAL_ASSERT(aad_hdr_len <= sizeof(aad_hdr));
+        memcpy(aad_hdr, data_hdr, aad_hdr_len);
+        struct dot11_hdr *ah = (struct dot11_hdr *)aad_hdr;
+        ah->frame_control = htole16(le16toh(ah->frame_control) & ~DOT11_MASK_FC_MORE_FRAGMENTS);
+        DOT11_SEQUENCE_CONTROL_SET_FRAGMENT_NUMBER(ah->sequence_control, 0);
+
+        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+        rxbuf = datapath_defrag(umacd, &sta_data->defrag_data, &data_hdr, &rxbufview, rxbuf, tid_index);
+        if (rxbuf == NULL)
+        {
+            MMOSAL_DEV_ASSERT(rxbufview == NULL);
+            return; /* accumulating fragments — wait for the last one before decrypting */
+        }
+        header = &data_hdr->base;               /* reassembled frame's header (for downstream addresses) */
+        /* datapath_defrag released the original rxbuf, so the old rx_metadata now dangles; the reassembled
+         * buffer is a defrag-alloc mmpkt with NO RX metadata (mmdrv_get_rx_metadata would assert on it — it
+         * is "for RX frames" only). rx_metadata is not read again on the reassembled path, so clear it
+         * (mirrors the normal decrypt-then-defrag path, which sets rx_metadata = NULL before defrag). */
+        rx_metadata = NULL;
+        /* Decrypt the reassembled whole frame; the view is now [CCMP hdr][ciphertext][MIC]. Use the saved
+         * contiguous [MAC header + QoS] as the AAD header (the reassembled buffer's header omits the QoS). */
+        if (!umac_datapath_sw_ccmp_decrypt(stad, rxbufview, (const struct dot11_data_hdr *)aad_hdr,
+                                           UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+        {
+            umac_stats_increment_datapath_rx_ccmp_failures(umacd);
+            goto drop;
+        }
+        reassembled = true;
+    }
+
+    if (!reassembled && dot11_frame_control_get_protected(header->frame_control))
     {
         if (rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED)
         {
@@ -716,7 +772,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             if (ccmp_header == NULL ||
                 !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
             {
-
                 umac_stats_increment_datapath_rx_ccmp_failures(umacd);
                 goto drop;
             }
@@ -743,7 +798,6 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         else
         {
-
             MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x, SEQ: 0x%04x).\n",
                       le16toh(header->frame_control),
                       le16toh(header->sequence_control));
@@ -751,6 +805,14 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
     }
 
+    if (mesh_ctrl_present)
+    {
+        /* Peer liveness: a decrypted mesh frame (data included) refreshes the transmitter's
+         * inactivity timer, mirroring Linux updating sta last_rx on every received frame
+         * (rx.c:4810). TA = immediate transmitter = the peer we heard from. Keeps an actively-
+         * communicating peer alive even if we miss its beacons (else MESH_PLINK_INACTIVITY_MS). */
+        umac_mesh_note_peer_rx(dot11_get_ta(header));
+    }
 
     if (tid_index <= MMWLAN_MAX_QOS_TID &&
         (dot11_frame_control_get_protected(header->frame_control) ||
@@ -762,7 +824,12 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
 
 
-    if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
+    if (reassembled)
+    {
+        /* The mesh SW-CCMP fragment path already reassembled the raw frame + decrypted the whole above;
+         * skip the mcast checks (a fragment here is unicast) and the normal decrypt-then-defrag below. */
+    }
+    else if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
         mm_mac_addr_is_multicast(dot11_get_da(header)))
     {
         if (dot11_frame_control_get_more_fragments(header->frame_control))
@@ -1243,7 +1310,15 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
 
     reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, tid_index);
 
-    if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0)
+    /* A fragmented MPDU (More Fragments set, or fragment number != 0) bypasses BA reordering. 802.11 makes
+     * A-MPDU and fragmentation mutually exclusive, and an FW-fragmented mesh SW-CCMP frame shares ONE
+     * sequence number across all its fragments — so the BA window (which advances per sequence number)
+     * would drop the 2nd+ fragment as "outdated". Deliver fragments straight to the after-reorder path,
+     * where they are reassembled (raw) then decrypted. No-op for unfragmented frames. */
+    bool is_fragment = dot11_frame_control_get_more_fragments(header->frame_control) ||
+                       (dot11_sequence_control_get_fragment_number(header->sequence_control) != 0);
+
+    if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0 || is_fragment)
     {
         umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
         return;
@@ -2049,6 +2124,31 @@ static void umac_datapath_aggr_check(struct umac_data *umacd,
     umac_ba_session_init(stad, tid, ssc, DOT11_BLOCK_ACK_TIMEOUT_DISABLED);
 }
 
+/* D1 (follow-Linux mesh_nexthop_resolve, mesh_hwmp.c): a mesh UNICAST DATA frame whose destination has
+ * no resolved HWMP path AND is not a direct peer is undeliverable right now. Linux buffers it + issues a
+ * PREQ; we have no mesh pending queue, so we DROP it and kick discovery — instead of the old fallback that
+ * transmitted RA=destination (only correct for a direct peer; for a multi-hop-only dest it wastes airtime
+ * on an unreachable RA + loses first packets). EAPOL (peering) and group/multicast are never dropped here.
+ * Side effect: kicks (rate-limited) path discovery when it returns true, so subsequent frames resolve. */
+static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h8023, bool is_eapol)
+{
+    if (is_eapol || mm_mac_addr_is_multicast(h8023->dest_addr))
+    {
+        return false;
+    }
+    uint8_t next_hop[DOT11_MAC_ADDR_LEN];
+    if (umac_mesh_lookup_next_hop(h8023->dest_addr, next_hop))
+    {
+        return false; /* a multi-hop path is resolved */
+    }
+    if (umac_mesh_get_peer_stad(h8023->dest_addr) != NULL)
+    {
+        return false; /* dest is a direct peer -> RA=dest is correct (single-hop, no path needed) */
+    }
+    umac_mesh_start_discovery(h8023->dest_addr);
+    return true;
+}
+
 enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
                                                   struct umac_sta_data *stad,
                                                   struct mmpktview *txbufview)
@@ -2071,7 +2171,6 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     enum mmwlan_status status = MMWLAN_ERROR;
 
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
 
 
     bool is_eapol = (ethertype == ETHERTYPE_EAPOL);
@@ -2103,6 +2202,13 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
             (umac_interface_get_vif_type_mask(umacd, stad_vif_id) & UMAC_INTERFACE_MESH) != 0;
         if (tx_is_mesh_frame)
         {
+            if (umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
+            {
+                /* D1: dropped pending path discovery (see helper); counted like any other TX drop. */
+                umac_stats_increment_datapath_txq_frames_dropped(umacd);
+                status = MMWLAN_SUCCESS;
+                goto error;
+            }
             umac_datapath_construct_80211_data_header_mesh(stad, header_8023, &data_hdr);
         }
         else
@@ -2116,6 +2222,17 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 #endif
     {
         tx_is_mesh_frame = umac_mesh_is_active();
+        if (tx_is_mesh_frame &&
+            umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
+        {
+            /* D1: count it like every other TX drop (mirrors the forward path's drop, :2856) so that
+             * "the first packets to a new multi-hop dest vanish" is VISIBLE in stats instead of silent.
+             * SUCCESS, not ERROR: the frame is deliberately consumed while path discovery is in flight —
+             * that is not a TX failure the caller can act on or retry differently. */
+            umac_stats_increment_datapath_txq_frames_dropped(umacd);
+            status = MMWLAN_SUCCESS;
+            goto error;
+        }
         data->ops->construct_80211_data_header(stad, header_8023, &data_hdr);
     }
     const uint32_t data_hdr_len = dot11_data_hdr_get_len(&data_hdr);
@@ -2171,6 +2288,17 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         }
     }
 
+    /* Sequence-number space + Block Ack / A-MPDU eligibility follow the NEXT-HOP peer (key_stad), not the
+     * dequeue stad. For a multi-hop local-origin unicast the frame is dequeued on the common_stad, but the
+     * per-link BA session, the next hop's reorder window, and the 802.11 QoS-data seqno must all key on the
+     * next hop (RA). Mirrors net/mac80211 ieee80211_tx_h_sequence: hdr->seq_ctrl is stamped from
+     * tx->sta->tid_seq[tid] with tx->sta = sta_info_get(addr1 = mpath->next_hop) (per-next-hop-peer, per-TID
+     * counter — NOT per-vif, NOT per-final-dest). Because A2/TA is always our own mesh MAC, the next hop keys
+     * its reorder scoreboard on (our-MAC, TID); a counter shared across next hops (or single-hop-to-P mixed
+     * with multi-hop-via-P) would feed one (TA,TID) window two seq spaces and corrupt reordering. key_stad ==
+     * stad for single-hop / non-mesh / multicast, so this is a no-op off the multi-hop mesh path. */
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(key_stad);
+
     MMOSAL_DEV_ASSERT(is_eapol || enc == ENCRYPTION_ENABLED);
 
     if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN && enc != ENCRYPTION_DISABLED)
@@ -2203,7 +2331,10 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     if (!is_multicast && !is_eapol)
     {
-        umac_datapath_aggr_check(umacd, stad, tid, header->sequence_control);
+        /* key_stad, not stad: open the originator BA session on the next-hop peer so the ADDBA is
+         * addressed to the real next hop (umac_ba_tx_addba_req -> peek_peer_addr) instead of self-
+         * addressing on common_stad (own mesh MAC) for a multi-hop origin. See the key_stad note above. */
+        umac_datapath_aggr_check(umacd, key_stad, tid, header->sequence_control);
     }
 
     rts_threshold = umac_config_get_rts_threshold(umacd);
@@ -2268,8 +2399,11 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     if (!is_multicast)
     {
-        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, tid);
-        if (umac_ba_is_ampdu_permitted(stad, tid))
+        /* key_stad: read the reorder-window bound + AMPDU-permitted flag from the next-hop peer's BA
+         * session (where aggr_check opened it), so a multi-hop origin's frames are marked A-MPDU-eligible.
+         * key_stad == stad off the multi-hop mesh path. */
+        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(key_stad, tid);
+        if (umac_ba_is_ampdu_permitted(key_stad, tid))
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
         }
@@ -2277,7 +2411,19 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     umac_connection_populate_tx_metadata(umacd, tx_metadata);
 
-    tx_metadata->aid = umac_sta_data_get_aid(stad);
+    /* aid + rate control follow the NEXT-HOP peer (key_stad), not the dequeue stad. A multi-hop mesh
+     * origin unicast is dequeued on the common_stad (chronite/final-dest is not a direct peer), whose
+     * aid/rate table is the untrained MBSS default (~MCS0). The frame is actually a unicast to the next
+     * hop (A1 = key_stad), so both the AID the FW indexes its per-STA TX context by AND the rate table
+     * must be the next hop's trained values. Keeping them on common_stad sent multi-hop frames at MCS0,
+     * where a full-size (~1500 B) 4-addr frame exceeds the 1 MHz max PPDU -> the FW FRAGMENTS it (sets
+     * moreFrag) AFTER the host SW-CCMP MIC is computed over the unfragmented FC -> the next hop MIC-fails
+     * ~99.6% (the S3 relay-forward drop; dual-side CCMP capture: key+nonce identical, FC 0x8843->0x8847).
+     * Completes the S2 "frame follows the next hop" fix (seqno/BA/reorder already key on key_stad, :2209-
+     * 2246/:2314). Mirrors net/mac80211: tx->sta = sta_info_get(addr1 = mpath->next_hop) drives rate
+     * control (rate_control_get_rate) + the per-STA TX context. key_stad == stad off the multi-hop mesh
+     * path, so single-hop / non-mesh / multicast are byte-identical (no-op). */
+    tx_metadata->aid = umac_sta_data_get_aid(key_stad);
 
 
     if (is_eapol)
@@ -2292,8 +2438,8 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     }
     else
     {
-        MMOSAL_DEV_ASSERT(stad != NULL);
-        umac_rc_init_rate_table_data(stad,
+        MMOSAL_DEV_ASSERT(key_stad != NULL);
+        umac_rc_init_rate_table_data(key_stad,
                                      &tx_metadata->rc_data,
                                      rts_required,
                                      mmpkt_get_data_length(txbufview));
@@ -2687,8 +2833,44 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(txbufview);
     struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
 
+    /* S3 (relay onto the aggregation-eligible data path, blocker B6). A forwarded UNICAST (key_type ==
+     * PAIRWISE, from umac_datapath_tx_mesh_unicast_frame) rides the next hop's per-TID QoS-data seqno
+     * space and opens a BA session on the next hop, so the FW A-MPDUs it — mirroring the local-origin
+     * path (:2209-2219). A re-broadcast GROUP (key_type == GROUP) stays on the baseline seqno space and
+     * never aggregates (No-Ack multicast). `stad` is already the next-hop peer for a forwarded unicast. */
+#if MESH_FWD_DATA_AGGREGATE
+    bool fwd_aggregate = (key_type == UMAC_KEY_TYPE_PAIRWISE);
+#else
+    bool fwd_aggregate = false;
+#endif
+    uint8_t fwd_tid = fwd_aggregate ? (uint8_t)MESH_FWD_TID : (uint8_t)MMWLAN_MAX_QOS_TID;
+    size_t seq_idx = fwd_aggregate ? (size_t)MESH_FWD_TID : (size_t)MMDRV_SEQ_NUM_BASELINE;
+
+    /* Wait for TX headroom BEFORE the seqno stamp / aggr_check below, so a paused forward never stamps a
+     * next-hop seqno it won't transmit (A-MPDU reorder gap) and never reaches aggr_check while paused.
+     * NB (2026-07-12 bench): the "relay interrupt-WDT crash" this originally tried to dodge with a
+     * timeout=0 drop-on-full is a board0-WIRING artifact (no WAKE/BUSY), NOT a software stall — a
+     * fully-wired relay (board2) never crashes. And timeout=0 was far too aggressive: it dropped ~every
+     * forward on any transient pause (board2 forwarded ~0/733). So use a bounded wait: lets a transient
+     * pause clear (the forward actually goes out + can aggregate) while capping the evtloop stall well
+     * under the interrupt-WDT window. See docs/reference/rimba-bench-devices.md + the S3 worklog. */
+    uint16_t pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
+    status = umac_datapath_wait_for_tx_ready_(data, MESH_FWD_TX_TIMEOUT_MS, pause_mask);
+    if (status != MMWLAN_SUCCESS)
+    {
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return status;
+    }
+
     DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
-                                               sta_data->tx_seq_num_spaces[MMDRV_SEQ_NUM_BASELINE]++);
+                                               sta_data->tx_seq_num_spaces[seq_idx]++);
+
+    if (fwd_aggregate)
+    {
+        umac_datapath_aggr_check(umacd, stad, fwd_tid, header->sequence_control);
+    }
 
     int key_id = -1;
     if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN)
@@ -2729,7 +2911,17 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
             umac_keys_increment_tx_seq(stad, key_id);
         }
     }
-    tx_metadata->tid = MMWLAN_MAX_QOS_TID;
+    tx_metadata->tid = fwd_tid;
+    /* S3 — mark the forwarded unicast A-MPDU-eligible from the next hop's BA session (where aggr_check
+     * opened it), mirroring the local-origin path (:2287-2292). Group re-broadcast stays non-aggregated. */
+    if (fwd_aggregate)
+    {
+        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, fwd_tid);
+        if (umac_ba_is_ampdu_permitted(stad, fwd_tid))
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
+        }
+    }
     tx_metadata->aid = umac_sta_data_get_aid(stad);
     /* P6c real-RC (Edit 2b): sample the peer's learned data rates on the forward path (mirrors the
      * local-origin path :2240), so a relay-dominated node trains mmrc instead of only feeding MCS0.
@@ -2737,21 +2929,15 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
     umac_rc_init_rate_table_data(stad, &tx_metadata->rc_data, false,
                                  mmpkt_get_data_length(txbufview));
 
-    uint16_t pause_mask = ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM;
-    uint32_t timeout_ms = umac_datapath_calculate_tx_timeout_ms(umacd, true);
-    status = umac_datapath_wait_for_tx_ready_(data, timeout_ms, pause_mask);
-    if (status != MMWLAN_SUCCESS)
-    {
-        mmpkt_close(&txbufview);
-        mmpkt_release(txbuf);
-        umac_stats_increment_datapath_txq_frames_dropped(umacd);
-        return status;
-    }
-
     umac_stats_update_last_tx_time(umacd);
 
     mmpkt_close(&txbufview);
-    if (mmdrv_tx_frame(txbuf, true) < 0)
+    /* S3 channel routing — mmdrv_tx_frame's 2nd arg is `is_mgmt` (queue select), NOT "blocking"; it only
+     * enqueues. Aggregating unicast goes on the DATA channel (is_mgmt=false) so the FW A-MPDUs it; the GROUP
+     * re-broadcast and the S3-off fallback stay on the MGMT channel (is_mgmt=true) — their pre-S3 queue.
+     * A broadcast on the ack-expecting DATA queue (is_mgmt=false without MMDRV_TX_FLAG_NO_ACK) would await
+     * an ACK that never comes, so group must not go there. */
+    if (mmdrv_tx_frame(txbuf, !fwd_aggregate) < 0)
     {
         return MMWLAN_ERROR;
     }
@@ -3640,6 +3826,25 @@ static void umac_datapath_process_rx_mgmt_frame_mesh(struct umac_data *umacd,
 
     if (subtype == DOT11_FC_SUBTYPE_ACTION)
     {
+        /* Block Ack action frames (ADDBA req/resp, DELBA) drive the per-peer BA session for A-MPDU:
+         * route them to the BA state machine keyed on the TRANSMITTING peer's stad, mirroring
+         * net/mac80211 ieee80211_rx_h_action's `case WLAN_CATEGORY_BACK` (rx.c) which is reached for a
+         * MESH_POINT vif. The passed stad is the mesh common stad (MM_UNUSED); the BA agreement is
+         * per-link, so resolve the peer stad from the frame's SA (A2 = the transmitting neighbour).
+         * Everything else (MPM/AMPE peering, HWMP path selection) stays with the mesh action handler. */
+        const struct dot11_action *action =
+            (const struct dot11_action *)mmpkt_get_data_start(rxbufview);
+        if (action->field.category == DOT11_ACTION_CATEGORY_BLOCK_ACK)
+        {
+            struct umac_sta_data *peer_stad = umac_mesh_get_peer_stad(dot11_get_sa(header));
+            if (peer_stad != NULL)
+            {
+                umac_ba_process_rx_frame(peer_stad,
+                                         mmpkt_get_data_start(rxbufview),
+                                         mmpkt_get_data_length(rxbufview));
+            }
+            return;
+        }
         umac_mesh_handle_action(umacd, rxbufview);
     }
     else if (subtype == DOT11_FC_SUBTYPE_AUTH)

@@ -412,10 +412,17 @@ static void umac_mesh_invalidate_paths_via(const uint8_t *next_hop);
 #define MESH_PLINK_MAX_RETRIES       (16)  /* ~5 s of silence (counter resets on any RX) before
                                             * giving up — avoids tearing down an active handshake */
 #define MESH_PLINK_HOLDING_TICKS     (2)
-/* Established-peer inactivity (mac80211 mesh_sta_cleanup / ieee80211_sta_expire with
- * mshcfg.plink_timeout). With ~100 ms beacons, no frame from a peer for this long means the
- * link is broken: close it, flush paths through it (-> PERR), and free the slot. */
-#define MESH_PLINK_INACTIVITY_MS     (6000)
+/* Established-peer inactivity teardown — mirror Linux mac80211 mesh housekeeping. Linux expires a
+ * mesh peer only after mshcfg.plink_timeout of no activity (ieee80211_sta_expire, sta_info.c:1616;
+ * driven by ieee80211_mesh_housekeeping, mesh.c:911), default MESH_DEFAULT_PLINK_TIMEOUT = 1800 s
+ * (net/wireless/mesh.c:26), evaluated lazily on a 60 s housekeeping tick (mesh.h:221). "Activity" is
+ * last_rx, refreshed by the peer's beacon (mesh_plink.c:446, our umac_mesh_handle_peer_beacon) AND by
+ * ANY received frame incl. data (rx.c:4810 fast-RX / rx.c:1770, our umac_mesh_note_peer_rx).
+ * The prior 6000 ms was ~300x too aggressive: at ~100 ms beacons it tolerated only ~60 missed beacons,
+ * so a brief RX fade tore the link down and forced a fresh SAE re-peer (under user-MPM secured mesh,
+ * __mesh_plink_deactivate silently destroys the sta, mesh_plink.c:410 — no Close, full re-SAE to recover).
+ * Match Linux's window so marginal RX rides through; close + flush paths (-> PERR) only after this. */
+#define MESH_PLINK_INACTIVITY_MS     (1800u * 1000u) /* 1800 s = Linux MESH_DEFAULT_PLINK_TIMEOUT */
 
 /* Peer-link states (mirror NL80211_PLINK_*). */
 enum mesh_plink_state
@@ -604,7 +611,14 @@ static struct mesh_peer *mesh_peer_alloc(const uint8_t *mac)
             umac_sta_data_set_bssid(p->stad, mesh_ctx.mesh_mac);
             umac_sta_data_set_peer_addr(p->stad, mac);
 #if MMWLAN_MESH_SEC_PHASE1
-            umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+            /* MFP=no (PMF_DISABLED), matching net/mac80211: a mesh peer's sta is MFP=no, so mac80211 sends
+             * ALL mesh management UNPROTECTED (HWMP PREQ/PREP, MPM/AMPE, Block Ack ADDBA/DELBA) and gates
+             * its unprotected-robust-mgmt RX drop on WLAN_STA_MFP. Keeping SAE (security_type != OPEN) still
+             * installs the pairwise/group keys for DATA CCMP — only pmf_is_required (management protection,
+             * umac_datapath.c:2584 TX / :373 RX) is turned off, so we stop pairwise-encrypting unicast robust
+             * mesh mgmt. That fixes the interop asymmetry where the ESP transmitted ADDBA/unicast-PREP
+             * CCMP-protected while a MFP=no Linux peer sends them in the clear (and would reject ours). */
+            umac_sta_data_set_security(p->stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
             /* Fresh local AMPE nonce per (re)alloc — both ends regenerate so a re-peer can't reuse a
              * stale MTK. peer_nonce_valid stays false (memset above) until we learn the peer's. */
             mmint_crypto_get_random(p->my_nonce, sizeof(p->my_nonce));
@@ -1372,6 +1386,24 @@ uint8_t mmwlan_mesh_peer_count(uint8_t estab_macs[][6])
         }
     }
     return n;
+}
+
+/* Refresh a peer's liveness on ANY received (decrypted) frame from it, mirroring Linux updating
+ * sta->deflink.rx_stats.last_rx on every frame (rx.c:4810 fast-RX path / rx.c:1771 general path).
+ * Called from the mesh data RX path with the frame's TA (immediate transmitter = the peer we heard
+ * from). Without this the ESP counted only beacons/peering/SAE as activity, so a peer actively
+ * sending us data whose beacons we happened to miss could wrongly hit MESH_PLINK_INACTIVITY_MS. */
+void umac_mesh_note_peer_rx(const uint8_t *ta)
+{
+    if (!mesh_ctx.active || ta == NULL)
+    {
+        return;
+    }
+    struct mesh_peer *peer = mesh_peer_find(ta);
+    if (peer != NULL)
+    {
+        peer->last_rx_ms = mmosal_get_time_ms();
+    }
 }
 
 void umac_mesh_handle_peer_beacon(const uint8_t *peer_mac, const uint8_t *ies, uint32_t ies_len)
@@ -2597,7 +2629,14 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     mac_addr_copy(p.next_hop, next_hop);
 
     struct umac_data *umacd = umac_data_get_umacd();
+    /* S3 — allocate the forwarded unicast on the per-TID data class so the FW enqueues it on the
+     * aggregating data queue (build_mesh_data_frame) instead of the mgmt queue (build_mgmt_frame), which
+     * never A-MPDUs. umac_datapath_tx_mesh_unicast_frame then marks it A-MPDU-eligible on the next hop. */
+#if MESH_FWD_DATA_AGGREGATE
+    struct mmpkt *frame = build_mesh_data_frame(umacd, umac_mesh_build_forward, &p, MESH_FWD_TID);
+#else
     struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_forward, &p);
+#endif
     if (frame == NULL)
     {
         return false;
@@ -2882,6 +2921,23 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
         return;
     }
 
+    /* Peer-link-id (plid) match, == mac80211 mesh_plink_get_event (mesh_plink.c:1077-1088): once we've
+     * recorded the peer's link id, an OPEN/CONFIRM carrying a DIFFERENT plid is OPN_IGNR/CNF_IGNR — the
+     * peer re-alloc'd its llid (restarted / raced a new session) while we still hold the old plink. Drop
+     * it WITHOUT learning the new plid or (below) the new AMPE nonce: the per-pair MTK is derived once at
+     * ESTAB from the recorded nonce+lid, so adopting the peer's new nonce/plid into a still-ESTAB peer
+     * silently desyncs our key from theirs (we keep the old MTK; they moved to a new one) -> every
+     * forwarded frame then fails its SW-CCMP MIC. A genuine restart still recovers: the peer's re-SAE
+     * Commit frees this peer via the reauth path (plid resets to 0), after which the next Open re-peers
+     * cleanly and both ends re-derive a matching MTK. mac80211 only re-peers from a plid==0 (freed) sta. */
+    if ((action == WLAN_SP_MESH_PEERING_OPEN || action == WLAN_SP_MESH_PEERING_CONFIRM) &&
+        peer->plid != 0 && peer_plid != peer->plid)
+    {
+        MMLOG_INF("MESH peer " MM_MAC_ADDR_FMT " plid mismatch rx=0x%04x ours=0x%04x; ignoring (OPN/CNF_IGNR)\n",
+                  MM_MAC_ADDR_VAL(sa), (unsigned)peer_plid, (unsigned)peer->plid);
+        return;
+    }
+
     /* Learn the peer's link id; a received peering frame is forward progress, so reset the
      * retransmit counter and mark the peer live (mac80211 last_rx). */
     peer->plid = peer_plid;
@@ -3115,8 +3171,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
          * mesh primary vif happening to be 0. */
         umac_sta_data_set_vif_id(mesh_ctx.common_stad, mesh_ctx.vif_id);
 #if MMWLAN_MESH_SEC_PHASE1
-        /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB). */
-        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_REQUIRED);
+        /* security != OPEN gates broadcast/group TX encryption (own MGTK installed at first ESTAB).
+         * PMF_DISABLED (MFP=no) matches net/mac80211 — mesh management is sent unprotected; see the
+         * per-peer set_security rationale above. */
+        umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
         /* P2c: generate this node's own MGTK once per mesh session, before any peering Open carries
          * it (mac80211 __mesh_rsn_auth_init). The install onto the common stad stays deferred to first
          * ESTAB (umac_mesh_install_common_keys) — a group key at start breaks OPEN peering (P1 gotcha). */

@@ -24,6 +24,33 @@
 #include "mmpkt.h"
 #include "umac/data/umac_data.h"
 
+/* S3 — relay/forward onto the aggregation-eligible data path (design §5 S3, blocker B6). When 1, a
+ * forwarded mesh UNICAST is built on the per-TID DATA class and marked A-MPDU-eligible on its next-hop
+ * BA session (mirrors net/mac80211 ieee80211_rx_h_mesh_forward re-injecting into the normal data TX
+ * path, TID preserved); when 0 it falls back to today's mgmt-class, non-aggregating forward. This flag
+ * also selects the TX queue: mmdrv_tx_frame's 2nd arg is `is_mgmt` (queue select), so aggregate=1 -> data
+ * queue, 0 -> mgmt queue. NB there is no "non-blocking forward TX": that arg was once misread as a
+ * blocking flag (the since-retracted "FIX-2"). What bounds the forward's evtloop stall is the explicit
+ * MESH_FWD_TX_TIMEOUT_MS wait below — keep that margin honest.
+ * Kept as a compile-time toggle for bench A/B without reverting S1/S2. */
+#ifndef MESH_FWD_DATA_AGGREGATE
+#define MESH_FWD_DATA_AGGREGATE 1
+#endif
+
+/* Forwarded unicast rides best-effort TID 0 — matches the wire QoS TID that umac_mesh_build_forward
+ * stamps (0x0100 = Mesh Control Present, TID bits 0), and 0 <= UMAC_BA_MAX_AGGR_TID so it aggregates. */
+#define MESH_FWD_TID 0
+
+/* Bounded TX-ready wait for a forwarded frame (ms). The forward runs in the umac-core evtloop; the
+ * original code waited the full MMWLAN_TX_DEFAULT_TIMEOUT_MS (1000 ms) and a timeout=0 drop-on-full
+ * forwarded ~nothing (bench 2026-07-12). This bound lets a transient pause clear so the forward actually
+ * goes out (and can aggregate) while capping the evtloop stall.
+ * BUDGET: the interrupt-WDT window is 300 ms and this wait is NOT the only work in an evtloop iteration
+ * (CCMP encrypt, RX processing, peering run there too) — so the wait alone must leave room for the rest.
+ * 250 ms was 83% of the window and could itself trip the very WDT this bounds; 100 ms rides out a
+ * transient pause (the observed pauses are ms-scale) while leaving ~200 ms for everything else. */
+#define MESH_FWD_TX_TIMEOUT_MS 100
+
 /* ---- public API (mirrors mmwlan_ibss_*) ----------------------------------- */
 
 /** Arguments to bring up an 802.11s mesh interface. */
@@ -123,6 +150,11 @@ void umac_mesh_handle_auth(struct umac_data *umacd, struct mmpktview *rxbufview)
  *  points at the beacon information elements. If the Mesh ID matches ours, initiates a peer
  *  link. Called from the datapath's S1G-beacon handler when a mesh vif is active. */
 void umac_mesh_handle_peer_beacon(const uint8_t *peer_mac, const uint8_t *ies, uint32_t ies_len);
+
+/** Refresh an established peer's inactivity timer on ANY received frame from it (mirrors Linux
+ *  updating sta last_rx on every frame, rx.c:4810). `ta` is the frame's transmitter address.
+ *  Called from the mesh data RX path so active data traffic — not just beacons — counts as liveness. */
+void umac_mesh_note_peer_rx(const uint8_t *ta);
 
 /** HWMP: look up an ACTIVE mesh path to `dest`, writing the next-hop MAC to `next_hop_out`.
  *  Returns false if there is no resolved path (the caller should send direct + start discovery). */

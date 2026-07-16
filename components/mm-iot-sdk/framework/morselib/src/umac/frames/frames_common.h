@@ -21,6 +21,11 @@ typedef void (*mgmt_frame_builder_t)(struct umac_data *umacd, struct consbuf *bu
 
 struct mmpkt *build_mgmt_frame(struct umac_data *umacd, mgmt_frame_builder_t builder, void *params);
 
+/* S3 — as build_mgmt_frame but allocates the frame on the per-TID data class (MMDRV_PKT_CLASS_DATA_TID0
+ * + tid) so a forwarded mesh unicast lands on the aggregating data queue instead of the mgmt queue. */
+struct mmpkt *build_mesh_data_frame(struct umac_data *umacd, mgmt_frame_builder_t builder, void *params,
+                                    uint8_t tid);
+
 
 bool frame_is_robust_mgmt(struct mmpktview *view);
 
