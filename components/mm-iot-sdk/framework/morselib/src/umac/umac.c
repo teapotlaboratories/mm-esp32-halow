@@ -1739,6 +1739,49 @@ enum mmwlan_status mmwlan_twt_setup_request(const struct mmwlan_twt_config_args 
     return MMWLAN_SUCCESS;
 }
 
+/* Public accessor for a TWT agreement's state, so an app can self-verify that a setup reached
+ * INSTALLED (the established state) rather than only inferring it from a PPK2 doze trace. Used by
+ * firmware/test-twt. The name matches the mmwlan* glob in protected_syms.txt, so it is exported
+ * unmangled like the rest of the public API. Returns:
+ *    1  agreement for flow_id is INSTALLED (established)
+ *    0  agreement exists but is still pending (PENDING_RESPONSE / PENDING_INSTALLATION)
+ *   -1  no such agreement, or morselib not initialised */
+int mmwlan_twt_agreement_installed(uint16_t flow_id)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return -1;
+    }
+    struct umac_twt_agreement_data *ag = umac_twt_get_agreement(umacd, flow_id);
+    if (ag == NULL)
+    {
+        return -1;
+    }
+    return (ag->state == UMAC_TWT_AGREEMENT_STATE_INSTALLED) ? 1 : 0;
+}
+
+/* Public accessor for the firmware's advertised A-MPDU capability, so an app can self-verify that
+ * the MM6108 FW still reports the mesh AMPDU capability the S0 spike proved on 2026-07-11
+ * (docs/worklog/2026-07-11-mesh-ampdu-s0-fw-capability-spike.md, S0a). This is the SAME bit the
+ * aggregation eligibility gate reads at umac_datapath.c via MORSE_CAP_SUPPORTED(..., AMPDU) -- so a
+ * stack bump that silently closes that gate fails the check. Used by firmware/test-ampdu-cap. The
+ * name matches the mmwlan* glob in protected_syms.txt, so it is exported unmangled.
+ * NB: per-vif capabilities are fetched at interface-add time (mmdrv_get_capabilities in
+ * umac_interface_add), so this reads 0 until a vif is up -- call it AFTER mmwlan_mesh_start. Returns:
+ *    1  FW advertises AMPDU for the active vif
+ *    0  FW does not advertise AMPDU (or no vif has been added yet)
+ *   -1  morselib not initialised */
+int mmwlan_ampdu_capability_advertised(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return -1;
+    }
+    return MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), AMPDU) ? 1 : 0;
+}
+
 enum mmwlan_status mmwlan_twt_teardown(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();

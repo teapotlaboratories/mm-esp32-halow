@@ -18,3 +18,4 @@ puts
 setvbuf
 mm_hexdump
 morse_xtal_init_delay
+esp_mesh_ccm_selftest

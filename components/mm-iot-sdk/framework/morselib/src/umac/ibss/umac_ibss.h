@@ -110,6 +110,14 @@ void mmwlan_ibss_register_peer_cb(mmwlan_ibss_peer_cb_t cb, void *arg);
 void mmwlan_ibss_foreach_peer(mmwlan_ibss_peer_cb_t cb, void *arg);
 
 /**
+ * Number of currently-known IBSS peers; if @p peer_macs != NULL, copies up to
+ * UMAC_IBSS_MAX_PEERS peer MACs into it. Every in_use entry is a peer we have
+ * heard a frame from, so on a provisioned N-node cell this reads N-1 with 0
+ * phantoms. App-visible telemetry (morselib MMLOG does not reach the UART).
+ */
+uint8_t mmwlan_ibss_peer_count(uint8_t peer_macs[][6]);
+
+/**
  * Age out peers that have not been heard from in @p threshold_ms.
  * Intended to be invoked periodically (e.g. every few seconds from a timer
  * task). Fires @c MMWLAN_IBSS_PEER_REMOVED for each evicted entry.
