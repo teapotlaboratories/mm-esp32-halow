@@ -179,6 +179,35 @@ void mmwlan_ibss_foreach_peer(mmwlan_ibss_peer_cb_t cb, void *arg)
     }
 }
 
+/* Number of currently-known IBSS peers; if @p peer_macs != NULL, copies up to UMAC_IBSS_MAX_PEERS
+ * peer MACs into it. Every in_use entry is a peer we have heard a frame from, so on a provisioned
+ * N-node cell this reads N-1 with 0 phantoms -- i.e. an exact count IS the phantom check (the #17
+ * phantom-peer bug would show as an extra in_use entry). App-visible telemetry the test-ibss
+ * reporter polls (morselib MMLOG does not reach the UART). Mirrors mmwlan_mesh_peer_count. The name
+ * matches the mmwlan* protected-symbols glob, so it is exported unmangled. */
+uint8_t mmwlan_ibss_peer_count(uint8_t peer_macs[][6])
+{
+    if (ibss_peers_lock == NULL)
+    {
+        return 0;
+    }
+    uint8_t n = 0;
+    IBSS_PEERS_LOCK();
+    for (size_t i = 0; i < UMAC_IBSS_MAX_PEERS; i++)
+    {
+        if (ibss_ctx.peers[i].in_use)
+        {
+            if (peer_macs != NULL)
+            {
+                memcpy(peer_macs[n], ibss_ctx.peers[i].mac, 6);
+            }
+            n++;
+        }
+    }
+    IBSS_PEERS_UNLOCK();
+    return n;
+}
+
 void mmwlan_ibss_age_peers(uint32_t threshold_ms)
 {
     if (ibss_peers_lock == NULL)

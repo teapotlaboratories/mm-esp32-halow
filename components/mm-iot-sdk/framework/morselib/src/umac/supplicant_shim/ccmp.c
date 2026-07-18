@@ -137,7 +137,12 @@ static int esp_mesh_ccm_ad(const uint8_t *key, size_t key_len, const uint8_t *no
 }
 
 /* RFC-3610 Packet-Vector-#1 known-answer test + decrypt round-trip. Returns 0 = PASS. Not called at
- * runtime by default (correctness is proven); available for a boot check. */
+ * runtime by default (correctness is proven); available for a boot check.
+ *
+ * Listed in framework/tools/metadata/protected_syms.txt so librarymangler.py leaves the name
+ * unmangled and app code can link against it: firmware/test-swccmp exercises this as the
+ * mesh-crypto regression test. Without that entry the symbol ships as mmint_esp_mesh_ccm_selftest
+ * and only morselib-internal callers can reach it. */
 int esp_mesh_ccm_selftest(void)
 {
     static const uint8_t key[16] = { 0xC0,0xC1,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xCB,0xCC,0xCD,0xCE,0xCF };
