@@ -61,7 +61,7 @@ int mesh_sae_build_commit(void *handle, const uint8_t *our_mac, const uint8_t *p
     {
         return -1;
     }
-    if (sae_write_commit(sae, buf, NULL, NULL) == 0 && wpabuf_len(buf) <= out_cap)
+    if (sae_write_commit(sae, buf, NULL, NULL, 0) == 0 && wpabuf_len(buf) <= out_cap)
     {
         *out_len = wpabuf_len(buf);
         os_memcpy(out, wpabuf_head(buf), *out_len);

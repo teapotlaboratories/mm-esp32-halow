@@ -40,9 +40,6 @@ struct datapath_txq_data
 };
 
 
-struct umac_datapath_ops;
-
-
 struct umac_datapath_data
 {
 
@@ -78,8 +75,6 @@ struct umac_datapath_data
     mmwlan_monitor_rx_cb_t monitor_cb;
 
     void *monitor_cb_arg;
-
-    const struct umac_datapath_ops *ops;
 };
 
 

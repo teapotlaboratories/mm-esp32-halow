@@ -19,7 +19,6 @@
 #include "umac/frames/deauthentication.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/scan/umac_scan.h"
-#include "umac/offload/umac_offload.h"
 
 
 
@@ -102,6 +101,8 @@ struct umac_evt
 
             enum umac_interface_type type;
 
+            const uint8_t *mac_addr;
+
             struct mmosal_semb *semb;
 
             volatile enum mmwlan_status *status;
@@ -160,6 +161,18 @@ struct umac_evt
         struct
         {
 
+            char *uri_buf;
+
+            size_t buf_len;
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } dpp_get_uri;
+
+        struct
+        {
+
             enum mmwlan_ps_mode mode;
         } set_ps_mode;
 
@@ -183,48 +196,6 @@ struct umac_evt
 
             volatile enum mmwlan_status *status;
         } update_beacon_vendor_ie_filter;
-
-        struct
-        {
-
-            uint32_t arp_addr;
-        } arp_response_offload;
-
-        struct
-        {
-
-            uint32_t interval_s;
-
-            uint32_t dest_ip;
-
-            bool send_as_garp;
-        } arp_refresh_offload;
-
-        struct
-        {
-
-            mmwlan_dhcp_lease_update_cb_t dhcp_lease_update_cb;
-
-            void *dhcp_lease_update_cb_arg;
-        } dhcp_offload;
-
-        struct
-        {
-
-            struct mmwlan_dhcp_lease_info lease_info;
-        } dhcp_offload_lease_update;
-
-        struct mmwlan_standby_enter_args standby_enter;
-
-        struct mmwlan_standby_set_status_payload_args standby_set_status_payload;
-
-        struct mmwlan_standby_set_wake_filter_args standby_set_wake_filter;
-
-        struct mmwlan_standby_config standby_set_config;
-
-        struct mmwlan_tcp_keepalive_offload_args tcp_keepalive_offload;
-
-        struct mmwlan_config_whitelist whitelist_filter;
 
         struct
         {
@@ -257,6 +228,14 @@ struct umac_evt
         struct
         {
 
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } ap_stop;
+
+        struct
+        {
+
             const uint8_t *sta_addr;
 
             struct mmwlan_ap_sta_status *sta_status;
@@ -283,8 +262,39 @@ struct umac_evt
 
             volatile enum mmwlan_status *status;
         } set_dynamic_ps_timeout;
+
+        struct
+        {
+
+            const struct mmwlan_relay_args *args;
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } relay_start;
+
+        struct
+        {
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } relay_stop;
+
+        struct
+        {
+
+            struct mmpkt *txbuf;
+
+        } tx_mgmt_frame;
     } args;
 };
+
+#ifndef UNIT_TESTS_64
+
+MM_STATIC_ASSERT(sizeof(struct umac_evt) == 32,
+                 "struct umac_evt must be 32 bytes to maintain ROM compatibility");
+#endif
 
 
 #define UMAC_EVT_INIT(_handler) { .handler = (_handler) }

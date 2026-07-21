@@ -35,10 +35,22 @@ extern "C"
 struct lfs_config;
 
 /**
- * Flash partition configuration structure
+ * Underlying integer type for @ref mmhal_flash_addr_t. Defaults to
+ * @c uint32_t. May be overridden by the build system (e.g. by defining
+ * @c MMHAL_FLASH_ADDR_T on the compiler command line) if a platform requires
+ * a wider integer type to represent a flash address.
+ */
+#ifndef MMHAL_FLASH_ADDR_T
+#define MMHAL_FLASH_ADDR_T uint32_t
+#endif
+
+/** Address type used by the mmhal flash API. */
+typedef MMHAL_FLASH_ADDR_T mmhal_flash_addr_t;
+
+/**
+ * Flash partition configuration structure.
  *
- * This should be initialized using @c MMHAL_FLASH_PARTITION_CONFIG_DEFAULT.
- * For example:
+ * This should be initialized using @c MMHAL_FLASH_PARTITION_CONFIG_DEFAULT. For example:
  *
  * @code{.c}
  * struct mmhal_flash_partition_config partition = MMHAL_FLASH_PARTITION_CONFIG_DEFAULT;
@@ -46,17 +58,25 @@ struct lfs_config;
  */
 struct mmhal_flash_partition_config
 {
-    /** The start address of the partition, this may be a physical address
-     *  or a relative address depending on implementation
+    /**
+     * The start address of the partition. If @c not_memory_mapped is false, then this must
+     * be a directly readable address within the CPU's memory map. If @c not_memory_mapped
+     * is true, then this address is implementation defined.
+     *
+     * Regardless of the value @c not_memory_mapped, the partition address range defined by
+     * @c partition_start and @c partition_size must be understood by @c mmhal_flash_erase(),
+     * @c mmhal_flash_getblocksize(), @c mmhal_flash_read(), and @c mmhal_flash_write().
      */
-    uint32_t partition_start;
+    mmhal_flash_addr_t partition_start;
 
-    /** The size of the partition */
+    /** The size of the partition (in bytes). */
     uint32_t partition_size;
 
     /**
-     * If true, then the partition is not memory mapped and cannot be directly accessed
-     * at the physical @c partition_start address
+     * If @c false, then the partition address range (`partition_start` to
+     * `partition_start + partition_size`) must be directly readable within the CPU's memory map.
+     * If @c true, then the partition is not memory mapped and its contents can only be read using
+     * @ref mmhal_flash_read().
      */
     bool not_memory_mapped;
 };
@@ -67,45 +87,71 @@ struct mmhal_flash_partition_config
 /**
  * Get MMCONFIG flash partition configuration.
  *
- * MMCONFIG initialization is done by @c mmconfig_init() in @c mmconfig.c.
+ * MMCONFIG initialization is done by @c mmconfig_init() in @c mmconfig.c,
  * which in turn calls this function to fetch the partition configuration for config store
  * from the HAL layer. If config store is not supported by the platform then we just
  * return NULL. This function returns a static pointer to
  * @c struct @c mmhal_flash_partition_config.
+ *
+ * Because primary/secondary partitions are used in the current implementation,
+ * the available config storage is half of the provided size.
  *
  * @return A static pointer to the partition config for MMCONFIG, or NULL if not supported.
  */
 const struct mmhal_flash_partition_config *mmhal_get_mmconfig_partition(void);
 
 /**
- * Erases a block of Flash pointed to by the block_address.
+ * Get optional factory default MMCONFIG flash partition configuration.
  *
- * The block address may be anywhere within the block to erase. The entire block gets erased.
- * Once erased all bytes in the block shall be @c MMHAL_FLASH_ERASE_VALUE (@c 0xFF).
+ * This partition uses the same on-flash format as a single MMCONFIG image, but is treated as
+ * read-only by @c mmconfig. If present and valid, values in this partition are used as fall-backs
+ * when a key is absent from the writable MMCONFIG partition. Platforms that do not provide a
+ * factory default partition may omit this function; a weak default implementation returns NULL.
  *
- * @param block_address The address of the block of Flash to erase.
- * @return              0 on success, negative number on failure
+ * Note that unlike @c mmhal_get_mmconfig_partition(), the size here is used only for a
+ * single partition. Therefore it would be normal to define a factory partition that is
+ * half the size (or less) of the normal config partition, and it is not necessary to
+ * align it to a flash sector as it is not erased.
+ *
+ * @return A static pointer to the factory MMCONFIG partition config, or NULL if not supported.
  */
-int mmhal_flash_erase(uint32_t block_address);
+const struct mmhal_flash_partition_config *mmhal_get_factory_mmconfig_partition(void);
 
 /**
- * Returns the size of the Flash block at the specified address.
+ * Erases a specified block of flash.
  *
- * @param block_address The address of the Flash block.
+ * The given @p block_address may be anywhere within the block to erase -- the entire block will
+ * be erased. Once erased all bytes in the block shall be @c MMHAL_FLASH_ERASE_VALUE.
+ *
+ * @param block_address The address of the block of flash to erase. Addresses are implementation
+ *                      dependent, but should be within a range defined by a given
+ *                      @c mmhal_flash_partition_config.
+ * @return              0 on success, negative number on failure
+ */
+int mmhal_flash_erase(mmhal_flash_addr_t block_address);
+
+/**
+ * Returns the size of the flash block at the specified address.
+ *
+ * @param block_address The address of the flash block. Addresses are implementation
+ *                      dependent, but should be within a range defined by a given
+ *                      @c mmhal_flash_partition_config.
  * @return              The size of the Flash block in bytes.
  *                      Returns 0 if an invalid address is specified.
  */
-uint32_t mmhal_flash_getblocksize(uint32_t block_address);
+uint32_t mmhal_flash_getblocksize(mmhal_flash_addr_t block_address);
 
 /**
  * Read a block of data from the specified Flash address into the buffer.
  *
- * @param read_address  The address in Flash to read from.
+ * @param read_address  The address to read from. Addresses are implementation
+ *                      dependent, but should be within a range defined by a given
+ *                      @c mmhal_flash_partition_config.
  * @param buf           The buffer to read into.
  * @param size          The number of bytes to read.
  * @return              0 on success, or a negative number on failure.
  */
-int mmhal_flash_read(uint32_t read_address, uint8_t *buf, size_t size);
+int mmhal_flash_read(mmhal_flash_addr_t read_address, uint8_t *buf, size_t size);
 
 /**
  * Write a block of data to the specified Flash address.
@@ -115,12 +161,14 @@ int mmhal_flash_read(uint32_t read_address, uint8_t *buf, size_t size);
  * The Flash block is not erased, it is up to the application to determine
  * if the block needs to be erased before programming.
  *
- * @param write_address The address in Flash to write to.
+ * @param write_address The address to write to. Addresses are implementation
+ *                      dependent, but should be within a range defined by a given
+ *                      @c mmhal_flash_partition_config.
  * @param data          A pointer to the block of data to write.
  * @param size          The number of bytes to write.
  * @return              0 on success, or a negative number on failure.
  */
-int mmhal_flash_write(uint32_t write_address, const uint8_t *data, size_t size);
+int mmhal_flash_write(mmhal_flash_addr_t write_address, const uint8_t *data, size_t size);
 
 /**
  * Get LittleFS configuration.

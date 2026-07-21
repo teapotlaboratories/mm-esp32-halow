@@ -119,7 +119,7 @@ static bool is_requestor_setup_cmd(uint8_t twt_setup_cmd)
 static enum mmwlan_status umac_twt_handle_configure(struct umac_data *umacd,
                                                     const struct umac_twt_command *cmd)
 {
-    int ret;
+    enum mmwlan_status ret = MMWLAN_ERROR;
     int exponent = 0;
     uint16_t mantissa = 0;
     uint16_t flow_id = 0;
@@ -181,11 +181,11 @@ static enum mmwlan_status umac_twt_handle_configure(struct umac_data *umacd,
 
     ret = mmdrv_twt_agreement_validate_req(&mmdrv_twt_data);
 
-    if (ret)
+    if (ret != MMWLAN_SUCCESS)
     {
         MMLOG_WRN("TWT req invalid\n");
         agreement->state = UMAC_TWT_AGREEMENT_STATE_EMPTY;
-        return MMWLAN_ERROR;
+        return ret;
     }
 
     agreement->state = UMAC_TWT_AGREEMENT_STATE_PENDING_RESPONSE;
@@ -290,11 +290,12 @@ enum mmwlan_status umac_twt_process_ie(struct umac_data *umacd, const struct dot
 }
 
 
-static int umac_twt_install_agreement(struct umac_twt_data *data,
-                                      uint16_t flow_id,
-                                      const struct umac_twt_agreement_data *agreement)
+static enum mmwlan_status
+umac_twt_install_agreement(struct umac_twt_data *data,
+                           uint16_t flow_id,
+                           const struct umac_twt_agreement_data *agreement)
 {
-    int ret = 0;
+    enum mmwlan_status status = MMWLAN_SUCCESS;
     struct mmdrv_twt_data mmdrv_twt_data = { 0 };
 
 
@@ -303,17 +304,17 @@ static int umac_twt_install_agreement(struct umac_twt_data *data,
     mmdrv_twt_data.agreement = &agreement->control;
     mmdrv_twt_data.agreement_len = (sizeof(agreement->control) + sizeof(agreement->params));
 
-    ret = mmdrv_twt_agreement_install_req(&mmdrv_twt_data);
-    if (ret != 0)
+    status = mmdrv_twt_agreement_install_req(&mmdrv_twt_data);
+    if (status != MMWLAN_SUCCESS)
     {
-        MMLOG_WRN("TWT agreement %u installation failed (ret=%d)\n", flow_id, ret);
+        MMLOG_WRN("TWT agreement %u installation failed (ret=%d)\n", flow_id, status);
     }
-    return ret;
+    return status;
 }
 
 enum mmwlan_status umac_twt_install_pending_agreements(struct umac_data *umacd, bool is_reinstall)
 {
-    int ret = 0;
+    enum mmwlan_status status = MMWLAN_SUCCESS;
     uint16_t i;
     struct umac_twt_data *data = umac_data_get_twt(umacd);
     struct umac_twt_agreement_data *agreement;
@@ -324,10 +325,10 @@ enum mmwlan_status umac_twt_install_pending_agreements(struct umac_data *umacd, 
         if ((agreement->state == UMAC_TWT_AGREEMENT_STATE_PENDING_INSTALLATION) ||
             (is_reinstall && (agreement->state == UMAC_TWT_AGREEMENT_STATE_INSTALLED)))
         {
-            ret = umac_twt_install_agreement(data, i, agreement);
-            if (ret != 0)
+            status = umac_twt_install_agreement(data, i, agreement);
+            if (status != MMWLAN_SUCCESS)
             {
-                return MMWLAN_ERROR;
+                return status;
             }
             agreement->state = UMAC_TWT_AGREEMENT_STATE_INSTALLED;
         }

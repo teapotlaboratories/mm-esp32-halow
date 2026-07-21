@@ -46,6 +46,20 @@ enum mmwlan_status umac_supp_dpp_push_button(struct umac_data *umacd);
 void umac_supp_dpp_push_button_stop(struct umac_data *umacd);
 
 
+enum mmwlan_status umac_supp_dpp_qr_enrollee_start(struct umac_data *umacd,
+                                                   const struct mmwlan_dpp_qr_args *qr_args,
+                                                   int *bootstrap_id);
+
+
+void umac_supp_dpp_qr_enrollee_stop(struct umac_data *umacd);
+
+
+enum mmwlan_status umac_supp_dpp_get_uri(struct umac_data *umacd,
+                                         int32_t bootstrap_id,
+                                         char *uri_buf,
+                                         size_t buf_len);
+
+
 void umac_supp_disconnect(struct umac_data *umacd);
 
 
@@ -59,6 +73,12 @@ void umac_supp_l2_sock_receive(struct umac_data *umacd,
                                const uint8_t *payload,
                                size_t payload_len,
                                const uint8_t *src_addr);
+
+
+void umac_supp_l2_sock_receive_ap(struct umac_data *umacd,
+                                  const uint8_t *payload,
+                                  size_t payload_len,
+                                  const uint8_t *src_addr);
 
 
 void umac_supp_process_deauth(struct umac_data *umacd);
@@ -86,13 +106,27 @@ void umac_supp_process_unprotected_deauth(struct umac_data *umacd,
                                           const uint8_t *da);
 
 
+void umac_supp_process_unprotected_deauth_ap(struct umac_data *umacd,
+                                             uint16_t reason_code,
+                                             const uint8_t *sa,
+                                             const uint8_t *da);
+
+
 void umac_supp_process_unprotected_disassoc(struct umac_data *umacd,
                                             uint16_t reason_code,
                                             const uint8_t *sa,
                                             const uint8_t *da);
 
 
-void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxbufview);
+void umac_supp_process_unprotected_disassoc_ap(struct umac_data *umacd,
+                                               uint16_t reason_code,
+                                               const uint8_t *sa,
+                                               const uint8_t *da);
+
+
+void umac_supp_process_mgmt_frame(struct umac_data *umacd,
+                                  struct mmpktview *rxbufview,
+                                  enum mmwlan_vif vif);
 
 
 void umac_supp_process_probe_req_frame(struct umac_data *umacd,
@@ -114,6 +148,9 @@ bool bip_is_valid(struct umac_sta_data *stad,
                   const struct dot11_hdr *header,
                   const uint8_t *data,
                   size_t data_len);
+
+
+bool bip_generate_mmie(struct umac_sta_data *stad, uint8_t *data, size_t data_len);
 
 
 bool ccmp_is_valid(struct umac_sta_data *stad,

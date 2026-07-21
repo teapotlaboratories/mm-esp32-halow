@@ -345,6 +345,7 @@ struct dpp_authentication {
 	int configurator;
 	int remove_on_tx_status;
 	int connect_on_tx_status;
+	int conf_result_pending_tx;
 	int waiting_conf_result;
 	int waiting_conn_status_result;
 	int auth_success;
@@ -874,8 +875,61 @@ int dpp_get_pubkey_hash(struct crypto_ec_key *key, u8 *hash);
 
 enum morse_dpp_event_type
 {
-    /** Equivalent to @c DPP_EVENT_PB_RESULT. */
+	/* QR code presence announcement (chirp) */
+	/** QR enrollee began broadcasting presence announcements (chirps). */
+	MORSE_DPP_EVT_CHIRP_STARTED,
+	/** QR enrollee presence announcement process has stopped. */
+	MORSE_DPP_EVT_CHIRP_STOPPED,
+
+	/* Push Button flow */
+	/** Push Button enrollment started (enrollee). */
+	MORSE_DPP_EVT_PB_STARTED,
+	/** Push Button configurator discovered. */
+	MORSE_DPP_EVT_PB_DISCOVERY,
+	/** Equivalent to @c DPP_EVENT_PB_RESULT. */
 	MORSE_DPP_EVT_PB_RESULT,
+
+	/* DPP Authentication phase */
+	/** Enrollee received and validated a DPP Authentication Request. */
+	MORSE_DPP_EVT_AUTH_REQ_RX,
+	/** Enrollee sent a DPP Authentication Response. */
+	MORSE_DPP_EVT_AUTH_RESP_TX,
+	/** DPP authentication phase succeeded (both PB and QR flows). */
+	MORSE_DPP_EVT_AUTH_SUCCESS,
+	/** DPP authentication could not complete (initiator/enrollee side). */
+	MORSE_DPP_EVT_AUTH_FAILURE,
+
+	/* DPP Configuration phase */
+	/** Enrollee sent a DPP Configuration Request. */
+	MORSE_DPP_EVT_CONF_REQ_TX,
+	/** DPP configuration object received (any DPP mode). */
+	MORSE_DPP_EVT_CONF_RECEIVED,
+	/** Enrollee sent a DPP Configuration Result (DPP2+). */
+	MORSE_DPP_EVT_CONF_RESULT_TX,
+	/** Configuration exchange failed after auth succeeded (enrollee side). */
+	MORSE_DPP_EVT_CONF_FAILED,
+};
+
+/** Reason codes for @c MORSE_DPP_EVT_AUTH_FAILURE. */
+enum morse_dpp_auth_failure_reason
+{
+	/** Responder never replied to the Authentication Request. */
+	MORSE_DPP_AUTH_FAILURE_NO_RESPONSE,
+	/** Auth Confirm was not received in time. */
+	MORSE_DPP_AUTH_FAILURE_NO_CONFIRM,
+	/** Exhausted all retry attempts without a response. */
+	MORSE_DPP_AUTH_FAILURE_INIT_FAILED,
+};
+
+/** Reason codes for @c MORSE_DPP_EVT_CONF_FAILED. */
+enum morse_dpp_conf_failure_reason
+{
+	/** Config response contained an error status. */
+	MORSE_DPP_CONF_FAILURE_RESPONSE_ERROR,
+	/** Timed out waiting for the config response. */
+	MORSE_DPP_CONF_FAILURE_TIMEOUT,
+	/** Timed out waiting for the DPP2 Configuration Result. */
+	MORSE_DPP_CONF_FAILURE_RESULT_TIMEOUT,
 };
 
 /** Enumeration of the different result reported using the @c DPP_EVENT_PB_RESULT hostap event.  */
@@ -897,10 +951,35 @@ struct morse_dpp_event
 		{
 		    /** Equivalent to the strings reported using @c DPP_EVENT_PB_RESULT */
 			enum morse_dpp_pb_result result;
-			/** Reference to a configuration result on success. May be @NULL if no conf_obj was
-			 * available. */
-			const struct dpp_config_obj *conf_obj;
 		} pb_result;
+		struct
+		{
+			/** Reference to the received configuration object. */
+			const struct dpp_config_obj *conf_obj;
+		} conf_received;
+		struct
+		{
+			/** 1 if this device initiated the auth exchange, 0 if it responded. */
+			int initiator;
+		} auth_success;
+		struct
+		{
+			enum morse_dpp_auth_failure_reason reason;
+		} auth_failure;
+		struct
+		{
+			enum morse_dpp_conf_failure_reason reason;
+		} conf_failed;
+		struct
+		{
+			/** MAC address of the discovered PB configurator (valid for callback duration only). */
+			const u8 *peer_mac;
+		} pb_discovery;
+		struct
+		{
+			/** MAC address of the configurator that sent the Auth Request (valid for callback duration only). */
+			const u8 *peer_mac;
+		} auth_req_rx;
 	} args;
 };
 
@@ -914,6 +993,9 @@ struct morse_dpp_event
     morse_dpp_event(__func__, __LINE__,                            \
         &(MORSE_DPP_EVT_ARGS(_type, _field, __VA_ARGS__)))
 
+#define MORSE_DPP_EVT_CALL_NOARGS(_type)                           \
+    morse_dpp_event(__func__, __LINE__,                            \
+        &(struct morse_dpp_event){ .type = (_type), .args = {{0}} })
 
 /**
  * Function that can be used to emit DPP event from hostap.
@@ -926,6 +1008,7 @@ struct morse_dpp_event
 void morse_dpp_event(const char *func, int line, const struct morse_dpp_event *evt);
 #else
 #define MORSE_DPP_EVT_CALL(_type, _field, ...)	((void)0)
+#define MORSE_DPP_EVT_CALL_NOARGS(_type)	((void)0)
 #endif /* MM_IOT_DPP_EVENTS*/
 
 #endif /* CONFIG_DPP || MM_IOT_DPP_HEADER */

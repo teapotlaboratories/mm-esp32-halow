@@ -3044,16 +3044,18 @@ void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufvie
  */
 static void umac_mesh_tear_down_active_interfaces(struct umac_data *umacd)
 {
-    struct umac_interface_data *iface = umac_data_get_interface(umacd);
     const enum umac_interface_type maybe_active[] = {
         UMAC_INTERFACE_STA,
         UMAC_INTERFACE_SCAN,
         UMAC_INTERFACE_ADHOC,
         UMAC_INTERFACE_NONE,
     };
+    struct umac_interface_vif_data *vif_sta = umac_data_get_interface_vif(umacd, MMWLAN_VIF_STA);
+    struct umac_interface_vif_data *vif_ap = umac_data_get_interface_vif(umacd, MMWLAN_VIF_AP);
+    uint16_t active = vif_sta->active_interface_types | vif_ap->active_interface_types;
     for (size_t i = 0; i < sizeof(maybe_active) / sizeof(maybe_active[0]); i++)
     {
-        if (iface->active_interface_types & maybe_active[i])
+        if (active & maybe_active[i])
         {
             umac_interface_remove(umacd, maybe_active[i]);
         }
@@ -3078,13 +3080,14 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
         iface_mac = NULL; /* inherit the chip's factory MAC */
     }
 
-    uint16_t vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
-    enum mmwlan_status status = umac_interface_add(umacd, UMAC_INTERFACE_MESH, iface_mac, &vif_id);
+    enum mmwlan_status status =
+        umac_interface_add(umacd, UMAC_INTERFACE_MESH, umac_datapath_ops_mesh, iface_mac);
     if (status != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("MESH interface add failed: %d\n", (int)status);
         return status;
     }
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH);
 
     const struct mmwlan_s1g_channel *chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
     if (chan == NULL)
@@ -3185,7 +3188,7 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
         umac_sta_data_set_security(mesh_ctx.common_stad, MMWLAN_OPEN, MMWLAN_PMF_DISABLED);
 #endif
     }
-    umac_datapath_configure_mesh_mode(umacd);
+    /* Datapath ops (umac_datapath_ops_mesh) are bound at umac_interface_add time. */
 
     /* Start the peer-link retransmission tick (mesh_plink_timer equivalent). Self-reschedules
      * while the mesh is active; serves Open/Confirm retransmits so handshakes reach ESTAB. */
@@ -3198,10 +3201,13 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
     ret = mmdrv_config_beacon_timer(vif_id, true);
     if (ret != 0)
     {
-        MMLOG_ERR("MESH: config_beacon_timer failed fw_status=%d\n", ret);
-        mesh_ctx.active = false;
-        status = MMWLAN_ERROR;
-        goto fail;
+        /* fw 1.17.8 rejects a standalone BSS_BEACON_CONFIG on a mesh vif (fw_status 14); the Linux
+         * 1.17.8 driver does NOT send it on the INITIAL mesh start (its comment: "Start mesh will be
+         * handled when supplicant configures mesh id") — MESH_CONFIG(enable_beaconing) below arms
+         * beaconing. This pre-call was tolerated by 1.17.6 but is now redundant/rejected, so treat it
+         * as non-fatal rather than failing the whole bring-up. */
+        MMLOG_ERR("MESH: config_beacon_timer fw_status=%d (non-fatal on 1.17.8; MESH_CONFIG arms beaconing)\n",
+                  ret);
     }
 
     /* Host beacon engine on (unmask the beacon IRQ) so the host serves each beacon

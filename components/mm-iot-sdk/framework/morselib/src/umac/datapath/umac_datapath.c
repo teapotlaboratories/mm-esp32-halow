@@ -14,6 +14,7 @@
 #include "umac/data/umac_data.h"
 #include "umac/datapath/datapath_defrag.h"
 #include "umac/regdb/umac_regdb.h"
+#include "umac/relay/umac_relay.h"
 #include "umac/supplicant_shim/umac_supp_shim.h"
 #include "dot11/dot11.h"
 #include "dot11/dot11_utils.h"
@@ -31,6 +32,7 @@
 #include "umac/twt/umac_twt.h"
 #include "umac/ibss/umac_ibss.h"
 #include "umac/mesh/umac_mesh.h"
+#include "umac/health_check/umac_health_check.h"
 #include "umac/ies/mmie.h"
 #include "umac/frames/disassociation.h"
 #include "umac/frames/deauthentication.h"
@@ -127,19 +129,6 @@ static bool umac_datapath_validate_buf_len(struct mmpktview *view, uint32_t min_
 }
 
 
-static void umac_datapath_handle_signal_monitor(struct umac_data *umacd, int16_t new_rssi)
-{
-    enum umac_connection_signal_change status =
-        umac_connection_check_signal_change(umacd, new_rssi);
-    if (status != UMAC_CONNECTION_SIGNAL_CHANGE_NO_CHANGE)
-    {
-        umac_supp_notify_signal_change(umacd,
-                                       new_rssi,
-                                       (status == UMAC_CONNECTION_SIGNAL_CHANGE_ABOVE_THRESHOLD));
-    }
-}
-
-
 static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
@@ -232,7 +221,6 @@ static void umac_datapath_process_s1g_beacon(struct umac_data *umacd, struct mmp
 
     int16_t new_rssi = rx_metadata->rssi;
     umac_stats_set_rssi(umacd, new_rssi);
-    umac_datapath_handle_signal_monitor(umacd, new_rssi);
 
     umac_connection_process_beacon_ies(umacd,
                                        mmpkt_get_data_start(rxbufview),
@@ -279,7 +267,15 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
         case DOT11_ACTION_CATEGORY_PUBLIC:
         case DOT11_ACTION_CATEGORY_SA_QUERY:
         case DOT11_ACTION_CATEGORY_WNM:
-            umac_supp_process_mgmt_frame(umacd, rxbufview);
+        {
+            enum mmwlan_vif vif =
+                umac_interface_get_vif_by_id(umacd, umac_sta_data_get_vif_id(stad));
+            umac_supp_process_mgmt_frame(umacd, rxbufview, vif);
+            break;
+        }
+
+        case DOT11_ACTION_CATEGORY_S1G:
+            umac_relay_process_s1g_action_frame(stad, rxbufview);
             break;
 
         case DOT11_ACTION_CATEGORY_S1G_UNPROTECTED:
@@ -345,7 +341,7 @@ static void umac_datapath_process_unprotected_robust_mgmt_frame(struct umac_data
 
 static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
                                                 struct umac_sta_data *stad,
-                                                struct umac_datapath_data *data,
+                                                uint16_t vif_id,
                                                 struct mmpktview *rxbufview)
 {
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
@@ -356,7 +352,7 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
 
     if (frame_is_robust_mgmt(rxbufview))
     {
-        if (stad == NULL)
+        if (!umac_sta_data_is_associated(stad))
         {
 
             return;
@@ -382,7 +378,7 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
             {
                 if (!bip_is_valid(stad, header, frame_data, frame_data_len))
                 {
-                    MMLOG_INF("Invalid frame security, dropping.\n");
+                    MMLOG_WRN("Invalid frame security, dropping.\n");
                     return;
                 }
             }
@@ -394,63 +390,19 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
         }
     }
 
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    data->ops->process_rx_mgmt_frame(umacd, stad, rxbufview);
-}
-
-static void umac_datapath_process_rx_mgmt_frame_sta(struct umac_data *umacd,
-                                                    struct umac_sta_data *stad,
-                                                    struct mmpktview *rxbufview)
-{
-    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
-    uint16_t frame_control_le = header->frame_control;
-    uint16_t subtype = dot11_frame_control_get_subtype(frame_control_le);
-
-    switch (subtype)
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops != NULL)
     {
-        case DOT11_FC_SUBTYPE_ASSOC_RSP:
-        case DOT11_FC_SUBTYPE_REASSOC_RSP:
-            umac_connection_process_assoc_reassoc_rsp(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_PROBE_RSP:
-        /* A beacon's fixed body (timestamp/beacon-interval/capability + IEs)
-         * matches a probe response, so the same parser handles it. Routing
-         * beacons here lets a scan passively discover IBSS peers (which may
-         * only beacon, not answer probe requests). umac_scan_process_probe_resp
-         * ignores frames when no scan is active. */
-        case DOT11_FC_SUBTYPE_BEACON:
-            umac_scan_process_probe_resp(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_DISASSOC:
-            umac_connection_process_disassoc_req(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_AUTH:
-            umac_connection_process_auth_resp(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_DEAUTH:
-            umac_connection_process_deauth_rx(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_ACTION:
-            umac_datapath_process_rx_action_frame(umacd, stad, rxbufview);
-            break;
-
-        default:
-            MMLOG_WRN("Recieved unsupported MGMT frame: frame_control=0x%04x\n",
-                      le16toh(frame_control_le));
-            break;
+        datapath_ops->process_rx_mgmt_frame(umacd, stad, rxbufview);
     }
 }
 
-
-static void umac_datapath_generate_8023_header(const uint8_t *dest_addr,
-                                               const uint8_t *src_addr,
-                                               uint16_t ethertype,
-                                               struct umac_8023_hdr *header)
+void umac_datapath_generate_8023_header(const uint8_t *dest_addr,
+                                        const uint8_t *src_addr,
+                                        uint16_t ethertype,
+                                        struct umac_8023_hdr *header)
 {
     mac_addr_copy(header->src_addr, src_addr);
     mac_addr_copy(header->dest_addr, dest_addr);
@@ -489,20 +441,27 @@ static bool umac_datapath_is_eapol_frame(struct mmpktview *rxbufview)
 
 
 static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
-                                                 struct umac_datapath_data *data,
                                                  struct mmpktview *rxbufview,
                                                  const struct dot11_hdr *header)
 {
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
 
+
+    struct mmdrv_rx_metadata *metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
 
 
     MMOSAL_ASSERT(mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN) != NULL);
 
-    umac_supp_l2_sock_receive(umacd,
-                              mmpkt_get_data_start(rxbufview),
-                              mmpkt_get_data_length(rxbufview),
-                              dot11_get_sa(header));
+    if (datapath_ops != NULL)
+    {
+        datapath_ops->supp_l2_sock_receive(umacd,
+                                           mmpkt_get_data_start(rxbufview),
+                                           mmpkt_get_data_length(rxbufview),
+                                           dot11_get_sa(header));
+    }
 }
 
 
@@ -522,6 +481,7 @@ static void umac_datapath_process_rx_eapol_frame(struct umac_data *umacd,
 static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmpktview *view,
                                           enum umac_key_type key_type, int key_id)
 {
+    MM_UNUSED(key_type);   /* PN + key now both keyed by key_id (see umac_keys_get_tx_seq) */
     const uint8_t *tk = umac_keys_get_key_data(stad, (uint8_t)key_id);
     size_t tk_len = umac_keys_get_key_len(stad, (uint8_t)key_id);
     if (tk == NULL || (tk_len != UMAC_KEY_AES_128_LEN && tk_len != UMAC_KEY_AES_256_LEN))
@@ -550,8 +510,9 @@ static bool umac_datapath_sw_ccmp_encrypt(struct umac_sta_data *stad, struct mmp
         return false;
     }
 
-    /* PN already incremented by the caller (mac80211 increments conf.tx_pn before use). */
-    uint64_t pn = umac_keys_get_tx_seq(stad, key_type);
+    /* PN already incremented by the caller (mac80211 increments conf.tx_pn before use).
+     * Pass the resolved key_id — connection_keys no longer maps key_type internally (2.11.2). */
+    uint64_t pn = umac_keys_get_tx_seq(stad, (uint8_t)key_id);
 
     uint8_t ccmp_hdr[DOT11_CCMP_HEADER_LEN];
     uint8_t mic[DOT11_CCMP_256_MIC_LEN];
@@ -666,11 +627,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     const struct dot11_hdr *header = &data_hdr->base;
 
-    uint16_t llc_ethertype;
     uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
-    struct umac_8023_hdr header_8023 = { 0 };
     bool mesh_ctrl_present = false;
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(rx_metadata);
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -874,17 +834,25 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             MMLOG_INF("Received 4-address EAPOL frame. Not supported\n");
             goto drop;
         }
-        umac_datapath_process_rx_eapol_frame(umacd, data, rxbufview, header);
+
+
+        umac_datapath_process_rx_eapol_frame(umacd, rxbufview, header);
         goto drop;
     }
 
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    if (data->ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
     {
-        MMLOG_DBG("Controlled Port is currently closed.\n");
         goto drop;
     }
 
+    if (datapath_ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
+    {
+        MMLOG_DBG("%s Controlled Port is currently closed.\n", datapath_ops->type);
+        goto drop;
+    }
 
     /* 802.11s: strip the Mesh Control header (between the MAC header and LLC/SNAP) so the
      * LLC/SNAP + payload extraction below works. Length depends on the address-extension flags
@@ -941,53 +909,38 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
     }
 
-    llc_ethertype = umac_datapath_get_llc_ethertype(rxbufview);
+    /* Per-vif host-slot demux: the FW stamps each RX frame with its ingress vif_id, so a
+     * concurrent mesh (VIF_STA slot) and AP (VIF_AP slot) are disambiguated natively — the old
+     * mesh_ctrl-based framing heuristic is retired. */
+    enum mmwlan_vif vif = umac_interface_get_vif_by_id(umacd, vif_id);
+    if (vif == MMWLAN_VIF_UNSPECIFIED)
+    {
+        MMLOG_WRN("Invalid RX VIF\n");
+        goto drop;
+    }
+
+    uint16_t llc_ethertype = umac_datapath_get_llc_ethertype(rxbufview);
     if (!llc_ethertype)
     {
         goto drop;
     }
 
+
+    mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);
+
+    umac_relay_process_data_frame(stad, vif, tid_index, data_hdr, llc_ethertype, &rxbufview);
+    if (rxbufview == NULL)
+    {
+
+        return;
+    }
+
+
+    struct umac_8023_hdr header_8023 = { 0 };
     umac_datapath_generate_8023_header(dot11_get_da(header),
                                        dot11_get_sa_data(data_hdr),
                                        llc_ethertype,
                                        &header_8023);
-
-
-    mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);
-
-    enum mmwlan_vif vif = MMWLAN_VIF_UNSPECIFIED;
-    /*
-     * Mesh + AP concurrency (gateway): the frame's originating vif isn't encoded here,
-     * so when BOTH a mesh and a concurrent AP are active, demux by framing instead of by
-     * global active-type — a mesh data frame carries the Mesh Control field
-     * (mesh_ctrl_present), an AP-client frame does not. Deliver mesh frames to the MESH
-     * host slot (reported as VIF_STA) and AP-client frames to VIF_AP, so a host gateway
-     * can bind one esp_netif per vif and route between them. This only diverges from the
-     * legacy single-interface mapping below when mesh and AP are up together.
-     */
-    bool mesh_and_ap_active =
-        umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID &&
-        umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != UMAC_INTERFACE_VIF_ID_INVALID;
-    if (mesh_and_ap_active)
-    {
-        vif = mesh_ctrl_present ? MMWLAN_VIF_STA : MMWLAN_VIF_AP;
-    }
-    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA) != UMAC_INTERFACE_VIF_ID_INVALID)
-    {
-        vif = MMWLAN_VIF_STA;
-    }
-    else if (umac_interface_get_vif_id(
-                 umacd, UMAC_INTERFACE_AP | UMAC_INTERFACE_ADHOC | UMAC_INTERFACE_MESH) !=
-             UMAC_INTERFACE_VIF_ID_INVALID)
-    {
-        /* IBSS and MESH reuse the AP per-vif slot for state/ext-cb registration. */
-        vif = MMWLAN_VIF_AP;
-    }
-    else
-    {
-        MMLOG_WRN("Invalid RX VIF\n");
-        goto drop;
-    }
 
     mmwlan_rx_pkt_ext_cb_t rx_pkt_cb;
     void *arg = NULL;
@@ -1463,15 +1416,57 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
                                                  struct mmpkt *rxbuf,
                                                  struct mmpktview *rxbufview)
 {
-    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    const struct dot11_hdr *header = (const struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
 
     MMOSAL_ASSERT(!dot11_is_4addr_hdr(header->frame_control));
 
     const enum dot11_fc_type frame_type =
         (enum dot11_fc_type)dot11_frame_control_get_type(header->frame_control);
     const uint16_t frame_subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+
+    if (frame_type == DOT11_FC_TYPE_MGMT &&
+        (dot11_sequence_control_get_fragment_number(header->sequence_control) ||
+         dot11_frame_control_get_more_fragments(header->frame_control)))
+    {
+        const struct dot11_data_hdr *data_hdr =
+            (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+        const size_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+
+
+        data_hdr = (const struct dot11_data_hdr *)mmpkt_remove_from_start(rxbufview, data_hdr_len);
+        if (data_hdr == NULL)
+        {
+            goto drop;
+        }
+
+
+        struct mmdrv_rx_metadata saved_metadata = *mmdrv_get_rx_metadata(rxbuf);
+
+        struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+        rxbuf = datapath_defrag(umacd,
+                                &sta_data->defrag_data,
+                                &data_hdr,
+                                &rxbufview,
+                                rxbuf,
+                                MMDRV_SEQ_NUM_BASELINE);
+        if (rxbuf == NULL)
+        {
+
+            return;
+        }
+
+
+        header = &data_hdr->base;
+        mmpkt_prepend(rxbufview, dot11_data_hdr_get_len(data_hdr));
+
+
+        *mmdrv_get_rx_metadata(rxbuf) = saved_metadata;
+    }
+
     const enum mmwlan_frame_filter_flag frame_filter_flag =
         umac_datapath_rx_frame_filter_matches(umacd, frame_type, frame_subtype);
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
 
     if (frame_type == DOT11_FC_TYPE_MGMT &&
         !umac_datapath_process_mgmt_frame_ccmp_header(umacd, stad, rxbufview))
@@ -1483,7 +1478,6 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
 
     if (frame_filter_flag != MMWLAN_FRAME_NO_MATCH && data->rx_frame_cb != NULL)
     {
-        struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
         struct mmwlan_rx_frame_info frame_info = {
             .frame_filter_flag = frame_filter_flag,
             .buf = mmpkt_get_data_start(rxbufview),
@@ -1498,7 +1492,7 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
     switch (frame_type)
     {
         case DOT11_FC_TYPE_MGMT:
-            umac_datapath_process_rx_mgmt_frame(umacd, stad, data, rxbufview);
+            umac_datapath_process_rx_mgmt_frame(umacd, stad, rx_metadata->vif_id, rxbufview);
             break;
 
         case DOT11_FC_TYPE_EXT:
@@ -1569,6 +1563,7 @@ static bool umac_datapath_is_rx_frame_duplicate(struct umac_datapath_sta_data *s
             (struct dot11_qos_ctrl *)(mmpkt_get_data_start(rxbufview) + data_hdr_len);
         if (!umac_datapath_validate_buf_len(rxbufview, data_hdr_len + sizeof(*qos_control)))
         {
+            MMLOG_INF("No QoS control field\n");
 
             return true;
         }
@@ -1601,14 +1596,11 @@ static bool umac_datapath_is_rx_frame_duplicate(struct umac_datapath_sta_data *s
 }
 
 
-static bool umac_datapath_rx_frame_allowed_pre_association(struct umac_datapath_data *data,
-                                                           uint16_t frame_ver_type_subtype,
-                                                           uint16_t frame_control_le)
+static bool umac_datapath_rx_frame_allowed_pre_association(
+    const struct umac_datapath_ops *datapath_ops,
+    uint16_t frame_ver_type_subtype,
+    uint16_t frame_control_le)
 {
-    MMOSAL_DEV_ASSERT(data != NULL);
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    MMOSAL_DEV_ASSERT(data->ops->frames_allowed_pre_association != NULL);
-
 
     if (frame_ver_type_subtype != DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON) &&
         dot11_frame_control_get_protected(frame_control_le))
@@ -1616,7 +1608,7 @@ static bool umac_datapath_rx_frame_allowed_pre_association(struct umac_datapath_
         return false;
     }
 
-    for (const uint16_t *iter = data->ops->frames_allowed_pre_association; *iter != UINT16_MAX;
+    for (const uint16_t *iter = datapath_ops->frames_allowed_pre_association; *iter != UINT16_MAX;
          iter++)
     {
         if (frame_ver_type_subtype == *iter)
@@ -1640,7 +1632,50 @@ void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter)
 }
 
 
-static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktview *rxbufview)
+struct umac_datapath_vif_reassignment
+{
+
+    uint32_t ver_type_subtype;
+
+    uint16_t interface_type_mask;
+};
+
+
+/* Returns true if the frame type is LUT-managed (has an authoritative owner interface), whether or
+ * not the target interface currently exists; false for any other frame type. When the target exists
+ * the frame's rx vif_id is overridden to it. Callers apply this unconditionally for the LUT types
+ * (their owner is fixed by frame type, not by the FW's rx-vif tag). */
+static bool umac_datapath_reassign_vif_id(struct umac_data *umacd,
+                                          struct mmdrv_rx_metadata *metadata,
+                                          uint32_t frame_ver_type_subtype,
+                                          const struct umac_datapath_vif_reassignment *lut,
+                                          size_t n_lut_rows)
+{
+    for (size_t ii = 0; ii < n_lut_rows; ii++)
+    {
+        if (lut[ii].ver_type_subtype == frame_ver_type_subtype)
+        {
+            uint16_t new_vif_id = umac_interface_get_vif_id(umacd, lut[ii].interface_type_mask);
+            if (new_vif_id != MMDRV_VIF_ID_INVALID)
+            {
+                MMLOG_VRB(
+                    "RX frame %x:%x: VIF ID %u->%u\n",
+                    ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                    ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE),
+                    metadata->vif_id,
+                    new_vif_id);
+                MMOSAL_DEV_ASSERT(new_vif_id < UINT8_MAX);
+                metadata->vif_id = new_vif_id;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static bool umac_datapath_rx_frame_preprocess(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     bool drop_frame = false;
     uint16_t frame_ver_type_subtype;
@@ -1653,6 +1688,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
 
     if (!umac_datapath_validate_buf_len(rxbufview, sizeof(header->frame_control)))
     {
+        MMLOG_WRN("Frame length invalid. Dropping.\n");
         drop_frame = true;
         goto exit;
     }
@@ -1718,27 +1754,71 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
         goto exit;
     }
 
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    if (data->ops == NULL)
+    struct mmdrv_rx_metadata *metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
+    if (metadata == NULL)
     {
-        MMLOG_WRN("Frame received before datapath configured. Dropping.\n");
+        MMLOG_WRN("Metadata error.\n");
+        MMOSAL_DEV_ASSERT(false);
+        drop_frame = true;
+        goto exit;
+    }
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+
+    /* Authoritative frame-type -> owner-interface routing, applied REGARDLESS of the FW's rx-vif tag.
+     * A PROBE_REQ is always for the AP; a beacon/PROBE_RSP is always for the STA. On a concurrent
+     * mesh+AP radio the mesh 'claims' broadcast RX, so the FW tags a client's PROBE_REQ with the mesh
+     * vif (a VALID id, so the old INVALID-only guard skipped it) -> the probe routed to the mesh ops
+     * and the AP never answered -> the client could never associate. reassign only overrides when the
+     * target interface exists, so this is a no-op for mesh-only / STA-only / plain-AP. */
+    static const struct umac_datapath_vif_reassignment vif_reassignment_lut[] = {
+        { DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_REQ), UMAC_INTERFACE_AP },
+        { DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON), UMAC_INTERFACE_STA },
+        { DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP), UMAC_INTERFACE_STA },
+    };
+
+    bool lut_managed = umac_datapath_reassign_vif_id(umacd,
+                                                     metadata,
+                                                     frame_ver_type_subtype,
+                                                     vif_reassignment_lut,
+                                                     MM_ARRAY_COUNT(vif_reassignment_lut));
+
+    vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+
+    if (vif_id == MMDRV_VIF_ID_INVALID && !lut_managed)
+    {
+        MMLOG_WRN("RX VIF unknown, frame type %x:%x\n",
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE));
+    }
+
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+
+    if (datapath_ops == NULL)
+    {
+
+        MMLOG_DBG("No ops for vif_id %u. Dropping RX frame %x:%x\n",
+                  vif_id,
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
+                  ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE));
         drop_frame = true;
         goto exit;
     }
 
-    if (!umac_datapath_rx_frame_allowed_pre_association(data,
+    if (!umac_datapath_rx_frame_allowed_pre_association(datapath_ops,
                                                         frame_ver_type_subtype,
                                                         header->frame_control))
     {
         const uint8_t *ta = dot11_get_ta(header);
-        MMOSAL_DEV_ASSERT(data->ops != NULL);
-        struct umac_sta_data *stad = data->ops->lookup_stad_by_peer_addr(umacd, ta);
+        struct umac_sta_data *stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ta);
         if (stad == NULL)
         {
-            MMLOG_INF("Dropping packet from unknown sender " MM_MAC_ADDR_FMT " (%04x)\n",
+            MMLOG_WRN("Dropping packet from unknown sender " MM_MAC_ADDR_FMT " (%04x, vif_id %u)\n",
                       MM_MAC_ADDR_VAL(ta),
-                      frame_ver_type_subtype);
+                      frame_ver_type_subtype,
+                      vif_id);
             drop_frame = true;
+            datapath_ops->handle_frame_unknown_sta(umacd, ta);
             goto exit;
         }
 
@@ -1811,7 +1891,6 @@ void umac_datapath_stad_flush(struct umac_data *umacd, struct umac_sta_data *sta
 }
 
 static void umac_datapath_flush_txq(struct umac_data *umacd);
-
 
 static void umac_datapath_flush(struct umac_data *umacd)
 {
@@ -1907,21 +1986,38 @@ static void umac_datapath_process_rx_frame(struct umac_data *umacd,
     uint16_t frame_subtype = dot11_frame_control_get_subtype(frame_control_le);
     MMLOG_VRB("RX frame. Type: %d, Subtype: %d.\n", frame_type, frame_subtype);
 
+    struct mmdrv_rx_metadata *metadata = mmdrv_get_rx_metadata(rxbuf);
+    uint16_t vif_id = umac_interface_get_vif_id_from_rx_metadata(metadata);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("No datapath ops for vif %u, dropping\n", vif_id);
+        mmpkt_close(&rxbufview);
+        mmpkt_release(rxbuf);
+        return;
+    }
+
 
     const uint8_t *ta = NULL;
     struct umac_sta_data *stad = NULL;
     if (frame_ver_type_subtype != DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON))
     {
         ta = dot11_get_ta(header);
-        MMOSAL_DEV_ASSERT(data->ops != NULL);
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ta);
         MMOSAL_DEV_ASSERT(mm_mac_addr_is_multicast(ta) == false);
-        stad = data->ops->lookup_stad_by_peer_addr(umacd, ta);
     }
 
 
-    if (stad == NULL && !umac_datapath_rx_frame_allowed_pre_association(data,
-                                                                        frame_ver_type_subtype,
-                                                                        frame_control_le))
+    if (stad == NULL && umac_datapath_rx_frame_allowed_pre_association(datapath_ops,
+                                                                       frame_ver_type_subtype,
+                                                                       frame_control_le))
+    {
+
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, NULL);
+    }
+
+    if (stad == NULL)
     {
         if (ta != NULL)
         {
@@ -1932,11 +2028,9 @@ static void umac_datapath_process_rx_frame(struct umac_data *umacd,
         return;
     }
 
-
-    if (stad && (frame_type == DOT11_FC_TYPE_DATA || frame_type == DOT11_FC_TYPE_MGMT))
+    if (umac_sta_data_is_associated(stad))
     {
-        uint16_t pwr_mgt = dot11_frame_control_get_power_mgmt(frame_control_le);
-        bool ok = data->ops->set_stad_sleep_state(stad, pwr_mgt);
+        bool ok = datapath_ops->update_stad_state_rx(stad, metadata, frame_control_le);
         MMOSAL_DEV_ASSERT(ok);
     }
 
@@ -2010,7 +2104,7 @@ void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     struct mmpktview *rxbufview = mmpkt_open(rxbuf);
 
-    if (umac_datapath_rx_frame_filter(umacd, rxbufview))
+    if (umac_datapath_rx_frame_preprocess(umacd, rxbufview))
     {
         mmpkt_close(&rxbufview);
         mmpkt_release(rxbuf);
@@ -2018,6 +2112,7 @@ void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
     }
 
     umac_datapath_rx_queue_frame(umacd, data, rxbuf, rxbufview);
+    umac_health_check_note_activity(umacd);
 
     umac_core_evt_wake(umacd);
 }
@@ -2077,29 +2172,9 @@ struct mmpkt *umac_datapath_copy_tx_mmpkt(struct mmpkt *pkt, uint8_t pkt_class)
     return copy;
 }
 
-
-static void umac_datapath_construct_80211_data_header_sta(struct umac_sta_data *stad,
-                                                          const struct umac_8023_hdr *hdr_8023,
-                                                          struct dot11_data_hdr *data_hdr)
-{
-    uint16_t frame_control = DOT11_MASK_FC_TO_DS |
-                             DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
-                             DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE;
-
-    umac_sta_data_get_bssid(stad, data_hdr->base.addr1);
-    umac_interface_get_mac_addr(stad, data_hdr->base.addr2);
-    mac_addr_copy(data_hdr->base.addr3, hdr_8023->dest_addr);
-    if (!umac_interface_addr_matches_mac_addr(stad, hdr_8023->src_addr))
-    {
-
-        frame_control |= DOT11_MASK_FC_FROM_DS;
-        mac_addr_copy(data_hdr->addr4, hdr_8023->src_addr);
-    }
-    data_hdr->base.frame_control = htole16(frame_control);
-}
-
 static void umac_datapath_aggr_check(struct umac_data *umacd,
                                      struct umac_sta_data *stad,
+                                     const struct umac_datapath_ops *datapath_ops,
                                      uint8_t tid,
                                      uint16_t ssc)
 {
@@ -2108,9 +2183,7 @@ static void umac_datapath_aggr_check(struct umac_data *umacd,
         return;
     }
 
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    if (data->ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
+    if (datapath_ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
     {
         return;
     }
@@ -2170,9 +2243,6 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     struct dot11_qos_ctrl qos_ctrl = {};
     enum mmwlan_status status = MMWLAN_ERROR;
 
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-
-
     bool is_eapol = (ethertype == ETHERTYPE_EAPOL);
 
     MMLOG_DBG("Dequeued frame for TX (%p, ethertype=0x%04x, tid=%u, %s port)\n",
@@ -2181,60 +2251,30 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
               tid,
               is_eapol ? "uncontrolled" : "controlled");
 
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
+    {
+        status = MMWLAN_ERROR;
+        goto error;
+    }
 
-    /*
-     * Frame per the stad's egress vif TYPE — the analog of mac80211's
-     * ieee80211_build_hdr switching on sdata->vif.type (AP: 3-addr fromDS; MESH:
-     * 4-addr + Mesh Control), after which morse_driver stamps the egress vif's id
-     * (mac.c:978). Off the gateway path (only mesh OR only AP active) the single
-     * global data->ops already matches every stad, so keep the exact legacy call
-     * + legacy Mesh-Control gating. Only when a mesh AND a concurrent AP are both
-     * up must the builder be chosen per-stad, because data->ops is single-valued
-     * (last writer wins) and would misframe one of the two vifs' traffic.
-     */
-    bool tx_is_mesh_frame;
-#if CONFIG_HALOW_AP_MODE
-    if (umac_datapath_gateway_active(umacd))
+    /* Egress framing follows the per-vif ops (STA/AP/MESH). Compute the mesh discriminator once;
+     * the Mesh Control insertion, next-hop keying, BA session and SW-CCMP paths below all key off
+     * it (replaces the old global umac_mesh_is_active() / gateway test). */
+    const bool tx_is_mesh_frame = (datapath_ops == umac_datapath_ops_mesh);
+    if (tx_is_mesh_frame && umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
     {
-        uint16_t stad_vif_id = umac_sta_data_get_vif_id(stad);
-        tx_is_mesh_frame =
-            (umac_interface_get_vif_type_mask(umacd, stad_vif_id) & UMAC_INTERFACE_MESH) != 0;
-        if (tx_is_mesh_frame)
-        {
-            if (umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
-            {
-                /* D1: dropped pending path discovery (see helper); counted like any other TX drop. */
-                umac_stats_increment_datapath_txq_frames_dropped(umacd);
-                status = MMWLAN_SUCCESS;
-                goto error;
-            }
-            umac_datapath_construct_80211_data_header_mesh(stad, header_8023, &data_hdr);
-        }
-        else
-        {
-            umac_datapath_construct_80211_data_header_ap(stad, header_8023, &data_hdr);
-        }
-        /* Egress on the frame's own vif rather than the FW default (mac.c:978). */
-        tx_metadata->vif_id = stad_vif_id;
+        /* D1: dropped pending HWMP path discovery; counted like any other TX drop. SUCCESS (not
+         * ERROR): the frame is deliberately consumed while discovery is in flight, not a failure
+         * the caller can retry differently. */
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        status = MMWLAN_SUCCESS;
+        goto error;
     }
-    else
-#endif
-    {
-        tx_is_mesh_frame = umac_mesh_is_active();
-        if (tx_is_mesh_frame &&
-            umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
-        {
-            /* D1: count it like every other TX drop (mirrors the forward path's drop, :2856) so that
-             * "the first packets to a new multi-hop dest vanish" is VISIBLE in stats instead of silent.
-             * SUCCESS, not ERROR: the frame is deliberately consumed while path discovery is in flight —
-             * that is not a TX failure the caller can act on or retry differently. */
-            umac_stats_increment_datapath_txq_frames_dropped(umacd);
-            status = MMWLAN_SUCCESS;
-            goto error;
-        }
-        data->ops->construct_80211_data_header(stad, header_8023, &data_hdr);
-    }
+
+    datapath_ops->construct_80211_data_header(stad, header_8023, &data_hdr);
     const uint32_t data_hdr_len = dot11_data_hdr_get_len(&data_hdr);
 
 
@@ -2298,6 +2338,10 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
      * with multi-hop-via-P) would feed one (TA,TID) window two seq spaces and corrupt reordering. key_stad ==
      * stad for single-hop / non-mesh / multicast, so this is a no-op off the multi-hop mesh path. */
     struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(key_stad);
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_ta(&(data_hdr.base))));
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_da(&(data_hdr.base))));
+    MMOSAL_DEV_ASSERT(!mm_mac_addr_is_zero(dot11_get_sa_data(&data_hdr)));
+
 
     MMOSAL_DEV_ASSERT(is_eapol || enc == ENCRYPTION_ENABLED);
 
@@ -2331,10 +2375,9 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     if (!is_multicast && !is_eapol)
     {
-        /* key_stad, not stad: open the originator BA session on the next-hop peer so the ADDBA is
-         * addressed to the real next hop (umac_ba_tx_addba_req -> peek_peer_addr) instead of self-
-         * addressing on common_stad (own mesh MAC) for a multi-hop origin. See the key_stad note above. */
-        umac_datapath_aggr_check(umacd, key_stad, tid, header->sequence_control);
+        /* key_stad, not stad: open the originator BA session on the next-hop peer (multi-hop mesh
+         * origin) so ADDBA is addressed to the real next hop; key_stad == stad off that path. */
+        umac_datapath_aggr_check(umacd, key_stad, datapath_ops, tid, header->sequence_control);
     }
 
     rts_threshold = umac_config_get_rts_threshold(umacd);
@@ -2450,12 +2493,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     umac_stats_update_last_tx_time(umacd);
 
     mmpkt_close(&txbufview);
-    int ret = mmdrv_tx_frame(txbuf, false);
-    if (ret)
+    status = mmdrv_tx_frame(txbuf, false);
+    if (status != MMWLAN_SUCCESS)
     {
-        MMLOG_WRN("mmdrv_tx_frame failed with retcode %d\n", ret);
+        MMLOG_WRN("mmdrv_tx_frame failed (%u)\n", status);
     }
-    return (ret == 0 ? MMWLAN_SUCCESS : MMWLAN_ERROR);
+    return status;
 
 error:
     mmpkt_close(&txbufview);
@@ -2484,86 +2527,12 @@ static uint32_t umac_datapath_calculate_tx_timeout_ms(struct umac_data *umacd, b
     }
 }
 
-/* Mesh stad resolvers (defined later in this file) — forward-declared for the gateway lookup +
- * the gateway-aware tx-status path. */
-static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_mesh(struct umac_data *umacd,
-                                                                         const uint8_t *addr);
-static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(struct umac_data *umacd,
-                                                                            const uint8_t *addr);
-static struct umac_sta_data *umac_datapath_lookup_stad_by_aid_mesh(struct umac_data *umacd,
-                                                                   uint16_t aid);
-
-/* True when a mesh and a concurrent AP are both active (the all-ESP Mesh-gate). */
-bool umac_datapath_gateway_active(struct umac_data *umacd)
-{
-    return umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID &&
-           umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != UMAC_INTERFACE_VIF_ID_INVALID;
-}
-
-/*
- * Gateway stad lookup scoped by the egress vif (the analog of mac80211 delivering to
- * the right sdata). AP netif (VIF_AP) -> AP client set; mesh netif (VIF_STA, the same
- * host-slot the RX demux uses for mesh) -> mesh peer / HWMP next-hop / group. An
- * UNSPECIFIED vif (internal callers) falls back to dest-MAC disambiguation: a known AP
- * client MAC -> AP, else mesh. `by_peer` selects the RA-based lookups (RX / TX-status).
- */
-/*
- * The Mesh-gate (concurrent mesh + AP) requires AP-mode symbols and is only possible when AP mode
- * is compiled in. Everything gateway-specific below is gated on CONFIG_HALOW_AP_MODE so non-AP
- * builds (STA/IBSS/scan) still link; umac_datapath_gateway_active() is always false in those builds
- * (no AP vif can exist), so the (always-compiled) call sites take their non-gateway path.
- */
-#if CONFIG_HALOW_AP_MODE
-static struct umac_sta_data *umac_datapath_gateway_lookup(struct umac_data *umacd,
-                                                          enum mmwlan_vif vif,
-                                                          const uint8_t *addr,
-                                                          bool by_peer)
-{
-    if (vif == MMWLAN_VIF_AP)
-    {
-        return by_peer ? umac_ap_lookup_sta_by_addr(umacd, addr)
-                       : umac_ap_lookup_sta_by_dest_addr(umacd, addr);
-    }
-    if (vif == MMWLAN_VIF_STA)
-    {
-        return by_peer ? umac_datapath_lookup_stad_by_peer_addr_mesh(umacd, addr)
-                       : umac_datapath_lookup_stad_by_tx_dest_addr_mesh(umacd, addr);
-    }
-    /* UNSPECIFIED: a known unicast AP-client MAC resolves to the AP, everything else
-     * (incl. broadcast — ambiguous without a vif) to the mesh. */
-    if (addr != NULL && !mm_mac_addr_is_multicast(addr))
-    {
-        struct umac_sta_data *ap_stad = umac_ap_lookup_sta_by_addr(umacd, addr);
-        if (ap_stad != NULL)
-        {
-            return ap_stad;
-        }
-    }
-    return by_peer ? umac_datapath_lookup_stad_by_peer_addr_mesh(umacd, addr)
-                   : umac_datapath_lookup_stad_by_tx_dest_addr_mesh(umacd, addr);
-}
-#else
-/* Non-AP build: no gateway possible; never reached (gateway_active is always false). */
-static struct umac_sta_data *umac_datapath_gateway_lookup(struct umac_data *umacd,
-                                                          enum mmwlan_vif vif,
-                                                          const uint8_t *addr,
-                                                          bool by_peer)
-{
-    (void)umacd;
-    (void)vif;
-    (void)addr;
-    (void)by_peer;
-    return NULL;
-}
-#endif
 
 enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
                                           struct mmpkt *txbuf,
                                           enum umac_datapath_frame_encryption enc,
-                                          const uint8_t *ra,
-                                          enum mmwlan_vif vif)
+                                          const uint8_t *ra)
 {
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     enum mmwlan_status status = MMWLAN_ERROR;
     struct mmpktview *txbufview = mmpkt_open(txbuf);
     const struct umac_8023_hdr *header_8023 =
@@ -2573,34 +2542,54 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
     {
         MMLOG_WRN("Tx len is too small %lu\n", mmpkt_get_data_length(txbufview));
         status = MMWLAN_ERROR;
-        goto exit;
+        goto drop;
     }
 
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    bool gateway = umac_datapath_gateway_active(umacd);
+    if (mm_mac_addr_is_zero(header_8023->dest_addr) || mm_mac_addr_is_zero(header_8023->src_addr))
+    {
+        MMLOG_WRN("Invalid Source or Destination Address\n");
+        status = MMWLAN_INVALID_ARGUMENT;
+        goto drop;
+    }
+
+    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("Invalid datapath_ops for vif_id %u\n", tx_metadata->vif_id);
+        status = MMWLAN_UNAVAILABLE;
+        goto drop;
+    }
+
     struct umac_sta_data *stad = NULL;
     const char *addr_type;
     const uint8_t *addr;
     if (ra == NULL)
     {
+        stad = datapath_ops->lookup_stad_by_tx_dest_addr(umacd, header_8023->dest_addr);
         addr_type = "DA";
         addr = header_8023->dest_addr;
-        stad = gateway ? umac_datapath_gateway_lookup(umacd, vif, addr, false)
-                       : data->ops->lookup_stad_by_tx_dest_addr(umacd, addr);
     }
     else
     {
+        stad = datapath_ops->lookup_stad_by_peer_addr(umacd, ra);
         addr_type = "RA";
         addr = ra;
-        stad = gateway ? umac_datapath_gateway_lookup(umacd, vif, addr, true)
-                       : data->ops->lookup_stad_by_peer_addr(umacd, ra);
     }
 
     if (stad == NULL)
     {
         MMLOG_WRN("No STA record for %s " MM_MAC_ADDR_FMT "\n", addr_type, MM_MAC_ADDR_VAL(addr));
         status = MMWLAN_NOT_FOUND;
-        goto exit;
+        goto drop;
+    }
+
+    if (mm_mac_addr_is_zero(umac_sta_data_peek_bssid(stad)))
+    {
+        MMLOG_WRN("Uninitialised STA record for " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(addr));
+        status = MMWLAN_NOT_FOUND;
+        goto drop;
     }
 
     const uint16_t ethertype = be16toh(header_8023->ethertype_be);
@@ -2611,40 +2600,74 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
             "Dropping request to TX non-EAPOL frame with encryption disabled (ethertype=0x%04x)\n",
             ethertype);
         status = MMWLAN_INVALID_ARGUMENT;
-        goto exit;
+        goto drop;
     }
 
-    struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
     tx_metadata->enc = is_eapol ? enc : ENCRYPTION_ENABLED;
 
-    if (is_eapol && !data->ops->is_stad_tx_paused(stad))
+    if (is_eapol && !datapath_ops->is_stad_tx_paused(stad))
     {
 
         return umac_datapath_process_tx_frame(umacd, stad, txbufview);
     }
 
-    mmpkt_close(&txbufview);
+    enum mmwlan_sta_state sta_state = datapath_ops->get_sta_state(stad);
+    if (sta_state != MMWLAN_STA_CONNECTED)
+    {
 
-    data->ops->enqueue_tx_frame(umacd, stad, txbuf);
+        MMLOG_WRN("Dropping request to TX frame when not connected (AID: %u, STATE: %s)\n",
+                  umac_sta_data_get_aid(stad),
+                  sta_state == MMWLAN_STA_DISABLED ? "disabled" : "connecting");
+        status = MMWLAN_UNAVAILABLE;
+        goto drop;
+    }
+
+    mmpkt_close(&txbufview);
+    datapath_ops->enqueue_tx_frame(umacd, stad, txbuf);
     MMLOG_DBG("Queued frame for TX (%p, ethertype=0x%04x, enc=0x%x)\n", txbuf, ethertype, enc);
     umac_core_evt_wake(umacd);
     return MMWLAN_SUCCESS;
 
-exit:
+drop:
     mmpkt_close(&txbufview);
     mmpkt_release(txbuf);
     return status;
+}
+
+static bool umac_datapath_dequeue_tx_frame(struct umac_data *umacd,
+                                           struct umac_sta_data **stad,
+                                           struct mmpkt **txbuf)
+{
+
+    const struct umac_datapath_ops *datapath_ops;
+
+    datapath_ops = umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_STA);
+    if (datapath_ops != NULL)
+    {
+        bool has_more = datapath_ops->dequeue_tx_frame(umacd, stad, txbuf);
+        if (*txbuf != NULL)
+        {
+            return has_more;
+        }
+    }
+
+    datapath_ops = umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_AP);
+    if (datapath_ops != NULL)
+    {
+        bool has_more = datapath_ops->dequeue_tx_frame(umacd, stad, txbuf);
+        if (*txbuf != NULL)
+        {
+            return has_more;
+        }
+    }
+
+    return false;
 }
 
 
 static inline bool umac_datapath_process_tx(struct umac_data *umacd,
                                             struct umac_datapath_data *data)
 {
-    if (data->ops == NULL)
-    {
-        MMLOG_DBG("No datapath ops loaded, skipping TX work.\n");
-        return false;
-    }
     bool has_more = false;
     for (unsigned ii = 0; ii < MAX_TX_PROCESS_PER_LOOP; ii++)
     {
@@ -2657,7 +2680,7 @@ static inline bool umac_datapath_process_tx(struct umac_data *umacd,
 
         struct mmpkt *mmpkt = NULL;
         struct umac_sta_data *stad = NULL;
-        has_more = data->ops->dequeue_tx_frame(umacd, &stad, &mmpkt);
+        has_more = umac_datapath_dequeue_tx_frame(umacd, &stad, &mmpkt);
 
         if (mmpkt == NULL)
         {
@@ -2706,6 +2729,9 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     uint8_t seq_num_space = MMDRV_SEQ_NUM_BASELINE;
 
     MMOSAL_DEV_ASSERT(stad != NULL);
+    MMOSAL_DEV_ASSERT(tx_metadata != NULL);
+
+    tx_metadata->vif_id = umac_sta_data_get_vif_id(stad);
 
     bool is_probe_request =
         (dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_MGMT) &&
@@ -2713,9 +2739,20 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
                                                sta_data->tx_seq_num_spaces[seq_num_space]++);
 
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+    MMOSAL_DEV_ASSERT(datapath_ops != NULL);
+    if (datapath_ops == NULL)
+    {
+        MMLOG_WRN("No datapath ops for vif %u", tx_metadata->vif_id);
+        mmpkt_close(&txbufview);
+        mmpkt_release(txbuf);
+        return MMWLAN_ERROR;
+    }
+
     int key_id = -1;
-    MMOSAL_DEV_ASSERT(data->ops != NULL);
-    if ((data->ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
+    if ((tx_metadata->enc != ENCRYPTION_DISABLED) &&
+        (datapath_ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
     {
 
         /* A group-addressed Mesh/Multihop Action frame (HWMP PREQ/PERR/RANN) is a group-privacy
@@ -2729,15 +2766,8 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
         if (umac_sta_data_pmf_is_required(stad) && frame_is_robust_mgmt(txbufview) &&
             !frame_is_group_privacy_action(txbufview))
         {
-            if (mm_mac_addr_is_multicast(dot11_get_da(header)))
-            {
 
-                MMLOG_WRN("Unsupported attempt to TX a BC/MC RMF, frame dropped.\n");
-                mmpkt_close(&txbufview);
-                mmpkt_release(txbuf);
-                return MMWLAN_ERROR;
-            }
-            else
+            if (!mm_mac_addr_is_multicast(dot11_get_da(header)))
             {
                 header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
                 key_id = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
@@ -2804,9 +2834,10 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     umac_stats_update_last_tx_time(umacd);
 
     mmpkt_close(&txbufview);
-    if (mmdrv_tx_frame(txbuf, true) < 0)
+    status = mmdrv_tx_frame(txbuf, true);
+    if (status != MMWLAN_SUCCESS)
     {
-        return MMWLAN_ERROR;
+        return status;
     }
 
     return MMWLAN_SUCCESS;
@@ -2869,7 +2900,9 @@ static enum mmwlan_status umac_datapath_tx_mesh_keyed_frame(struct umac_sta_data
 
     if (fwd_aggregate)
     {
-        umac_datapath_aggr_check(umacd, stad, fwd_tid, header->sequence_control);
+        /* Forwarded frame is a mesh frame; open the BA session under the mesh ops. */
+        umac_datapath_aggr_check(umacd, stad, umac_datapath_ops_mesh, fwd_tid,
+                                 header->sequence_control);
     }
 
     int key_id = -1;
@@ -2994,25 +3027,19 @@ static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd
         DATAPATH_TRACE("tx_status deq %x", (uint32_t)mmpkt);
 
         struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
+        MMOSAL_DEV_ASSERT(tx_metadata != NULL);
 
-        /* AP-client and mesh-peer AID domains overlap, so in a gateway route the tx-status to the
-         * right table by the frame's stamped egress vif_id (Gap B) rather than by AID alone. */
-        struct umac_sta_data *stad;
-#if CONFIG_HALOW_AP_MODE
-        if (umac_datapath_gateway_active(umacd) &&
-            (umac_interface_get_vif_type_mask(umacd, tx_metadata->vif_id) & UMAC_INTERFACE_MESH))
+        const struct umac_datapath_ops *datapath_ops =
+            umac_interface_get_datapath_ops_by_vif_id(umacd, tx_metadata->vif_id);
+        if (datapath_ops == NULL)
         {
-            stad = umac_datapath_lookup_stad_by_aid_mesh(umacd, tx_metadata->aid);
+            MMLOG_WRN("No ops for VIF %u. Dropping TX frame\n", tx_metadata->vif_id);
+            mmpkt_release(mmpkt);
+            continue;
         }
-        else if (umac_datapath_gateway_active(umacd))
-        {
-            stad = umac_ap_lookup_sta_by_aid(umacd, tx_metadata->aid);
-        }
-        else
-#endif
-        {
-            stad = data->ops->lookup_stad_by_aid(umacd, tx_metadata->aid);
-        }
+
+
+        struct umac_sta_data *stad = datapath_ops->lookup_stad_by_aid(umacd, tx_metadata->aid);
         if (stad != NULL)
         {
             bool frame_acked = (tx_metadata->status_flags & MMDRV_TX_STATUS_FLAG_NO_ACK) == 0;
@@ -3031,7 +3058,8 @@ static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd
 
             if (valid_ack_status)
             {
-                umac_connection_handle_ack_status(mmpkt, umacd, frame_acked);
+                umac_connection_handle_ack_status(umacd, mmpkt, frame_acked);
+                umac_relay_handle_ack_status(umacd, mmpkt, frame_acked);
             }
 
 
@@ -3153,9 +3181,10 @@ static enum mmwlan_status umac_datapath_tx_qos_null_frame(struct umac_data *umac
     umac_stats_update_last_tx_time(umacd);
 
     mmpkt_close(&view);
-    if (mmdrv_tx_frame(mmpkt, false))
+    enum mmwlan_status status = mmdrv_tx_frame(mmpkt, false);
+    if (status != MMWLAN_SUCCESS)
     {
-        return MMWLAN_ERROR;
+        return status;
     }
 
     return MMWLAN_SUCCESS;
@@ -3392,688 +3421,4 @@ enum mmwlan_status umac_datapath_register_monitor_cb(struct umac_data *umacd,
     data->monitor_cb_arg = arg;
     data->monitor_cb = callback;
     return MMWLAN_SUCCESS;
-}
-
-
-static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_sta_mode(
-    struct umac_data *umacd,
-    const uint8_t *addr)
-{
-    MMLOG_DBG("Lookup peer " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(addr));
-
-    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
-    if (stad == NULL)
-    {
-        return NULL;
-    }
-
-    if (mm_mac_addr_is_multicast(addr) || umac_sta_data_matches_peer_addr(stad, addr))
-    {
-        return stad;
-    }
-    else
-    {
-        return NULL;
-    }
-}
-
-static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_sta_mode(
-    struct umac_data *umacd,
-    const uint8_t *dest_addr)
-{
-    MMLOG_DBG("Lookup dest addr " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(dest_addr));
-
-
-    return umac_connection_get_stad(umacd);
-}
-
-static struct umac_sta_data *umac_datapath_lookup_stad_by_aid_sta(struct umac_data *umacd,
-                                                                  uint16_t aid)
-{
-    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
-    if (stad == NULL)
-    {
-        return NULL;
-    }
-    if (umac_sta_data_get_aid(stad) != aid)
-    {
-        MMLOG_WRN("AID mismatch (%u != %u)\n", umac_sta_data_get_aid(stad), aid);
-        return NULL;
-    }
-    return stad;
-}
-
-/* Mesh per-AID stad lookup (P6c real-RC: closes GAP-2). The STA variant above returns the single
- * common stad (AID 0), which mismatches every mesh peer AID (1..N) -> TX-status feedback is dropped.
- * Mirror umac_ap_lookup_sta_by_aid: peer AID N maps to mesh slot N-1. AID 0 = the common (group/mgmt)
- * stad. */
-static struct umac_sta_data *umac_datapath_lookup_stad_by_aid_mesh(struct umac_data *umacd,
-                                                                   uint16_t aid)
-{
-    MM_UNUSED(umacd);
-    if (aid == 0)
-    {
-        return umac_mesh_get_common_stad();
-    }
-    return umac_mesh_peer_stad_at((size_t)(aid - 1));
-}
-
-
-static enum mmwlan_sta_state umac_datapath_get_state_sta(struct umac_sta_data *stad)
-{
-    MMOSAL_DEV_ASSERT(stad != NULL);
-    return umac_connection_get_state(umac_sta_data_get_umacd(stad));
-}
-
-
-const uint16_t frames_allowed_pre_association_sta_mode[] = {
-    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
-    UINT16_MAX,
-};
-
-static bool nullop_set_stad_sleep_state_sta_mode(struct umac_sta_data *stad, bool asleep)
-{
-    MM_UNUSED(asleep);
-    return stad != NULL;
-}
-
-static void umac_datapath_tx_queue_frame_sta(struct umac_data *umacd,
-                                             struct umac_sta_data *stad,
-                                             struct mmpkt *txbuf)
-{
-    MMOSAL_TASK_ENTER_CRITICAL();
-    umac_sta_data_queue_pkt(stad, txbuf);
-    umac_stats_update_datapath_txq_high_water_mark(umacd, umac_sta_data_get_queued_len(stad));
-    MMOSAL_TASK_EXIT_CRITICAL();
-}
-
-static bool umac_datapath_tx_dequeue_frame_sta(struct umac_data *umacd,
-                                               struct umac_sta_data **stad_ptr,
-                                               struct mmpkt **txbuf_ptr)
-{
-    MMOSAL_ASSERT(umacd && stad_ptr && txbuf_ptr);
-    *stad_ptr = NULL;
-    *txbuf_ptr = NULL;
-
-    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
-    bool has_more = false;
-
-    if (stad == NULL || umac_sta_data_is_paused(stad))
-    {
-        return false;
-    }
-    MMOSAL_TASK_ENTER_CRITICAL();
-    *txbuf_ptr = umac_sta_data_pop_pkt(stad);
-    has_more = umac_sta_data_get_queued_len(stad);
-    MMOSAL_TASK_EXIT_CRITICAL();
-    if (*txbuf_ptr != NULL)
-    {
-        *stad_ptr = stad;
-    }
-    return has_more;
-}
-
-
-static const struct umac_datapath_ops datapath_ops_sta = {
-    .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_sta,
-    .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_sta_mode,
-    .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_sta_mode,
-    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_sta,
-    .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
-    .is_stad_tx_paused = umac_sta_data_is_paused,
-    .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
-    .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_sta,
-    .construct_80211_data_header = umac_datapath_construct_80211_data_header_sta,
-    .get_sta_state = umac_datapath_get_state_sta,
-    .frames_allowed_pre_association = frames_allowed_pre_association_sta_mode,
-};
-
-void umac_datapath_configure_sta_mode(struct umac_data *umacd)
-{
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops = &datapath_ops_sta;
-    MMLOG_INF("Datapath configured for STA mode\n");
-}
-
-/* Defined in umac_datapath_ap.c; reused for the IBSS ops table. */
-extern const uint16_t frames_allowed_pre_association_ap_mode[];
-
-/* IBSS rx lookup: each unicast sender gets its own per-peer stad so the
- * receive-side sequence number / dedup state is isolated per sender. Broadcast,
- * multicast and NULL fall through to the common stad. */
-static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_ibss(struct umac_data *umacd,
-                                                                         const uint8_t *addr)
-{
-    MM_UNUSED(umacd);
-    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
-    {
-        return umac_ibss_get_common_stad();
-    }
-    return umac_ibss_get_or_create_peer_stad(addr);
-}
-
-/* IBSS tx-dest lookup: always the common stad. Our outgoing frames share one
- * SNS2/3 sequence space per IEEE 802.11 — the receiver dedupes per-sender, not
- * per-(sender, my-MAC), so we don't need per-destination tx state. Keeping TX
- * simple also means broadcast/multicast and unicast TX share the one txq the
- * dequeue path consults (see umac_datapath_tx_dequeue_frame_ibss). */
-static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_ibss(
-    struct umac_data *umacd, const uint8_t *addr)
-{
-    MM_UNUSED(umacd);
-    MM_UNUSED(addr);
-    return umac_ibss_get_common_stad();
-}
-
-/* In IBSS there is no association handshake; the controlled port is always
- * open, so report CONNECTED to allow data tx/rx through the common stad. */
-static enum mmwlan_sta_state umac_datapath_get_state_ibss(struct umac_sta_data *stad)
-{
-    MM_UNUSED(stad);
-    return MMWLAN_STA_CONNECTED;
-}
-
-static void umac_datapath_process_rx_mgmt_frame_ibss(struct umac_data *umacd,
-                                                     struct umac_sta_data *stad,
-                                                     struct mmpktview *rxbufview)
-{
-    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
-    uint16_t subtype = dot11_frame_control_get_subtype(header->frame_control);
-
-    switch (subtype)
-    {
-        case DOT11_FC_SUBTYPE_PROBE_REQ:
-            umac_ibss_handle_probe_req(umacd, rxbufview);
-            break;
-
-        case DOT11_FC_SUBTYPE_PROBE_RSP:
-        case DOT11_FC_SUBTYPE_BEACON:
-            umac_scan_process_probe_resp(umacd, rxbufview);
-            break;
-
-        default:
-            MM_UNUSED(stad);
-            break;
-    }
-}
-
-/* IBSS data frames are sent peer-to-peer: ToDS=0, FromDS=0, addr1=DA,
- * addr2=SA (this node), addr3=BSSID. (Contrast STA mode, which sets ToDS and
- * addr1=BSSID.) */
-static void umac_datapath_construct_80211_data_header_ibss(struct umac_sta_data *stad,
-                                                           const struct umac_8023_hdr *hdr_8023,
-                                                           struct dot11_data_hdr *data_hdr)
-{
-    uint16_t frame_control = DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
-                             DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE;
-
-    mac_addr_copy(data_hdr->base.addr1, hdr_8023->dest_addr);
-    umac_interface_get_mac_addr(stad, data_hdr->base.addr2);
-    umac_sta_data_get_bssid(stad, data_hdr->base.addr3);
-    data_hdr->base.frame_control = htole16(frame_control);
-}
-
-/* IBSS dequeue: the STA-mode dequeue at umac_datapath_tx_dequeue_frame_sta uses
- * umac_connection_get_stad() to find the stad — which is NULL for IBSS (no
- * association FSM). Use our common stad directly instead, otherwise enqueued
- * frames sit in the txq forever. */
-static bool umac_datapath_tx_dequeue_frame_ibss(struct umac_data *umacd,
-                                                struct umac_sta_data **stad_ptr,
-                                                struct mmpkt **txbuf_ptr)
-{
-    MM_UNUSED(umacd);
-    MMOSAL_ASSERT(stad_ptr && txbuf_ptr);
-    *stad_ptr = NULL;
-    *txbuf_ptr = NULL;
-
-    struct umac_sta_data *stad = umac_ibss_get_common_stad();
-    if (stad == NULL || umac_sta_data_is_paused(stad))
-    {
-        return false;
-    }
-
-    MMOSAL_TASK_ENTER_CRITICAL();
-    *txbuf_ptr = umac_sta_data_pop_pkt(stad);
-    bool has_more = umac_sta_data_get_queued_len(stad);
-    MMOSAL_TASK_EXIT_CRITICAL();
-    if (*txbuf_ptr != NULL)
-    {
-        *stad_ptr = stad;
-    }
-    return has_more;
-}
-
-/* IBSS frames allowed from a not-yet-known sender. IBSS has no association, so —
- * like STA mode, not AP mode — S1G beacons must be allowed: otherwise the RX
- * filter falls through to dot11_get_ta(), which for an S1G beacon reads the
- * time_stamp field (addr2 offset) and mints a fresh phantom peer every beacon,
- * flooding the peer table (#17, esp. a morse_driver node whose beacon SA=BSSID).
- * Allowing S1G_BEACON routes beacons to umac_datapath_process_s1g_beacon, which
- * does proper source_addr-based peer discovery (#16) and drops SA=BSSID. */
-static const uint16_t frames_allowed_pre_association_ibss[] = {
-    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_RSP),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
-    UINT16_MAX,
-};
-
-const struct umac_datapath_ops datapath_ops_ibss = {
-    .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_ibss,
-    .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_ibss,
-    .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_ibss,
-    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_sta,
-    .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
-    .is_stad_tx_paused = umac_sta_data_is_paused,
-    .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
-    .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_ibss,
-    .construct_80211_data_header = umac_datapath_construct_80211_data_header_ibss,
-    .get_sta_state = umac_datapath_get_state_ibss,
-    .frames_allowed_pre_association = frames_allowed_pre_association_ibss,
-};
-
-void umac_datapath_configure_ibss_mode(struct umac_data *umacd)
-{
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops = &datapath_ops_ibss;
-    MMLOG_INF("Datapath configured for IBSS mode\n");
-}
-
-/* --- MESH datapath ops -----------------------------------------------------
- * 802.11s mesh is association-less and self-beaconing, like IBSS, so the datapath
- * plumbing mirrors the IBSS ops: the "common" stad (the MBSS) backs broadcast/mgmt
- * TX. Generic helpers (get_state, sleep, pause, enqueue, data-header) are shared with
- * IBSS/STA; the mesh-specific bits are the common-stad lookups and the mgmt-frame RX
- * handler, which routes ACTION frames to the Mesh Peering Management code. */
-static struct umac_sta_data *umac_datapath_lookup_stad_by_peer_addr_mesh(struct umac_data *umacd,
-                                                                         const uint8_t *addr)
-{
-    MM_UNUSED(umacd);
-    /* Unicast RX from a peer -> that peer's stad (its pairwise/group-RX keychain + replay state);
-     * broadcast/multicast/zero -> the common (MBSS) stad. Mirrors the IBSS per-peer lookup. */
-    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
-    {
-        return umac_mesh_get_common_stad();
-    }
-    struct umac_sta_data *peer = umac_mesh_get_peer_stad(addr);
-    return (peer != NULL) ? peer : umac_mesh_get_common_stad();
-}
-
-static struct umac_sta_data *umac_datapath_lookup_stad_by_tx_dest_addr_mesh(
-    struct umac_data *umacd, const uint8_t *addr)
-{
-    MM_UNUSED(umacd);
-    /* Unicast to an established peer -> that peer's stad, so the frame is queued on the peer's TX
-     * queue and encrypted under the peer's per-pair MTK (its AID key slot); the TX scheduler
-     * (umac_datapath_tx_dequeue_frame_mesh) drains each peer's queue in turn. Broadcast/multicast/
-     * zero -> the common (MBSS) stad (group MGTK). Mirrors the RX lookup above and the AP per-STA
-     * model; an unknown / not-yet-ESTAB unicast dest falls back to the common stad.
-     * Single-hop: the dest is the directly-peered next hop. The MTK is per *link* (next hop), not per
-     * final DA, so HWMP multi-hop needs a next-hop resolve here too — a later step (see
-     * umac_datapath_construct_80211_data_header_mesh). */
-    if (addr == NULL || mm_mac_addr_is_zero(addr) || mm_mac_addr_is_multicast(addr))
-    {
-        return umac_mesh_get_common_stad();
-    }
-    struct umac_sta_data *peer = umac_mesh_get_peer_stad(addr);
-    return (peer != NULL) ? peer : umac_mesh_get_common_stad();
-}
-
-/* Pick the next mesh stad with queued TX work: the common (MBSS) stad first (broadcast/mgmt + group
- * MGTK), then each established peer's stad (per-pair unicast MTK). Pure (no side effects) so the
- * dequeue can call it twice — once to choose, once to recompute has_more. Mirrors
- * umac_ap_get_next_sta_for_tx walking data->stas[]. */
-static struct umac_sta_data *mesh_get_next_tx_stad(void)
-{
-    struct umac_sta_data *stad = umac_mesh_get_common_stad();
-    if (stad != NULL && !umac_sta_data_is_paused(stad) && umac_sta_data_get_queued_len(stad))
-    {
-        return stad;
-    }
-    for (size_t ii = 0; ii < UMAC_MESH_MAX_PEERS; ii++)
-    {
-        stad = umac_mesh_peer_stad_at(ii);
-        if (stad != NULL && !umac_sta_data_is_paused(stad) && umac_sta_data_get_queued_len(stad))
-        {
-            return stad;
-        }
-    }
-    return NULL;
-}
-
-static bool umac_datapath_tx_dequeue_frame_mesh(struct umac_data *umacd,
-                                                struct umac_sta_data **stad_ptr,
-                                                struct mmpkt **txbuf_ptr)
-{
-    MM_UNUSED(umacd);
-    MMOSAL_ASSERT(stad_ptr && txbuf_ptr);
-    *stad_ptr = NULL;
-    *txbuf_ptr = NULL;
-
-    /* Scan + pop + recompute has_more under one critical section so a concurrent enqueue can't make
-     * the multi-queue view inconsistent across the scan (the common stad plus each peer's queue). */
-    MMOSAL_TASK_ENTER_CRITICAL();
-    struct umac_sta_data *stad = mesh_get_next_tx_stad();
-    if (stad != NULL)
-    {
-        *txbuf_ptr = umac_sta_data_pop_pkt(stad);
-        if (*txbuf_ptr != NULL)
-        {
-            *stad_ptr = stad;
-        }
-    }
-    /* has_more = any eligible stad still holds a queued frame after this pop. Re-scan rather than
-     * inspect just `stad`: returning only this stad's depth would stall the other peers' queues
-     * (mesh has no single queued-frame counter like the AP's num_pkts_queued). */
-    bool has_more = (mesh_get_next_tx_stad() != NULL);
-    MMOSAL_TASK_EXIT_CRITICAL();
-    return has_more;
-}
-
-/* Build the 802.11 header for a mesh data frame, mirroring net/mac80211 (ieee80211_build_hdr,
- * MESH_POINT). Verified against an on-air capture (docs worklog 2026-06-26): QoS Data, with a
- * Mesh Control header (inserted in the TX path) and the QoS "Mesh Control Present" bit set.
- *  - Group-addressed (bcast/mcast): 3-address, fromDS=1. A1=DA, A2=TA(us), A3=mesh-SA(us).
- *  - Unicast to a peer: 4-address, toDS=fromDS=1. A1=next-hop, A2=us, A3=mesh-DA, A4=mesh-SA(us).
- * Single-hop only for now: next hop == final destination (the directly-peered node); HWMP
- * path selection for multi-hop is a later step. */
-void umac_datapath_construct_80211_data_header_mesh(struct umac_sta_data *stad,
-                                                    const struct umac_8023_hdr *hdr_8023,
-                                                    struct dot11_data_hdr *data_hdr)
-{
-    uint16_t frame_control = DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE |
-                             DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE;
-    uint8_t our_mac[DOT11_MAC_ADDR_LEN];
-    umac_interface_get_mac_addr(stad, our_mac);
-
-    if (mm_mac_addr_is_multicast(hdr_8023->dest_addr))
-    {
-        frame_control |= DOT11_MASK_FC_FROM_DS;
-        mac_addr_copy(data_hdr->base.addr1, hdr_8023->dest_addr);
-        mac_addr_copy(data_hdr->base.addr2, our_mac);
-        mac_addr_copy(data_hdr->base.addr3, our_mac);
-    }
-    else
-    {
-        frame_control |= DOT11_MASK_FC_TO_DS | DOT11_MASK_FC_FROM_DS;
-        /* RA = the HWMP next hop toward the destination. If no path is resolved yet, fall back
-         * to direct (correct for a directly-peered dest) and kick off path discovery so a
-         * multi-hop path resolves for subsequent frames. */
-        uint8_t next_hop[DOT11_MAC_ADDR_LEN];
-        if (!umac_mesh_lookup_next_hop(hdr_8023->dest_addr, next_hop))
-        {
-            mac_addr_copy(next_hop, hdr_8023->dest_addr);
-            umac_mesh_start_discovery(hdr_8023->dest_addr);
-        }
-        mac_addr_copy(data_hdr->base.addr1, next_hop);            /* RA = next hop */
-        mac_addr_copy(data_hdr->base.addr2, our_mac);             /* TA = us */
-        mac_addr_copy(data_hdr->base.addr3, hdr_8023->dest_addr); /* mesh DA (final dest) */
-        /* mesh SA = the 802.3 source. For originated frames this is our (synced) MAC; for a
-         * FORWARDED frame (re-injected with the original src) it preserves the true origin. */
-        mac_addr_copy(data_hdr->addr4, hdr_8023->src_addr);
-    }
-    data_hdr->base.frame_control = htole16(frame_control);
-}
-
-static void umac_datapath_process_rx_mgmt_frame_mesh(struct umac_data *umacd,
-                                                     struct umac_sta_data *stad,
-                                                     struct mmpktview *rxbufview)
-{
-    MM_UNUSED(stad);
-    const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
-    uint16_t subtype = dot11_frame_control_get_subtype(header->frame_control);
-
-    if (subtype == DOT11_FC_SUBTYPE_ACTION)
-    {
-        /* Block Ack action frames (ADDBA req/resp, DELBA) drive the per-peer BA session for A-MPDU:
-         * route them to the BA state machine keyed on the TRANSMITTING peer's stad, mirroring
-         * net/mac80211 ieee80211_rx_h_action's `case WLAN_CATEGORY_BACK` (rx.c) which is reached for a
-         * MESH_POINT vif. The passed stad is the mesh common stad (MM_UNUSED); the BA agreement is
-         * per-link, so resolve the peer stad from the frame's SA (A2 = the transmitting neighbour).
-         * Everything else (MPM/AMPE peering, HWMP path selection) stays with the mesh action handler. */
-        const struct dot11_action *action =
-            (const struct dot11_action *)mmpkt_get_data_start(rxbufview);
-        if (action->field.category == DOT11_ACTION_CATEGORY_BLOCK_ACK)
-        {
-            struct umac_sta_data *peer_stad = umac_mesh_get_peer_stad(dot11_get_sa(header));
-            if (peer_stad != NULL)
-            {
-                umac_ba_process_rx_frame(peer_stad,
-                                         mmpkt_get_data_start(rxbufview),
-                                         mmpkt_get_data_length(rxbufview));
-            }
-            return;
-        }
-        umac_mesh_handle_action(umacd, rxbufview);
-    }
-    else if (subtype == DOT11_FC_SUBTYPE_AUTH)
-    {
-        umac_mesh_handle_auth(umacd, rxbufview); /* SAE peering (P3) */
-    }
-}
-
-/* Mesh peering uses ACTION frames (MPM/AMPE) + AUTH frames (SAE) pre-association; allow them (and
- * beacons) through. */
-static const uint16_t frames_allowed_pre_association_mesh[] = {
-    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, AUTH),
-    UINT16_MAX,
-};
-
-static const struct umac_datapath_ops datapath_ops_mesh = {
-    .process_rx_mgmt_frame = umac_datapath_process_rx_mgmt_frame_mesh,
-    .lookup_stad_by_peer_addr = umac_datapath_lookup_stad_by_peer_addr_mesh,
-    .lookup_stad_by_tx_dest_addr = umac_datapath_lookup_stad_by_tx_dest_addr_mesh,
-    .lookup_stad_by_aid = umac_datapath_lookup_stad_by_aid_mesh,
-    .set_stad_sleep_state = nullop_set_stad_sleep_state_sta_mode,
-    .is_stad_tx_paused = umac_sta_data_is_paused,
-    .enqueue_tx_frame = umac_datapath_tx_queue_frame_sta,
-    .dequeue_tx_frame = umac_datapath_tx_dequeue_frame_mesh,
-    .construct_80211_data_header = umac_datapath_construct_80211_data_header_mesh,
-    .get_sta_state = umac_datapath_get_state_ibss,
-    .frames_allowed_pre_association = frames_allowed_pre_association_mesh,
-};
-
-void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
-{
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops = &datapath_ops_mesh;
-    MMLOG_INF("Datapath configured for MESH mode\n");
-}
-
-/* ---- Gateway (mesh + concurrent AP) datapath ops -------------------------------------------
- * data->ops is a single global, but a gateway must serve BOTH the AP-client and mesh-peer stad
- * sets at once. Mirroring mac80211 dispatching per sdata->vif, each stad-facing op below routes
- * by the stad's egress vif TYPE (mesh vs AP). Installed by configure_ap_mode when a mesh is
- * already active (mesh-first bring-up), so data->ops stops being single-mode in a gateway.
- * Whole block is AP-mode-only: it references umac_ap_* (defined only under CONFIG_HALOW_AP_MODE)
- * and configure_gateway_mode is called solely from configure_ap_mode (also AP-mode-only). */
-#if CONFIG_HALOW_AP_MODE
-
-static bool umac_datapath_stad_is_mesh(struct umac_sta_data *stad)
-{
-    struct umac_data *umacd = umac_sta_data_get_umacd(stad);
-    uint16_t vif_types = umac_interface_get_vif_type_mask(umacd, umac_sta_data_get_vif_id(stad));
-    return (vif_types & UMAC_INTERFACE_MESH) != 0;
-}
-
-static struct umac_sta_data *umac_datapath_gw_lookup_by_peer_addr(struct umac_data *umacd,
-                                                                  const uint8_t *addr)
-{
-    /* RX TA / TX RA is unicast: a known AP client -> AP stad, else the mesh peer/next-hop. */
-    return umac_datapath_gateway_lookup(umacd, MMWLAN_VIF_UNSPECIFIED, addr, true);
-}
-
-static struct umac_sta_data *umac_datapath_gw_lookup_by_tx_dest_addr(struct umac_data *umacd,
-                                                                     const uint8_t *addr)
-{
-    return umac_datapath_gateway_lookup(umacd, MMWLAN_VIF_UNSPECIFIED, addr, false);
-}
-
-static struct umac_sta_data *umac_datapath_gw_lookup_by_aid(struct umac_data *umacd, uint16_t aid)
-{
-    /* AID domains overlap between AP clients and mesh peers; the only caller that matters
-     * (tx-status) disambiguates by the frame's stamped vif_id at its call site. This fallback
-     * prefers the AP table then mesh. */
-    struct umac_sta_data *ap_stad = umac_ap_lookup_sta_by_aid(umacd, aid);
-    return ap_stad ? ap_stad : umac_datapath_lookup_stad_by_aid_mesh(umacd, aid);
-}
-
-static bool umac_datapath_gw_is_stad_tx_paused(struct umac_sta_data *stad)
-{
-    return umac_datapath_stad_is_mesh(stad) ? umac_sta_data_is_paused(stad)
-                                            : umac_ap_is_stad_paused(stad);
-}
-
-static bool umac_datapath_gw_set_stad_sleep_state(struct umac_sta_data *stad, bool asleep)
-{
-    return umac_datapath_stad_is_mesh(stad) ? nullop_set_stad_sleep_state_sta_mode(stad, asleep)
-                                            : umac_ap_set_stad_sleep_state(stad, asleep);
-}
-
-static enum mmwlan_sta_state umac_datapath_gw_get_sta_state(struct umac_sta_data *stad)
-{
-    return umac_datapath_stad_is_mesh(stad) ? umac_datapath_get_state_ibss(stad)
-                                            : umac_ap_get_state(stad);
-}
-
-static void umac_datapath_gw_enqueue_tx_frame(struct umac_data *umacd,
-                                              struct umac_sta_data *stad,
-                                              struct mmpkt *txbuf)
-{
-    /* Queue on the stad's own queue via its interface's enqueue so the AP's num_pkts_queued
-     * accounting is only touched for AP stads (mesh stads use the plain per-stad queue). */
-    if (umac_datapath_stad_is_mesh(stad))
-    {
-        umac_datapath_tx_queue_frame_sta(umacd, stad, txbuf);
-    }
-    else
-    {
-        umac_ap_queue_pkt(umacd, stad, txbuf);
-    }
-}
-
-static bool umac_datapath_gw_dequeue_tx_frame(struct umac_data *umacd,
-                                              struct umac_sta_data **stad_ptr,
-                                              struct mmpkt **txbuf_ptr)
-{
-    /* Alternate which set is served first each call so sustained load on one interface cannot
-     * starve the other (a strict AP-first order would stall mesh-direction forwarding whenever the
-     * AP is saturated, and vice-versa). Fall back to the other set when the preferred one is empty.
-     * Single datapath instance (one umacd), so a file-scope toggle is sufficient. */
-    static bool prefer_mesh = false;
-    prefer_mesh = !prefer_mesh;
-
-    if (prefer_mesh)
-    {
-        (void)umac_datapath_tx_dequeue_frame_mesh(umacd, stad_ptr, txbuf_ptr);
-        if (*txbuf_ptr == NULL)
-        {
-            (void)umac_ap_tx_dequeue_frame(umacd, stad_ptr, txbuf_ptr);
-        }
-    }
-    else
-    {
-        (void)umac_ap_tx_dequeue_frame(umacd, stad_ptr, txbuf_ptr);
-        if (*txbuf_ptr == NULL)
-        {
-            (void)umac_datapath_tx_dequeue_frame_mesh(umacd, stad_ptr, txbuf_ptr);
-        }
-    }
-
-    /* has_more: keep the scheduler looping while we still produce frames; when both sets are empty
-     * we return nothing and the work loop stops (it breaks on a NULL frame). */
-    return *txbuf_ptr != NULL;
-}
-
-static void umac_datapath_gw_construct_80211_data_header(struct umac_sta_data *stad,
-                                                         const struct umac_8023_hdr *hdr_8023,
-                                                         struct dot11_data_hdr *data_hdr)
-{
-    /* process_tx_frame's gateway branch already calls the per-vif builder directly, so this is a
-     * safety net; dispatch by the stad's vif for consistency if ever invoked via ops. */
-    if (umac_datapath_stad_is_mesh(stad))
-    {
-        umac_datapath_construct_80211_data_header_mesh(stad, hdr_8023, data_hdr);
-    }
-    else
-    {
-        umac_datapath_construct_80211_data_header_ap(stad, hdr_8023, data_hdr);
-    }
-}
-
-static void umac_datapath_gw_process_rx_mgmt_frame(struct umac_data *umacd,
-                                                   struct umac_sta_data *stad,
-                                                   struct mmpktview *rxbufview)
-{
-    /* A PROBE_REQ is only ever answered by the AP (the mesh handler ignores it), and a broadcast
-     * probe's FW vif attribution is ambiguous, so route it to the AP handler regardless of vif id
-     * — otherwise the concurrent AP could be undiscoverable via active scan. */
-    const struct dot11_hdr *hdr = (const struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
-    if (dot11_frame_control_get_subtype(hdr->frame_control) == DOT11_FC_SUBTYPE_PROBE_REQ)
-    {
-        umac_datapath_process_rx_mgmt_frame_ap(umacd, stad, rxbufview);
-        return;
-    }
-
-    /* Otherwise route by the INGRESS vif (the FW tags each RX frame with its vif id), so a mesh
-     * peering ACTION/AUTH goes to the mesh handler and an AP client ASSOC/AUTH to the AP handler —
-     * resolving the AUTH-subtype overlap that frame content alone cannot. */
-    struct mmpkt *rxbuf = mmpkt_from_view(rxbufview);
-    const struct mmdrv_rx_metadata *rxmeta = mmdrv_get_rx_metadata(rxbuf);
-    if (rxmeta != NULL &&
-        (umac_interface_get_vif_type_mask(umacd, rxmeta->vif_id) & UMAC_INTERFACE_MESH))
-    {
-        umac_datapath_process_rx_mgmt_frame_mesh(umacd, stad, rxbufview);
-    }
-    else
-    {
-        umac_datapath_process_rx_mgmt_frame_ap(umacd, stad, rxbufview);
-    }
-}
-
-/* Pre-association RX allow-list = union of AP + mesh: both mesh peering (ACTION/AUTH + beacons)
- * and AP client bring-up (PROBE/AUTH/ASSOC) must pass while the sender has no stad record yet. */
-static const uint16_t frames_allowed_pre_association_gateway[] = {
-    DOT11_VER_TYPE_SUBTYPE(0, EXT, S1G_BEACON),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, PROBE_REQ),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, AUTH),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ASSOC_REQ),
-    DOT11_VER_TYPE_SUBTYPE(0, MGMT, ACTION),
-    UINT16_MAX,
-};
-
-static const struct umac_datapath_ops datapath_ops_gateway = {
-    .process_rx_mgmt_frame = umac_datapath_gw_process_rx_mgmt_frame,
-    .lookup_stad_by_peer_addr = umac_datapath_gw_lookup_by_peer_addr,
-    .lookup_stad_by_tx_dest_addr = umac_datapath_gw_lookup_by_tx_dest_addr,
-    .lookup_stad_by_aid = umac_datapath_gw_lookup_by_aid,
-    .set_stad_sleep_state = umac_datapath_gw_set_stad_sleep_state,
-    .is_stad_tx_paused = umac_datapath_gw_is_stad_tx_paused,
-    .enqueue_tx_frame = umac_datapath_gw_enqueue_tx_frame,
-    .dequeue_tx_frame = umac_datapath_gw_dequeue_tx_frame,
-    .construct_80211_data_header = umac_datapath_gw_construct_80211_data_header,
-    .get_sta_state = umac_datapath_gw_get_sta_state,
-    .frames_allowed_pre_association = frames_allowed_pre_association_gateway,
-};
-
-void umac_datapath_configure_gateway_mode(struct umac_data *umacd)
-{
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops = &datapath_ops_gateway;
-    MMLOG_INF("Datapath configured for GATEWAY (mesh+AP) mode\n");
-}
-
-#endif /* CONFIG_HALOW_AP_MODE */
-
-void umac_datapath_configure_scan_mode(struct umac_data *umacd)
-{
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-
-    if (data->ops == NULL)
-    {
-        data->ops = &datapath_ops_sta;
-    }
 }

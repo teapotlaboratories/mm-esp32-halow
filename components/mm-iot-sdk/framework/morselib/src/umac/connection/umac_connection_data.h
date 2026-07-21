@@ -44,7 +44,6 @@ struct umac_connection_data
     bool is_initialised;
 
     bool ecsa_active;
-    uint16_t vif_id;
     struct umac_connection_bss_cfg bss_cfg;
     mmwlan_link_state_cb_t link_callback;
     void *link_arg;
@@ -71,9 +70,15 @@ struct umac_connection_data
 
     enum umac_connection_mode mode;
 
-    struct mmwlan_dpp_args dpp_args;
+    void (*dpp_event_cb)(const struct mmwlan_dpp_cb_args *dpp_event, void *arg);
+
+    void *dpp_event_cb_arg;
 
     bool control_resp_1mhz_in_en;
 
     struct ie_s1g_operation ecsa_s1g_info;
+
+    enum mmwlan_dpp_mode dpp_mode;
+
+    int32_t dpp_bootstrap_id;
 };

@@ -17,14 +17,6 @@
 #include "umac/ies/s1g_operation.h"
 
 
-enum umac_connection_signal_change
-{
-    UMAC_CONNECTION_SIGNAL_CHANGE_NO_CHANGE,
-    UMAC_CONNECTION_SIGNAL_CHANGE_ABOVE_THRESHOLD,
-    UMAC_CONNECTION_SIGNAL_CHANGE_BELOW_THRESHOLD
-};
-
-
 struct umac_connection_bss_cfg
 {
 
@@ -61,6 +53,11 @@ enum mmwlan_status umac_connection_start_dpp(struct umac_data *umacd,
 
 
 enum mmwlan_status umac_connection_stop_dpp(struct umac_data *umacd);
+
+
+enum mmwlan_status umac_connection_get_dpp_uri(struct umac_data *umacd,
+                                               char *uri_buf,
+                                               size_t buf_len);
 
 
 void umac_connection_handle_dpp_event(struct umac_data *umacd,
@@ -117,6 +114,10 @@ enum mmwlan_status umac_connection_set_bss_cfg(struct umac_data *umacd,
                                                struct umac_connection_bss_cfg *config);
 
 
+enum mmwlan_status umac_connection_get_channel_info(struct umac_data *umacd,
+                                                    struct mmwlan_vif_channel_info *cfg);
+
+
 enum mmwlan_status umac_connection_get_bssid(struct umac_data *umacd, uint8_t *bssid);
 
 
@@ -157,7 +158,7 @@ enum mmwlan_status umac_connection_process_deauth_tx(struct umac_data *umacd,
                                                      struct frame_data_deauth *params);
 
 
-void umac_connection_handle_ack_status(struct mmpkt *mmpkt, struct umac_data *umacd, bool acked);
+void umac_connection_handle_ack_status(struct umac_data *umacd, struct mmpkt *mmpkt, bool acked);
 
 
 void umac_connection_handle_beacon_loss(struct umac_data *umacd);
@@ -166,13 +167,9 @@ void umac_connection_handle_beacon_loss(struct umac_data *umacd);
 void umac_connection_set_monitor_disable(struct umac_data *umacd, bool disable);
 
 
-void umac_connection_set_signal_monitor(struct umac_data *umacd,
-                                        int16_t threshold,
-                                        int16_t hysteresis);
-
-
-enum umac_connection_signal_change umac_connection_check_signal_change(struct umac_data *umacd,
-                                                                       int16_t rssi);
+enum mmwlan_status umac_connection_set_signal_monitor(struct umac_data *umacd,
+                                                      int16_t threshold,
+                                                      int16_t hysteresis);
 
 
 void umac_connection_set_sta_autoconnect(struct umac_data *umacd,

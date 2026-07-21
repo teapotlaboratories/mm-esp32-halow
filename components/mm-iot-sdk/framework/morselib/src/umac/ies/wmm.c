@@ -50,8 +50,8 @@ void ie_wmm_info_build(struct consbuf *buf)
         ie->vs_header.oui[0] = wmm_info_id[0];
         ie->vs_header.oui[1] = wmm_info_id[1];
         ie->vs_header.oui[2] = wmm_info_id[2];
-        ie->vs_header.type = WMM_OUI_TYPE;
 
+        ie->type = WMM_OUI_TYPE;
         ie->subtype = WMM_INFO_ELEMENT_SUBTYPE;
         ie->version = WMM_VERSION;
         ie->qos_info = 0;

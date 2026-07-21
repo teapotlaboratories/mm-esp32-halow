@@ -14,6 +14,10 @@
 enum dpp_status_error;
 
 int wpas_dpp_qr_code(struct wpa_supplicant *wpa_s, const char *cmd);
+int wpas_dpp_bootstrap_gen(struct wpa_supplicant *wpa_s, const char *cmd);
+const char * wpas_dpp_bootstrap_get_uri(struct wpa_supplicant *wpa_s,
+					unsigned int id);
+int wpas_dpp_bootstrap_remove(struct wpa_supplicant *wpa_s, const char *id);
 int wpas_dpp_nfc_uri(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_nfc_handover_req(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_nfc_handover_sel(struct wpa_supplicant *wpa_s, const char *cmd);
@@ -46,6 +50,5 @@ int wpas_dpp_ca_set(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_conf_set(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_push_button(struct wpa_supplicant *wpa_s, const char *cmd);
 void wpas_dpp_push_button_stop(struct wpa_supplicant *wpa_s);
-void wpas_dpp_push_button_tx_wait_expire(struct wpa_supplicant *wpa_s);
 
 #endif /* DPP_SUPPLICANT_H */
