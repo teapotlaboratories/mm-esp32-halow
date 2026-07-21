@@ -21,24 +21,24 @@
 #endif
 
 
+struct umac_datapath_ops;
+
+
+extern const struct umac_datapath_ops *const umac_datapath_ops_ap;
+
+extern const struct umac_datapath_ops *const umac_datapath_ops_sta;
+
+/* Per-vif ops tables for the STA-host-slot modes we add on top of upstream (defined in
+ * umac_datapath_mesh.c / umac_datapath_ibss.c). Bound at umac_interface_add time. */
+extern const struct umac_datapath_ops *const umac_datapath_ops_mesh;
+
+extern const struct umac_datapath_ops *const umac_datapath_ops_ibss;
+
+
 void umac_datapath_init(struct umac_data *umacd);
 
 
 void umac_datapath_deinit(struct umac_data *umacd);
-
-
-void umac_datapath_configure_sta_mode(struct umac_data *umacd);
-
-
-void umac_datapath_configure_ap_mode(struct umac_data *umacd);
-
-
-void umac_datapath_configure_ibss_mode(struct umac_data *umacd);
-
-void umac_datapath_configure_mesh_mode(struct umac_data *umacd);
-
-
-void umac_datapath_configure_scan_mode(struct umac_data *umacd);
 
 
 void umac_datapath_stad_init(struct umac_sta_data *stad);
@@ -88,27 +88,12 @@ enum umac_datapath_frame_encryption
 };
 
 
-/*
- * @param vif  The egress vif the caller is transmitting on (the analog of
- *             mac80211's info->control.vif). Used, when a mesh and a concurrent AP
- *             are both up, to scope the stad lookup to the right interface so e.g. a
- *             broadcast can be attributed to the AP subnet vs the mesh subnet. The
- *             mesh netif uses MMWLAN_VIF_STA (the same host-slot the RX demux maps
- *             mesh to); MMWLAN_VIF_UNSPECIFIED falls back to dest-MAC disambiguation.
- */
+/* The egress vif is conveyed via the frame's pre-stamped tx_metadata->vif_id (the caller stamps
+ * it before calling); the per-vif ops are resolved from it inside the TX path. */
 enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
                                           struct mmpkt *txbuf,
                                           enum umac_datapath_frame_encryption enc,
-                                          const uint8_t *ra,
-                                          enum mmwlan_vif vif);
-
-/* True when a mesh and a concurrent AP are both active (the all-ESP Mesh-gate). */
-bool umac_datapath_gateway_active(struct umac_data *umacd);
-
-/* Install the gateway datapath ops (every stad-facing op dispatches by the stad's vif so BOTH
- * the AP-client and mesh-peer stad sets are served). Called from configure_ap_mode when a mesh
- * is already active. */
-void umac_datapath_configure_gateway_mode(struct umac_data *umacd);
+                                          const uint8_t *ra);
 
 
 enum mmwlan_status umac_datapath_wait_for_tx_ready(struct umac_data *umacd, uint32_t timeout_ms);
@@ -202,5 +187,25 @@ enum mmwlan_status umac_datapath_register_monitor_cb(struct umac_data *umacd,
 
 
 void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter);
+
+
+struct MM_PACKED umac_8023_hdr
+{
+    struct
+    {
+
+        uint8_t dest_addr[DOT11_MAC_ADDR_LEN];
+
+        uint8_t src_addr[DOT11_MAC_ADDR_LEN];
+
+        uint16_t ethertype_be;
+    };
+};
+
+
+void umac_datapath_generate_8023_header(const uint8_t *dest_addr,
+                                        const uint8_t *src_addr,
+                                        uint16_t ethertype,
+                                        struct umac_8023_hdr *header);
 
 

@@ -11,5 +11,5 @@ set(src
 
 add_library(mmutils STATIC ${src})
 add_dependencies(mmutils morselib)
-target_link_libraries(mmutils INTERFACE morselib)
-target_include_directories(mmutils INTERFACE ${inc})
+target_link_libraries(mmutils PUBLIC morselib)
+target_include_directories(mmutils PUBLIC ${inc})

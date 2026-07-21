@@ -60,8 +60,10 @@ static esp_err_t halow_transmit(void *h, void *buffer, size_t len)
     struct mmpkt *pkt;
     struct mmpktview *pktview;
     enum mmwlan_status status;
+    mmhalow_netif_driver_t *driver = (mmhalow_netif_driver_t *)h;
     struct mmwlan_tx_metadata metadata = {
         .tid = 0,
+        .vif = driver->tx_vif,
     };
 
     status = mmwlan_tx_wait_until_ready(1000);
@@ -322,10 +324,20 @@ enum mmwlan_status mmhalow_status()
 
 void mmhalow_wifi_start(){
     mmhalow_netif_driver_t *morse_drv = esp_netif_get_io_driver(halow_netif);
+    /* Tag AP egress with MMWLAN_VIF_AP so morselib's per-VIF datapath routes it to the AP VIF
+     * (an UNSPECIFIED tag is ambiguous once an idle STA VIF also exists — see mmhalow.h tx_vif). */
+    morse_drv->tx_vif = MMWLAN_VIF_AP;
     mmwlan_ap_enable(&morse_drv->ap_args);
 }
 
 esp_netif_t *mmhalow_get_netif(void)
 {
     return halow_netif;
+}
+
+void mmhalow_set_tx_vif(enum mmwlan_vif vif)
+{
+    mmhalow_netif_driver_t *morse_drv = esp_netif_get_io_driver(halow_netif);
+    MMOSAL_ASSERT(morse_drv);
+    morse_drv->tx_vif = vif;
 }

@@ -39,22 +39,19 @@ enum umac_interface_type
 };
 
 
-#define UMAC_INTERFACE_VIF_ID_INVALID (0xffff)
-
-
 void umac_interface_init(struct umac_data *umacd);
+
+
+struct umac_datapath_ops;
 
 
 enum mmwlan_status umac_interface_add(struct umac_data *umacd,
                                       enum umac_interface_type type,
-                                      const uint8_t *mac_addr,
-                                      uint16_t *vif_id);
+                                      const struct umac_datapath_ops *datapath_ops,
+                                      const uint8_t *mac_addr);
 
 
 void umac_interface_remove(struct umac_data *umacd, enum umac_interface_type type);
-
-
-void umac_interface_stop(struct umac_data *umacd);
 
 
 bool umac_interface_is_active(struct umac_data *umacd);
@@ -77,12 +74,15 @@ static inline uint16_t umac_interface_get_vif_id_from_rx_metadata(
 uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask);
 
 
+enum mmwlan_vif umac_interface_get_vif_by_id(struct umac_data *umacd, uint16_t vif_id);
+
+
+/** Return the active interface-type bitmask of the host-slot that owns @p vif_id
+ *  (or 0 if none). Two-slot shim for mode decisions keyed off the FW vif_id. */
 uint16_t umac_interface_get_vif_type_mask(struct umac_data *umacd, uint16_t vif_id);
 
 
-enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
-                                                enum umac_interface_type type,
-                                                uint16_t *vif_id);
+enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd, enum mmwlan_vif vif);
 
 
 enum mmwlan_status umac_interface_get_fw_version(struct umac_data *umacd,
@@ -108,9 +108,12 @@ enum mmwlan_status umac_interface_borrow_vif_mac_addr(struct umac_data *umacd,
                                                       const uint8_t **mac_addr);
 
 
-enum mmwlan_status umac_interface_set_vif_mac_addr(struct umac_data *umacd,
-                                                   enum mmwlan_vif vif,
-                                                   const uint8_t *mac_addr);
+const struct umac_datapath_ops *umac_interface_get_datapath_ops_by_vif_id(struct umac_data *umacd,
+                                                                          uint16_t vif_id);
+
+
+const struct umac_datapath_ops *umac_interface_get_datapath_ops(struct umac_data *umacd,
+                                                                enum mmwlan_vif vif);
 
 
 enum mmwlan_status umac_interface_get_mac_addr(struct umac_sta_data *stad, uint8_t *mac_addr);
@@ -123,6 +126,11 @@ bool umac_interface_addr_matches_mac_addr(struct umac_sta_data *stad, const uint
 
 
 enum mmwlan_status umac_interface_set_scan(struct umac_data *umacd, bool enabled);
+
+
+int umac_interface_calc_pri_1mhz_idx(struct umac_data *umacd,
+                                     const struct ie_s1g_operation *s1g_operation,
+                                     const struct mmwlan_s1g_channel *operating_chan);
 
 
 const struct mmwlan_s1g_channel *umac_interface_calc_pri_channel(
@@ -156,9 +164,6 @@ const struct morse_caps *umac_interface_get_capabilities(struct umac_data *umacd
 
 
 uint8_t umac_interface_max_supported_bw(struct umac_data *umacd);
-
-
-void umac_interface_configure_periodic_health_check(struct umac_data *umacd);
 
 
 bool umac_interface_get_control_response_bw_1mhz_out_enabled(struct umac_data *umacd);

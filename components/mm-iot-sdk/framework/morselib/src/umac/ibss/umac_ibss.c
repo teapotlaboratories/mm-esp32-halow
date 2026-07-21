@@ -444,7 +444,7 @@ void umac_ibss_start(uint16_t vif_id,
     /* In case of a restart, wipe the peer table. */
     umac_ibss_clear_peers_();
 
-    umac_datapath_configure_ibss_mode(umacd);
+    /* Datapath ops (umac_datapath_ops_ibss) are bound at umac_interface_add time. */
     ibss_ctx.active = true;
 }
 
@@ -572,16 +572,18 @@ void umac_ibss_handle_probe_req(struct umac_data *umacd, struct mmpktview *rxbuf
  * and remove it. Each remove call is a no-op if the bit isn't set. */
 static void umac_ibss_tear_down_active_interfaces(struct umac_data *umacd)
 {
-    struct umac_interface_data *iface = umac_data_get_interface(umacd);
     const enum umac_interface_type maybe_active[] = {
         UMAC_INTERFACE_STA,
         UMAC_INTERFACE_SCAN,
         UMAC_INTERFACE_AP,
         UMAC_INTERFACE_NONE,
     };
+    struct umac_interface_vif_data *vif_sta = umac_data_get_interface_vif(umacd, MMWLAN_VIF_STA);
+    struct umac_interface_vif_data *vif_ap = umac_data_get_interface_vif(umacd, MMWLAN_VIF_AP);
+    uint16_t active = vif_sta->active_interface_types | vif_ap->active_interface_types;
     for (size_t i = 0; i < sizeof(maybe_active) / sizeof(maybe_active[0]); i++)
     {
-        if (iface->active_interface_types & maybe_active[i])
+        if (active & maybe_active[i])
         {
             umac_interface_remove(umacd, maybe_active[i]);
         }
@@ -612,14 +614,14 @@ enum mmwlan_status mmwlan_ibss_start(const struct mmwlan_ibss_args *args)
         iface_mac = NULL;
     }
 
-    uint16_t vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
     enum mmwlan_status status =
-        umac_interface_add(umacd, UMAC_INTERFACE_ADHOC, iface_mac, &vif_id);
+        umac_interface_add(umacd, UMAC_INTERFACE_ADHOC, umac_datapath_ops_ibss, iface_mac);
     if (status != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("IBSS interface add failed: %d\n", (int)status);
         return status;
     }
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_ADHOC);
 
     const struct mmwlan_s1g_channel *chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
     if (chan == NULL)
@@ -693,14 +695,13 @@ fail:
 enum mmwlan_status mmwlan_ibss_stop(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
-    struct umac_interface_data *iface = umac_data_get_interface(umacd);
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_ADHOC);
 
-    if (!(iface->active_interface_types & UMAC_INTERFACE_ADHOC))
+    if (vif_id == MMDRV_VIF_ID_INVALID)
     {
         return MMWLAN_UNAVAILABLE;
     }
 
-    uint16_t vif_id = iface->vif_id;
     /* Stop our local beacon generation first so we stop touching the vif. */
     umac_ibss_set_active(false);
     umac_connection_signal_link_state(umacd, MMWLAN_VIF_AP, MMWLAN_LINK_DOWN);

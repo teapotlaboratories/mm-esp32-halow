@@ -32,6 +32,13 @@ typedef struct mmhalow_netif_driver
     struct mmwlan_ap_args ap_args;
 
     bool sta_conf_set;
+
+    /* VIF to stamp on egress frames. morselib's per-VIF datapath (>= 2.11.2) resolves the TX frame's
+     * VIF from this tag; a plain AP app still boots an (idle) STA VIF, so an UNSPECIFIED tag is
+     * ambiguous and the frame is dropped by mmwlan_tx_pkt ("Unable to infer VIF ID"). Set per active
+     * role (the AP path sets MMWLAN_VIF_AP). Defaults to MMWLAN_VIF_UNSPECIFIED (calloc) so the STA
+     * and mesh paths keep inferring the VIF exactly as before. */
+    enum mmwlan_vif tx_vif;
 } mmhalow_netif_driver_t;
 
 struct mmhalow_scan_args
@@ -98,3 +105,12 @@ void mmhalow_wifi_start();
  * not been called.
  */
 esp_netif_t *mmhalow_get_netif(void);
+
+/**
+ * Set the VIF that mmhalow's netif stamps on egress frames. Needed when a caller drives mmwlan
+ * directly (e.g. a mesh-gate calling @ref mmwlan_mesh_start) rather than via @ref mmhalow_connect /
+ * @ref mmhalow_wifi_start: morselib's per-VIF datapath must be told which VIF the netif egresses on,
+ * and an UNSPECIFIED tag is ambiguous once more than one VIF is active. For a mesh netif pass
+ * @ref MMWLAN_VIF_STA (the mesh occupies the STA host-slot; morselib resolves STA->MESH).
+ */
+void mmhalow_set_tx_vif(enum mmwlan_vif vif);

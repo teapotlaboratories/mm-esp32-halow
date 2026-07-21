@@ -15,6 +15,8 @@ set(INC
 set(SRCS
     ${ROOT_DIR}/mmrc/src/core/mmrc.c
     ${ROOT_DIR}/src/common/mac_address.c
+    ${ROOT_DIR}/src/common/common.c
+    ${ROOT_DIR}/src/common/consbuf.c
     ${ROOT_DIR}/src/common/mmpkt.c
     ${ROOT_DIR}/src/common/mmpkt_list.c
     ${ROOT_DIR}/src/dot11/dot11_utils.c
@@ -32,6 +34,9 @@ set(SRCS
     ${ROOT_DIR}/src/umac/data/umac_sta_data.c
     ${ROOT_DIR}/src/umac/datapath/datapath_defrag.c
     ${ROOT_DIR}/src/umac/datapath/umac_datapath.c
+    ${ROOT_DIR}/src/umac/datapath/umac_datapath_sta.c
+    ${ROOT_DIR}/src/umac/datapath/umac_datapath_ibss.c
+    ${ROOT_DIR}/src/umac/datapath/umac_datapath_mesh.c
     ${ROOT_DIR}/src/umac/frames/action.c
     ${ROOT_DIR}/src/umac/frames/association.c
     ${ROOT_DIR}/src/umac/frames/authentication.c
@@ -41,6 +46,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/frames/probe_request.c
     ${ROOT_DIR}/src/umac/frames/probe_response.c
     ${ROOT_DIR}/src/umac/frames/utils.c
+    ${ROOT_DIR}/src/umac/frames/s1g_action.c
     ${ROOT_DIR}/src/umac/ies/aid_request.c
     ${ROOT_DIR}/src/umac/ies/twt_ie.c
     ${ROOT_DIR}/src/umac/ies/s1g_capabilities.c
@@ -49,6 +55,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/ies/ies_common.c
     ${ROOT_DIR}/src/umac/ies/wmm.c
     ${ROOT_DIR}/src/umac/ies/morse_ie.c
+    ${ROOT_DIR}/src/umac/ies/reachable_address.c
     ${ROOT_DIR}/src/umac/interface/umac_interface.c
     ${ROOT_DIR}/src/umac/keys/connection_keys.c
     ${ROOT_DIR}/src/umac/keys/umac_keys.c
@@ -71,7 +78,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/umac.c
     ${ROOT_DIR}/src/umac/umac_mmdrv_shim.c
     ${ROOT_DIR}/src/umac/wnm_sleep/umac_wnm_sleep.c
-    ${ROOT_DIR}/src/umac/offload/umac_offload.c
+    ${ROOT_DIR}/src/umac/health_check/umac_health_check.c
     ${ROOT_DIR}/src/driver/morse_driver/mm6108/mm6108.c
     ${ROOT_DIR}/src/driver/morse_driver/mm6108/pager_if_hw.c
     ${ROOT_DIR}/src/driver/morse_driver/mm6108/pager_if.c
@@ -82,10 +89,10 @@ set(SRCS
     ${ROOT_DIR}/src/driver/beacon/beacon.c
     ${ROOT_DIR}/src/driver/driver.c
     ${ROOT_DIR}/src/driver/driver_task.c
-    ${ROOT_DIR}/src/driver/health/driver_health.c
     ${ROOT_DIR}/src/driver/puff/puff.c
     ${ROOT_DIR}/src/driver/morse_crc/morse_crc.c
     ${ROOT_DIR}/src/driver/morse_driver/command.c
+    ${ROOT_DIR}/src/driver/morse_driver/coredump.c
     ${ROOT_DIR}/src/driver/morse_driver/event.c
     ${ROOT_DIR}/src/driver/morse_driver/ext_host_table.c
     ${ROOT_DIR}/src/driver/morse_driver/firmware.c
