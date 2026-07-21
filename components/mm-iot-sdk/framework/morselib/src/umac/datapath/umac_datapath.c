@@ -341,6 +341,7 @@ static void umac_datapath_process_unprotected_robust_mgmt_frame(struct umac_data
 
 static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
                                                 struct umac_sta_data *stad,
+                                                uint16_t vif_id,
                                                 struct mmpktview *rxbufview)
 {
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
@@ -389,10 +390,8 @@ static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
         }
     }
 
-    struct mmdrv_rx_metadata *metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
-    const struct umac_datapath_ops *datapath_ops = umac_interface_get_datapath_ops_by_vif_id(
-        umacd,
-        umac_interface_get_vif_id_from_rx_metadata(metadata));
+    const struct umac_datapath_ops *datapath_ops =
+        umac_interface_get_datapath_ops_by_vif_id(umacd, vif_id);
     MMOSAL_DEV_ASSERT(datapath_ops != NULL);
     if (datapath_ops != NULL)
     {
@@ -835,6 +834,8 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             MMLOG_INF("Received 4-address EAPOL frame. Not supported\n");
             goto drop;
         }
+
+
         umac_datapath_process_rx_eapol_frame(umacd, rxbufview, header);
         goto drop;
     }
@@ -1415,15 +1416,57 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
                                                  struct mmpkt *rxbuf,
                                                  struct mmpktview *rxbufview)
 {
-    struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    const struct dot11_hdr *header = (const struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
 
     MMOSAL_ASSERT(!dot11_is_4addr_hdr(header->frame_control));
 
     const enum dot11_fc_type frame_type =
         (enum dot11_fc_type)dot11_frame_control_get_type(header->frame_control);
     const uint16_t frame_subtype = dot11_frame_control_get_subtype(header->frame_control);
+
+
+    if (frame_type == DOT11_FC_TYPE_MGMT &&
+        (dot11_sequence_control_get_fragment_number(header->sequence_control) ||
+         dot11_frame_control_get_more_fragments(header->frame_control)))
+    {
+        const struct dot11_data_hdr *data_hdr =
+            (const struct dot11_data_hdr *)mmpkt_get_data_start(rxbufview);
+        const size_t data_hdr_len = dot11_data_hdr_get_len(data_hdr);
+
+
+        data_hdr = (const struct dot11_data_hdr *)mmpkt_remove_from_start(rxbufview, data_hdr_len);
+        if (data_hdr == NULL)
+        {
+            goto drop;
+        }
+
+
+        struct mmdrv_rx_metadata saved_metadata = *mmdrv_get_rx_metadata(rxbuf);
+
+        struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+        rxbuf = datapath_defrag(umacd,
+                                &sta_data->defrag_data,
+                                &data_hdr,
+                                &rxbufview,
+                                rxbuf,
+                                MMDRV_SEQ_NUM_BASELINE);
+        if (rxbuf == NULL)
+        {
+
+            return;
+        }
+
+
+        header = &data_hdr->base;
+        mmpkt_prepend(rxbufview, dot11_data_hdr_get_len(data_hdr));
+
+
+        *mmdrv_get_rx_metadata(rxbuf) = saved_metadata;
+    }
+
     const enum mmwlan_frame_filter_flag frame_filter_flag =
         umac_datapath_rx_frame_filter_matches(umacd, frame_type, frame_subtype);
+    const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
 
     if (frame_type == DOT11_FC_TYPE_MGMT &&
         !umac_datapath_process_mgmt_frame_ccmp_header(umacd, stad, rxbufview))
@@ -1435,7 +1478,6 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
 
     if (frame_filter_flag != MMWLAN_FRAME_NO_MATCH && data->rx_frame_cb != NULL)
     {
-        struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
         struct mmwlan_rx_frame_info frame_info = {
             .frame_filter_flag = frame_filter_flag,
             .buf = mmpkt_get_data_start(rxbufview),
@@ -1450,7 +1492,7 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
     switch (frame_type)
     {
         case DOT11_FC_TYPE_MGMT:
-            umac_datapath_process_rx_mgmt_frame(umacd, stad, rxbufview);
+            umac_datapath_process_rx_mgmt_frame(umacd, stad, rx_metadata->vif_id, rxbufview);
             break;
 
         case DOT11_FC_TYPE_EXT:
@@ -1754,7 +1796,8 @@ static bool umac_datapath_rx_frame_preprocess(struct umac_data *umacd, struct mm
 
     if (datapath_ops == NULL)
     {
-        MMLOG_WRN("No ops for vif_id %u. Dropping RX frame %x:%x\n",
+
+        MMLOG_DBG("No ops for vif_id %u. Dropping RX frame %x:%x\n",
                   vif_id,
                   ((frame_ver_type_subtype & DOT11_MASK_FC_TYPE) >> DOT11_SHIFT_FC_TYPE),
                   ((frame_ver_type_subtype & DOT11_MASK_FC_SUBTYPE) >> DOT11_SHIFT_FC_SUBTYPE));

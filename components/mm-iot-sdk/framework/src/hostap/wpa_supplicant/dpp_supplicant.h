@@ -14,6 +14,10 @@
 enum dpp_status_error;
 
 int wpas_dpp_qr_code(struct wpa_supplicant *wpa_s, const char *cmd);
+int wpas_dpp_bootstrap_gen(struct wpa_supplicant *wpa_s, const char *cmd);
+const char * wpas_dpp_bootstrap_get_uri(struct wpa_supplicant *wpa_s,
+					unsigned int id);
+int wpas_dpp_bootstrap_remove(struct wpa_supplicant *wpa_s, const char *id);
 int wpas_dpp_nfc_uri(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_nfc_handover_req(struct wpa_supplicant *wpa_s, const char *cmd);
 int wpas_dpp_nfc_handover_sel(struct wpa_supplicant *wpa_s, const char *cmd);

@@ -803,6 +803,40 @@ enum mmwlan_status mmwlan_dpp_stop(void)
     return status;
 }
 
+static void umac_dpp_get_uri_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    enum mmwlan_status status = umac_connection_get_dpp_uri(umacd,
+                                                            evt->args.dpp_get_uri.uri_buf,
+                                                            evt->args.dpp_get_uri.buf_len);
+    if (evt->args.dpp_get_uri.status)
+    {
+        *evt->args.dpp_get_uri.status = status;
+    }
+    if (evt->args.dpp_get_uri.semb)
+    {
+        mmosal_semb_give(evt->args.dpp_get_uri.semb);
+    }
+}
+
+enum mmwlan_status mmwlan_dpp_get_uri(char *uri_buf, size_t buf_len)
+{
+    if (uri_buf == NULL || buf_len == 0)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    enum mmwlan_status status = MMWLAN_ERROR;
+    struct umac_data *umacd = umac_data_get_umacd();
+
+    UMAC_QUEUE_EVT_AND_WAIT(umac_dpp_get_uri_evt_handler,
+                            dpp_get_uri,
+                            &status,
+                            .uri_buf = uri_buf,
+                            .buf_len = buf_len);
+
+    return status;
+}
+
 #endif
 
 enum mmwlan_sta_state mmwlan_get_sta_state(void)
@@ -865,6 +899,8 @@ enum mmwlan_status mmwlan_scan_request(const struct mmwlan_scan_req *scan_req)
         MMLOG_ERR("Channel list not set\n");
         return MMWLAN_CHANNEL_LIST_NOT_SET;
     }
+
+
 
     enum mmwlan_status status = umac_core_start(umacd);
     if (status != MMWLAN_SUCCESS)
@@ -976,12 +1012,6 @@ enum mmwlan_status mmwlan_ap_enable(const struct mmwlan_ap_args *args)
     if (data == NULL)
     {
         return MMWLAN_UNAVAILABLE;
-    }
-
-    bool ok = umac_ap_validate_ap_args(umacd, args);
-    if (!ok)
-    {
-        return MMWLAN_INVALID_ARGUMENT;
     }
 
     status = umac_core_start(umacd);
@@ -1906,16 +1936,37 @@ enum mmwlan_status mmwlan_register_sleep_cb(mmwlan_sleep_cb_t callback, void *ar
     return umac_core_register_sleep_cb(umacd, callback, arg);
 }
 
+static void umac_tx_mgmt_frame_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
+    struct mmpkt *txbuf = evt->args.tx_mgmt_frame.txbuf;
+    if (stad == NULL)
+    {
+        mmpkt_release(txbuf);
+        return;
+    }
+
+    umac_datapath_tx_mgmt_frame(stad, txbuf);
+}
+
 enum mmwlan_status mmwlan_tx_mgmt_frame(struct mmpkt *txbuf)
 {
     struct umac_data *umacd = umac_data_get_umacd();
-    struct umac_sta_data *stad = umac_connection_get_stad(umacd);
-    if (stad == NULL)
+
+    if (!umac_data_is_initialised(umacd))
     {
-        return MMWLAN_UNAVAILABLE;
+        return MMWLAN_NOT_INITIALIZED;
     }
 
-    return umac_datapath_tx_mgmt_frame(stad, txbuf);
+    if (txbuf == NULL)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    struct umac_evt evt =
+        UMAC_EVT_INIT_ARGS(umac_tx_mgmt_frame_evt_handler, tx_mgmt_frame, .txbuf = txbuf);
+    bool ok = umac_core_evt_queue(umacd, &evt);
+    return ok ? MMWLAN_SUCCESS : MMWLAN_ERROR;
 }
 
 enum mmwlan_status mmwlan_register_rx_frame_cb(uint32_t filter,

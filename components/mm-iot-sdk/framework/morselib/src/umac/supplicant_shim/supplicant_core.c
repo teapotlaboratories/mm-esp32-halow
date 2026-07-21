@@ -202,6 +202,168 @@ void umac_supp_dpp_push_button_stop(struct umac_data *umacd)
     wpas_dpp_push_button_stop(wpa_s);
 }
 
+
+
+#if !(defined(MM810XB2_HOSTAP_ROM_COMPAT_ENABLED) && MM810XB2_HOSTAP_ROM_COMPAT_ENABLED)
+
+static void bytes_to_hex(char *dst, const uint8_t *src, size_t len)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t ii = 0; ii < len; ii++)
+    {
+        *dst++ = hex[src[ii] >> 4];
+        *dst++ = hex[src[ii] & 0x0f];
+    }
+    *dst = '\0';
+}
+
+
+static void build_bootstrap_gen_cmd(const struct mmwlan_dpp_qr_args *qr_args,
+                                    char *cmd,
+                                    size_t cmd_len)
+{
+    int pos = snprintf(cmd, cmd_len, "type=qrcode curve=P-256");
+    if (pos < 0 || (size_t)pos >= cmd_len)
+    {
+        return;
+    }
+
+    if (qr_args->bootstrap_private_key != NULL && qr_args->bootstrap_private_key_len > 0)
+    {
+        int prefix_len = snprintf(cmd + pos, cmd_len - pos, " key=");
+        const size_t key_start_pos = pos + prefix_len;
+        const size_t encoded_key_len = qr_args->bootstrap_private_key_len * 2;
+        const size_t key_end_pos = key_start_pos + encoded_key_len + 1;
+        if (prefix_len < 0 || key_end_pos > cmd_len)
+        {
+            return;
+        }
+        pos += prefix_len;
+
+        bytes_to_hex(cmd + pos, qr_args->bootstrap_private_key, qr_args->bootstrap_private_key_len);
+    }
+}
+
+
+static void build_chirp_cmd(int bootstrap_id,
+                            const struct mmwlan_dpp_qr_args *qr_args,
+                            char *cmd,
+                            size_t cmd_len)
+{
+    uint16_t iterations = qr_args->chirp_iterations ? qr_args->chirp_iterations : 1;
+
+
+    snprintf(cmd, cmd_len, " own=%d iter=%u", bootstrap_id, (unsigned)iterations);
+}
+#endif
+
+enum mmwlan_status umac_supp_dpp_qr_enrollee_start(struct umac_data *umacd,
+                                                   const struct mmwlan_dpp_qr_args *qr_args,
+                                                   int *bootstrap_id)
+{
+#if (defined(MM810XB2_HOSTAP_ROM_COMPAT_ENABLED) && MM810XB2_HOSTAP_ROM_COMPAT_ENABLED)
+    MM_UNUSED(umacd);
+    MM_UNUSED(qr_args);
+    MM_UNUSED(bootstrap_id);
+    return MMWLAN_NOT_SUPPORTED;
+#else
+    if (qr_args->bootstrap_private_key_len > MMWLAN_DPP_BOOTSTRAP_KEY_MAX_LEN ||
+        (qr_args->bootstrap_private_key_len > 0 && qr_args->bootstrap_private_key == NULL))
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
+    struct umac_supp_shim_data *data = umac_data_get_supp_shim(umacd);
+    struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)data->sta_driver_ctx;
+    if (wpa_s == NULL)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+
+
+    char cmd[320];
+
+    build_bootstrap_gen_cmd(qr_args, cmd, sizeof(cmd));
+    int id = wpas_dpp_bootstrap_gen(wpa_s, cmd);
+    if (id < 0)
+    {
+        MMLOG_WRN("DPP bootstrap gen failed\n");
+        return MMWLAN_ERROR;
+    }
+
+    *bootstrap_id = id;
+
+    build_chirp_cmd(id, qr_args, cmd, sizeof(cmd));
+    int ret = wpas_dpp_chirp(wpa_s, cmd);
+    if (ret != 0)
+    {
+        MMLOG_WRN("DPP chirp start failed with code %d\n", ret);
+        char id_str[16];
+        snprintf(id_str, sizeof(id_str), "%d", id);
+        wpas_dpp_bootstrap_remove(wpa_s, id_str);
+        return MMWLAN_ERROR;
+    }
+
+    return MMWLAN_SUCCESS;
+#endif
+}
+
+void umac_supp_dpp_qr_enrollee_stop(struct umac_data *umacd)
+{
+#if (defined(MM810XB2_HOSTAP_ROM_COMPAT_ENABLED) && MM810XB2_HOSTAP_ROM_COMPAT_ENABLED)
+    MM_UNUSED(umacd);
+    return;
+#else
+    struct umac_supp_shim_data *data = umac_data_get_supp_shim(umacd);
+    struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)data->sta_driver_ctx;
+    if (wpa_s == NULL)
+    {
+        return;
+    }
+
+    wpas_dpp_chirp_stop(wpa_s);
+
+    wpas_dpp_bootstrap_remove(wpa_s, "*");
+#endif
+}
+
+enum mmwlan_status umac_supp_dpp_get_uri(struct umac_data *umacd,
+                                         int32_t bootstrap_id,
+                                         char *uri_buf,
+                                         size_t buf_len)
+{
+#if (defined(MM810XB2_HOSTAP_ROM_COMPAT_ENABLED) && MM810XB2_HOSTAP_ROM_COMPAT_ENABLED)
+    MM_UNUSED(umacd);
+    MM_UNUSED(bootstrap_id);
+    MM_UNUSED(uri_buf);
+    MM_UNUSED(buf_len);
+    return MMWLAN_NOT_SUPPORTED;
+#else
+    struct umac_supp_shim_data *data = umac_data_get_supp_shim(umacd);
+    struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)data->sta_driver_ctx;
+    if (wpa_s == NULL)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+
+    const char *uri = wpas_dpp_bootstrap_get_uri(wpa_s, (unsigned int)bootstrap_id);
+    if (uri == NULL)
+    {
+        MMLOG_WRN("DPP bootstrap URI not found for id=%d\n", bootstrap_id);
+        return MMWLAN_NOT_FOUND;
+    }
+
+    size_t uri_len = strlen(uri);
+    if (uri_len + 1 > buf_len)
+    {
+        return MMWLAN_NO_MEM;
+    }
+
+    memcpy(uri_buf, uri, uri_len + 1);
+    return MMWLAN_SUCCESS;
+#endif
+}
+
 #endif
 
 void umac_supp_disconnect(struct umac_data *umacd)

@@ -2343,9 +2343,10 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 	tail_len += hostapd_get_rsnxe_override_len(hapd);
 
 	tailpos = tail = os_malloc(tail_len);
-	if (head == NULL || tail == NULL) {
+	if (head == NULL || ext_head == NULL || tail == NULL) {
 		wpa_printf(MSG_ERROR, "Failed to set beacon data");
 		os_free(head);
+		os_free(ext_head);
 		os_free(tail);
 		return -1;
 	}
@@ -2464,6 +2465,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 	if (hapd->iconf->mbssid && hapd->iconf->num_bss > 1) {
 		if (ieee802_11_build_ap_params_mbssid(hapd, params)) {
 			os_free(head);
+			os_free(ext_head);
 			os_free(tail);
 			wpa_printf(MSG_ERROR,
 				   "MBSSID: Failed to set beacon data");
@@ -2667,9 +2669,15 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
 #endif /* CONFIG_SAE */
 
 	if (hapd->iconf->ieee80211ah)
+	{
 		params->head = (u8 *) ext_head;
+		os_free(head);
+	}
 	else
+	{
 		params->head = (u8 *) head;
+		os_free(ext_head);
+	}
 	params->head_len = head_len;
 	params->tail = tail;
 	params->tail_len = tail_len;
@@ -2774,6 +2782,8 @@ void ieee802_11_free_ap_params(struct wpa_driver_ap_params *params)
 {
 	os_free(params->tail);
 	params->tail = NULL;
+	os_free(params->head);
+	params->head = NULL;
 	os_free(params->head);
 	params->head = NULL;
 	os_free(params->proberesp);

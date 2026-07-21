@@ -697,14 +697,12 @@ int dpp_prepare_channel_list(struct dpp_authentication *auth,
 
 int dpp_gen_uri(struct dpp_bootstrap_info *bi)
 {
-#ifdef MM_IOT_DPP_DISABLE_URI_HOST
-	return 0;
-#endif
-
 	char macstr[ETH_ALEN * 2 + 10];
 	size_t len;
 	char supp_curves[10];
+#ifndef MM_IOT_DPP_DISABLE_URI_HOST
 	char host[100];
+#endif
 
 	len = 4; /* "DPP:" */
 	if (bi->chan)
@@ -737,6 +735,7 @@ int dpp_gen_uri(struct dpp_bootstrap_info *bi)
 		supp_curves[0] = '\0';
 	}
 
+#ifndef MM_IOT_DPP_DISABLE_URI_HOST
 	host[0] = '\0';
 	if (bi->host) {
 		char buf[100];
@@ -754,6 +753,7 @@ int dpp_gen_uri(struct dpp_bootstrap_info *bi)
 			len += os_snprintf(host, sizeof(host), "H:[%s]:%u;",
 					   addr, bi->port);
 	}
+#endif
 
 	os_free(bi->uri);
 	bi->uri = os_malloc(len + 1);
@@ -768,7 +768,11 @@ int dpp_gen_uri(struct dpp_bootstrap_info *bi)
 		    DPP_VERSION == 3 ? "V:3;" :
 		    (DPP_VERSION == 2 ? "V:2;" : ""),
 		    supp_curves,
+#ifndef MM_IOT_DPP_DISABLE_URI_HOST
 		    host,
+#else
+		    "",
+#endif
 		    bi->pk);
 	return 0;
 }

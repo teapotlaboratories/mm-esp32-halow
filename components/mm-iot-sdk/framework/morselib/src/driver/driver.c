@@ -1300,14 +1300,18 @@ struct mmpkt *mmdrv_alloc_mmpkt_for_tx(uint8_t pkt_class,
 struct mmpkt *mmdrv_alloc_mmpkt_for_defrag(uint32_t min_capacity, uint32_t max_capacity)
 {
 
-    struct mmpkt *mmpkt = mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, max_capacity, 0);
+    const size_t metadata_len = sizeof(struct mmdrv_rx_metadata);
+
+
+    struct mmpkt *mmpkt =
+        mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, max_capacity, metadata_len);
     if (mmpkt != NULL)
     {
         return mmpkt;
     }
 
 
-    mmpkt = mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, UINT32_MAX, 0);
+    mmpkt = mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, UINT32_MAX, metadata_len);
     if (mmpkt != NULL)
     {
         struct mmpktview *pktview = mmpkt_open(mmpkt);
@@ -1322,7 +1326,7 @@ struct mmpkt *mmdrv_alloc_mmpkt_for_defrag(uint32_t min_capacity, uint32_t max_c
     }
 
 
-    return mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, min_capacity, 0);
+    return mmhal_wlan_alloc_mmpkt_for_rx(MMHAL_WLAN_PKT_DATA_TID0, min_capacity, metadata_len);
 }
 
 enum mmwlan_status mmdrv_set_frag_threshold(uint32_t frag_threshold)

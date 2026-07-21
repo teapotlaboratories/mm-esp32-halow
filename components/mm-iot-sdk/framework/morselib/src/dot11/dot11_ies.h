@@ -25,8 +25,6 @@ struct MM_PACKED dot11_ie_vs_hdr
     struct dot11_ie_hdr header;
 
     uint8_t oui[3];
-
-    uint8_t type;
 };
 
 
@@ -232,6 +230,8 @@ struct MM_PACKED dot11_ie_wmm_info
 
     struct dot11_ie_vs_hdr vs_header;
 
+    uint8_t type;
+
     uint8_t subtype;
 
     uint8_t version;
@@ -244,6 +244,8 @@ struct MM_PACKED dot11_ie_wmm_param
 {
 
     struct dot11_ie_vs_hdr vs_header;
+
+    uint8_t type;
 
     uint8_t subtype;
 
@@ -261,6 +263,8 @@ struct MM_PACKED dot11_ie_morse_info
 {
 
     struct dot11_ie_vs_hdr vs_header;
+
+    uint8_t type;
 
     uint8_t sw_major;
 

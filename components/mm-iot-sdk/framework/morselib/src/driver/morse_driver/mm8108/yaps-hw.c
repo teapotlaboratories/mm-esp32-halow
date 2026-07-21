@@ -31,12 +31,15 @@
      MORSE_PKT_WORD_ALIGN +                 \
      MORSE_YAPS_DELIM_SIZE)
 
+
+#ifndef UNIT_TESTS_64
 MM_STATIC_ASSERT((sizeof(struct mmpkt) + YAPS_MAX_RX_PAYLOAD + sizeof(struct mmdrv_rx_metadata) <=
                   MMHAL_WLAN_MMPKT_RX_MAX_SIZE),
                  "RX pool size must be larger to accommodate packets from the chip");
 MM_STATIC_ASSERT(TX_DATA_HEADER_LEN + YAPS_MAX_TX_PAYLOAD + sizeof(struct mmdrv_tx_metadata) <=
                      MMHAL_WLAN_MMPKT_TX_MAX_SIZE,
                  "TX pool size must be larger to accommodate packets to the chip");
+#endif
 
 #define YAPS_MAX_PKT_SIZE_BYTES         16128
 #define YAPS_DEFAULT_READ_SIZE_BYTES    512

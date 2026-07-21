@@ -35,6 +35,19 @@ extern "C"
 struct lfs_config;
 
 /**
+ * Underlying integer type for @ref mmhal_flash_addr_t. Defaults to
+ * @c uint32_t. May be overridden by the build system (e.g. by defining
+ * @c MMHAL_FLASH_ADDR_T on the compiler command line) if a platform requires
+ * a wider integer type to represent a flash address.
+ */
+#ifndef MMHAL_FLASH_ADDR_T
+#define MMHAL_FLASH_ADDR_T uint32_t
+#endif
+
+/** Address type used by the mmhal flash API. */
+typedef MMHAL_FLASH_ADDR_T mmhal_flash_addr_t;
+
+/**
  * Flash partition configuration structure.
  *
  * This should be initialized using @c MMHAL_FLASH_PARTITION_CONFIG_DEFAULT. For example:
@@ -54,7 +67,7 @@ struct mmhal_flash_partition_config
      * @c partition_start and @c partition_size must be understood by @c mmhal_flash_erase(),
      * @c mmhal_flash_getblocksize(), @c mmhal_flash_read(), and @c mmhal_flash_write().
      */
-    uint32_t partition_start;
+    mmhal_flash_addr_t partition_start;
 
     /** The size of the partition (in bytes). */
     uint32_t partition_size;
@@ -80,9 +93,29 @@ struct mmhal_flash_partition_config
  * return NULL. This function returns a static pointer to
  * @c struct @c mmhal_flash_partition_config.
  *
+ * Because primary/secondary partitions are used in the current implementation,
+ * the available config storage is half of the provided size.
+ *
  * @return A static pointer to the partition config for MMCONFIG, or NULL if not supported.
  */
 const struct mmhal_flash_partition_config *mmhal_get_mmconfig_partition(void);
+
+/**
+ * Get optional factory default MMCONFIG flash partition configuration.
+ *
+ * This partition uses the same on-flash format as a single MMCONFIG image, but is treated as
+ * read-only by @c mmconfig. If present and valid, values in this partition are used as fall-backs
+ * when a key is absent from the writable MMCONFIG partition. Platforms that do not provide a
+ * factory default partition may omit this function; a weak default implementation returns NULL.
+ *
+ * Note that unlike @c mmhal_get_mmconfig_partition(), the size here is used only for a
+ * single partition. Therefore it would be normal to define a factory partition that is
+ * half the size (or less) of the normal config partition, and it is not necessary to
+ * align it to a flash sector as it is not erased.
+ *
+ * @return A static pointer to the factory MMCONFIG partition config, or NULL if not supported.
+ */
+const struct mmhal_flash_partition_config *mmhal_get_factory_mmconfig_partition(void);
 
 /**
  * Erases a specified block of flash.
@@ -95,7 +128,7 @@ const struct mmhal_flash_partition_config *mmhal_get_mmconfig_partition(void);
  *                      @c mmhal_flash_partition_config.
  * @return              0 on success, negative number on failure
  */
-int mmhal_flash_erase(uint32_t block_address);
+int mmhal_flash_erase(mmhal_flash_addr_t block_address);
 
 /**
  * Returns the size of the flash block at the specified address.
@@ -106,7 +139,7 @@ int mmhal_flash_erase(uint32_t block_address);
  * @return              The size of the Flash block in bytes.
  *                      Returns 0 if an invalid address is specified.
  */
-uint32_t mmhal_flash_getblocksize(uint32_t block_address);
+uint32_t mmhal_flash_getblocksize(mmhal_flash_addr_t block_address);
 
 /**
  * Read a block of data from the specified Flash address into the buffer.
@@ -118,7 +151,7 @@ uint32_t mmhal_flash_getblocksize(uint32_t block_address);
  * @param size          The number of bytes to read.
  * @return              0 on success, or a negative number on failure.
  */
-int mmhal_flash_read(uint32_t read_address, uint8_t *buf, size_t size);
+int mmhal_flash_read(mmhal_flash_addr_t read_address, uint8_t *buf, size_t size);
 
 /**
  * Write a block of data to the specified Flash address.
@@ -135,7 +168,7 @@ int mmhal_flash_read(uint32_t read_address, uint8_t *buf, size_t size);
  * @param size          The number of bytes to write.
  * @return              0 on success, or a negative number on failure.
  */
-int mmhal_flash_write(uint32_t write_address, const uint8_t *data, size_t size);
+int mmhal_flash_write(mmhal_flash_addr_t write_address, const uint8_t *data, size_t size);
 
 /**
  * Get LittleFS configuration.

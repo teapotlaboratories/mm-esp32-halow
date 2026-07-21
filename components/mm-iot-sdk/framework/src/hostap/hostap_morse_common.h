@@ -15,6 +15,13 @@
  * ----
  */
 
+/*
+ * On Apple, hostap's upstream src/utils/common.h __APPLE__ block defines
+ * __BYTE_ORDER and bswap_16/bswap_32 itself. Defining them here as well
+ * trips -Wmacro-redefined / -Wshadow against the upstream block, so let
+ * upstream win on Apple.
+ */
+#ifndef __APPLE__
 #ifdef __big_endian__
 #define __BYTE_ORDER __BIG_ENDIAN
 #else
@@ -28,6 +35,7 @@
 #ifndef bswap_32
 #define bswap_32(x) __builtin_bswap32(x)
 #endif
+#endif /* !__APPLE__ */
 
 #if !defined(htonl)
 #define htonl(x) htobe32(x)

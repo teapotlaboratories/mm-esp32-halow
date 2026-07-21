@@ -851,6 +851,9 @@ void morse_trns_stop(struct driver_data *driverd)
         mmosal_task_sleep(1);
     }
 
+
+    mmhal_wlan_register_spi_irq_handler(NULL);
+
     mmosal_mutex_delete(bus_lock);
     bus_lock = NULL;
 

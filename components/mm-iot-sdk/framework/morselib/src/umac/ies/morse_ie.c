@@ -45,7 +45,7 @@ void ie_morse_info_build(struct umac_data *umacd, struct consbuf *buf)
         ie->vs_header.oui[0] = morse_ie_info_id[0];
         ie->vs_header.oui[1] = morse_ie_info_id[1];
         ie->vs_header.oui[2] = morse_ie_info_id[2];
-        ie->vs_header.type = MORSE_IE_OUI_TYPE;
+        ie->type = MORSE_IE_OUI_TYPE;
         ie->sw_major = 0;
         ie->sw_minor = 0;
         ie->sw_patch = 0;

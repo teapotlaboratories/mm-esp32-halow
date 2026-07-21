@@ -46,6 +46,20 @@ enum mmwlan_status umac_supp_dpp_push_button(struct umac_data *umacd);
 void umac_supp_dpp_push_button_stop(struct umac_data *umacd);
 
 
+enum mmwlan_status umac_supp_dpp_qr_enrollee_start(struct umac_data *umacd,
+                                                   const struct mmwlan_dpp_qr_args *qr_args,
+                                                   int *bootstrap_id);
+
+
+void umac_supp_dpp_qr_enrollee_stop(struct umac_data *umacd);
+
+
+enum mmwlan_status umac_supp_dpp_get_uri(struct umac_data *umacd,
+                                         int32_t bootstrap_id,
+                                         char *uri_buf,
+                                         size_t buf_len);
+
+
 void umac_supp_disconnect(struct umac_data *umacd);
 
 

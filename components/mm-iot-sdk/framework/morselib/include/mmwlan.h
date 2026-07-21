@@ -1238,13 +1238,9 @@ struct mmwlan_sta_args
  *
  * @warning Channel list must be set before enabling station mode. @ref mmwlan_set_channel_list().
  *
- * @deprecated  The @c sta_status_cb parameter should not be used. Please use
- *              @c mmwlan_sta_args.ext_sta_status_cb as the preferred callback method.
- *
  * @param args              STA arguments (e.g., SSID, etc.). See @ref mmwlan_sta_args.
  * @param sta_status_cb     Optional callback to be invoked on STA state changes.
- *                          May be @c NULL. Must be @c NULL if @c args->ext_sta_status_cb is not @c
- *                          NULL.
+ *                          May be @c NULL.
  *
  * @return @ref MMWLAN_SUCCESS on success, else an appropriate error code.
  */
@@ -1476,9 +1472,6 @@ enum mmwlan_status mmwlan_set_listen_interval(uint16_t interval);
  *
  * @{
  *
- * @note It is highly recommended to refer to Morse Micro App Note 04 on WNM sleep for a more
- *       detailed explanation on how this feature works.
- *
  * WNM sleep is an extended power save mode in which the STA need not listen for every DTIM beacon
  * and need not perform rekey, allowing the STA to remain associated and reduce power consumption
  * when it has no traffic to send or receive from the AP. While a STA is in WNM sleep it will be
@@ -1606,18 +1599,65 @@ static inline enum mmwlan_status mmwlan_set_wnm_sleep_enabled(bool wnm_sleep_ena
  *          breaking changes may be introduced in future releases.
  */
 
-/** Enumeration of DPP events.
+/**
+ * Enumeration of DPP modes.
+ *
+ * @warning BETA NOTICE: This is a beta API that is under development;
+ *          breaking changes may be introduced in future releases.
+ */
+enum mmwlan_dpp_mode
+{
+    /** DPP Push Button mode */
+    MMWLAN_DPP_MODE_PUSH_BUTTON,
+    /** DPP QR Code Enrollee mode. */
+    MMWLAN_DPP_MODE_QR_ENROLLEE,
+};
+
+/**
+ * Enumeration of DPP events.
  *
  * @warning BETA NOTICE: This is a beta API that is under development;
  *          breaking changes may be introduced in future releases.
  */
 enum mmwlan_dpp_event
 {
-    /** DPP push button result. */
+    /* QR code presence announcement (chirp) */
+    /** QR enrollee began broadcasting presence announcements. */
+    MMWLAN_DPP_EVT_CHIRP_STARTED,
+    /** QR enrollee presence announcement process has stopped. */
+    MMWLAN_DPP_EVT_CHIRP_STOPPED,
+
+    /* Push Button flow */
+    /** Push Button enrollment started (enrollee). */
+    MMWLAN_DPP_EVT_PB_STARTED,
+    /** Push Button configurator discovered. */
+    MMWLAN_DPP_EVT_PB_DISCOVERY,
+    /** DPP push button result. This will only occur in @c MMWLAN_DPP_MODE_PUSH_BUTTON mode. */
     MMWLAN_DPP_EVT_PB_RESULT,
+
+    /* DPP Authentication phase */
+    /** Enrollee received and validated a DPP Authentication Request. */
+    MMWLAN_DPP_EVT_AUTH_REQ_RX,
+    /** Enrollee sent a DPP Authentication Response. */
+    MMWLAN_DPP_EVT_AUTH_RESP_TX,
+    /** DPP authentication phase succeeded (both PB and QR flows). */
+    MMWLAN_DPP_EVT_AUTH_SUCCESS,
+    /** DPP authentication could not complete. */
+    MMWLAN_DPP_EVT_AUTH_FAILURE,
+
+    /* DPP Configuration phase */
+    /** Enrollee sent a DPP Configuration Request. */
+    MMWLAN_DPP_EVT_CONF_REQ_TX,
+    /** DPP configuration received (any DPP mode). */
+    MMWLAN_DPP_EVT_CONF_RECEIVED,
+    /** Enrollee sent a DPP Configuration Result (DPP2+). */
+    MMWLAN_DPP_EVT_CONF_RESULT_TX,
+    /** Configuration exchange failed after authentication succeeded. */
+    MMWLAN_DPP_EVT_CONF_FAILED,
 };
 
-/** Enumeration of results for @c MMWLAN_DPP_EVT_PB_RESULT.
+/**
+ * Enumeration of results for @c MMWLAN_DPP_EVT_PB_RESULT.
  *
  * @warning BETA NOTICE: This is a beta API that is under development;
  *          breaking changes may be introduced in future releases.
@@ -1630,6 +1670,38 @@ enum mmwlan_dpp_pb_result
     MMWLAN_DPP_PB_RESULT_ERROR,
     /** A session overlap occurred during the DPP push button process. */
     MMWLAN_DPP_PB_RESULT_SESSION_OVERLAP,
+};
+
+/**
+ * Reason codes for @c MMWLAN_DPP_EVT_AUTH_FAILURE.
+ *
+ * @warning BETA NOTICE: This is a beta API that is under development;
+ *          breaking changes may be introduced in future releases.
+ */
+enum mmwlan_dpp_auth_failure_reason
+{
+    /** Responder never replied to the Authentication Request. */
+    MMWLAN_DPP_AUTH_FAILURE_NO_RESPONSE,
+    /** Authentication confirmation was not received in time. */
+    MMWLAN_DPP_AUTH_FAILURE_NO_CONFIRM,
+    /** Exhausted all retry attempts without a response. */
+    MMWLAN_DPP_AUTH_FAILURE_INIT_FAILED,
+};
+
+/**
+ * Reason codes for @c MMWLAN_DPP_EVT_CONF_FAILED.
+ *
+ * @warning BETA NOTICE: This is a beta API that is under development;
+ *          breaking changes may be introduced in future releases.
+ */
+enum mmwlan_dpp_conf_failure_reason
+{
+    /** Config response contained an error status. */
+    MMWLAN_DPP_CONF_FAILURE_RESPONSE_ERROR,
+    /** Timed out waiting for the config response. */
+    MMWLAN_DPP_CONF_FAILURE_TIMEOUT,
+    /** Timed out waiting for the DPP2 Configuration Result. */
+    MMWLAN_DPP_CONF_FAILURE_RESULT_TIMEOUT,
 };
 
 /**
@@ -1651,14 +1723,106 @@ struct mmwlan_dpp_cb_args
         {
             /** Result of DPP push button. */
             enum mmwlan_dpp_pb_result result;
-            /** SSID of the AP to connect to. May be @c NUlL. */
+        } pb_result;
+
+        /** Argument for @c MMWLAN_DPP_EVT_CONF_RECEIVED event. */
+        struct
+        {
+            /** SSID of the AP to connect to. May be @c NULL. */
             const uint8_t *ssid;
             /** Length of the SSID. */
             uint16_t ssid_len;
             /** Passphrase, NULL terminated. May be @c NULL. */
             const char *passphrase;
-        } pb_result;
+        } conf_received;
+
+        /** Argument for @c MMWLAN_DPP_EVT_PB_DISCOVERY event. */
+        struct
+        {
+            /** MAC address of the discovered PB configurator. Valid for callback duration only. */
+            const uint8_t *peer_mac;
+        } pb_discovery;
+
+        /** Argument for @c MMWLAN_DPP_EVT_AUTH_REQ_RX event. */
+        struct
+        {
+            /** MAC address of the configurator that sent the authentication request. Valid for
+             * callback duration only. */
+            const uint8_t *peer_mac;
+        } auth_req_rx;
+
+        /** Argument for @c MMWLAN_DPP_EVT_AUTH_SUCCESS event. */
+        struct
+        {
+            /** @c true if this device initiated the authentication exchange, @c false if it
+             * responded. */
+            bool initiator;
+        } auth_success;
+
+        /** Argument for @c MMWLAN_DPP_EVT_AUTH_FAILURE event. */
+        struct
+        {
+            /** Reason for the authentication failure. */
+            enum mmwlan_dpp_auth_failure_reason reason;
+        } auth_failure;
+
+        /** Argument for @c MMWLAN_DPP_EVT_CONF_FAILED event. */
+        struct
+        {
+            /** Reason for the configuration failure. */
+            enum mmwlan_dpp_conf_failure_reason reason;
+        } conf_failed;
     } args;
+};
+
+/** Maximum length (in bytes) of a DER-encoded bootstrap private key. */
+#define MMWLAN_DPP_BOOTSTRAP_KEY_MAX_LEN 128
+
+/**
+ * Structure to hold the QR enrollee specific arguments for the DPP process.
+ *
+ * @warning BETA NOTICE: This is a beta API that is under development;
+ *          breaking changes may be introduced in future releases.
+ */
+struct mmwlan_dpp_qr_args
+{
+    /**
+     * DER-encoded EC private key for the DPP bootstrap identity (P-256 / prime256v1).
+     *
+     * If non-NULL (and @c bootstrap_private_key_len is non-zero), this key is used as the
+     * bootstrap identity. It must match the key used to generate the QR code printed on the
+     * device label. The data pointed to must remain valid until @c mmwlan_dpp_start() returns.
+     *
+     * If NULL (the default for zero-initialized structs), a fresh key pair is generated
+     * automatically. This is useful for ephemeral/dynamic QR codes where the URI is
+     * retrieved at run-time via @c mmwlan_dpp_get_uri() rather than printed on a fixed label.
+     *
+     * A suitable DER key can be generated with:
+     * @code
+     * openssl ecparam -name prime256v1 -genkey -noout -outform DER -out bootstrap.der
+     * @endcode
+     */
+    const uint8_t *bootstrap_private_key;
+    /** Length of @c bootstrap_private_key in bytes. Set to 0 for auto-generated key pair. */
+    uint16_t bootstrap_private_key_len;
+    /**
+     * Number of chirp iterations (0 = default of 1).
+     *
+     * A chirp is a DPP Presence Announcement action frame broadcast on candidate channels
+     * to make the enrollee discoverable to a nearby DPP configurator without requiring the
+     * enrollee to know in advance which channel the configurator is listening on.
+     *
+     * One iteration consists of one complete pass through the candidate channel list. The
+     * channel list is built from the preferred S1G frequency plus any channels where DPP
+     * configurator connectivity was detected in a scan; the list is refreshed by a new scan
+     * every 4 rounds. Between iterations the device waits approximately 30 seconds before
+     * starting the next round.
+     *
+     * When all iterations are exhausted without receiving a DPP configuration, chirping
+     * stops and @c MMWLAN_DPP_EVT_CONF_RECEIVED will not be delivered. The application
+     * may re-invoke @ref mmwlan_dpp_start() to begin another round of chirps if desired.
+     */
+    uint16_t chirp_iterations;
 };
 
 /**
@@ -1673,7 +1837,24 @@ struct mmwlan_dpp_args
     void (*dpp_event_cb)(const struct mmwlan_dpp_cb_args *dpp_event, void *arg);
     /** Optional user argument that will be passed back to the DPP event callback. */
     void *dpp_event_cb_arg;
+    /** DPP mode to use. */
+    enum mmwlan_dpp_mode mode;
+    /** QR enrollee specific arguments. Only used when @c mode is @c MMWLAN_DPP_MODE_QR_ENROLLEE. */
+    struct mmwlan_dpp_qr_args qr;
 };
+
+/**
+ * Initializer for @ref mmwlan_dpp_args.
+ *
+ * @see mmwlan_dpp_args
+ */
+#define MMWLAN_DPP_ARGS_INIT                 \
+    {                                        \
+        .dpp_event_cb = NULL,                \
+        .dpp_event_cb_arg = NULL,            \
+        .mode = MMWLAN_DPP_MODE_PUSH_BUTTON, \
+        .qr = { 0 },                         \
+    }
 
 /**
  * Function to start the Device Provisioning Protocol (DPP) process.
@@ -1702,6 +1883,23 @@ enum mmwlan_status mmwlan_dpp_start(const struct mmwlan_dpp_args *args);
  * @returns @c MMWLAN_SUCCESS on success, else an appropriate error code.
  */
 enum mmwlan_status mmwlan_dpp_stop(void);
+
+/**
+ * Retrieve the DPP bootstrap URI for the current QR enrollee session.
+ *
+ * @warning BETA NOTICE: This is beta API that is under development;
+ *          breaking changes may be introduced in future releases.
+ *
+ * This can be called after DPP has successfully started in QR Enrollee mode (see @ref
+ * mmwlan_dpp_start()). The URI is derived from the bootstrap private key and can be encoded as a QR
+ * code for scanning by a DPP configurator.
+ *
+ * @param[out] uri_buf  Buffer to copy the null-terminated URI string into.
+ * @param      buf_len  Size of @p uri_buf in bytes.
+ *
+ * @returns @c MMWLAN_SUCCESS on success, else an appropriate error code.
+ */
+enum mmwlan_status mmwlan_dpp_get_uri(char *uri_buf, size_t buf_len);
 
 /** @} */
 
@@ -1842,6 +2040,11 @@ struct mmwlan_ap_args
      * The combination of this field and @c s1g_chan_num will be used
      * to look up the appropriate entry in the channel list, which must have been previously
      * provided using @ref mmwlan_set_channel_list().
+     *
+     * @note When the STA interface is already active, this must match the STA current
+     *       operating class. Set both this and @c s1g_chan_num to 0 to auto-config
+     *       all four channel fields: @c op_class, @c s1g_chan_num, @c pri_bw_mhz,
+     *       @c pri_1mhz_chan_idx. See @ref mmwlan_ap_enable() for more details.
      */
     uint16_t op_class;
     /**
@@ -1850,6 +2053,10 @@ struct mmwlan_ap_args
      * The combination of this field and @c op_class will be used
      * to look up the appropriate entry in the channel list, which must have been previously
      * provided using @ref mmwlan_set_channel_list().
+     *
+     * @note When the STA interface is already active, this must match the STA current
+     *       S1G channel number. Set both this and @c op_class to 0 to auto-config from the
+     *       STA. See the note on @c op_class for details.
      */
     uint16_t s1g_chan_num;
     /**
@@ -1870,11 +2077,18 @@ struct mmwlan_ap_args
      *
      * @note This must not be greater than the bandwidth of the operating channel or 2 MHz,
      *       whichever is lower.
+     * @note When the STA interface is already active, this must match the STA current
+     *       primary bandwidth. Overwritten by the STA value when @c op_class and @c s1g_chan_num
+     *       are both 0. See @ref mmwlan_ap_enable() for details.
      */
     uint8_t pri_bw_mhz;
     /**
      * Index of the primary 1 Mhz channel within the operating channel. This must be less than
      * the bandwidth of the operating channel.
+     *
+     * @note When the STA interface is already active, this must match the STA current
+     *       primary 1 MHz channel index. Overwritten by the STA value when @c op_class and
+     *       @c s1g_chan_num are both 0. See @ref mmwlan_ap_enable() for details.
      */
     uint8_t pri_1mhz_chan_idx;
     /**
@@ -1941,6 +2155,11 @@ struct mmwlan_ap_args
  * @warning Channel list must be set before enabling AP mode. See @ref mmwlan_set_channel_list().
  *
  * @warning OWE security is not currently supported for AP mode.
+ *
+ * When the STA interface is already active (simultaneous STA + AP operation), the AP must operate
+ * on the same channel as the STA. The caller is responsible for ensuring relevant channel
+ * parameters match the STA current operating channel. The recommended way to obtain these values
+ * is @ref mmwlan_get_vif_channel_info() with @ref MMWLAN_VIF_STA.
  *
  * @param args Arguments (e.g., SSID, etc.). See @ref mmwlan_ap_args.
  *

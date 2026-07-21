@@ -55,6 +55,11 @@ enum mmwlan_status umac_connection_start_dpp(struct umac_data *umacd,
 enum mmwlan_status umac_connection_stop_dpp(struct umac_data *umacd);
 
 
+enum mmwlan_status umac_connection_get_dpp_uri(struct umac_data *umacd,
+                                               char *uri_buf,
+                                               size_t buf_len);
+
+
 void umac_connection_handle_dpp_event(struct umac_data *umacd,
                                       const struct mmwlan_dpp_cb_args *event);
 

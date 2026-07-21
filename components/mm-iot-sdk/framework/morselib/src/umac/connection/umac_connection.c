@@ -47,6 +47,8 @@
 
 #define MORSE_SHORT_ACK_TIMEOUT_ADJUST_US (300)
 
+static void umac_connection_assoc_reassoc_req_retry(void *arg1, void *arg2);
+
 void umac_connection_init(struct umac_data *umacd)
 {
     struct umac_connection_data *data = umac_data_get_connection(umacd);
@@ -166,14 +168,28 @@ enum mmwlan_status umac_connection_start_dpp(struct umac_data *umacd,
         return status;
     }
 
-    status = umac_supp_dpp_push_button(umacd);
-    if (status != MMWLAN_SUCCESS)
+    if (args->mode == MMWLAN_DPP_MODE_QR_ENROLLEE)
     {
-        return status;
+        int bootstrap_id = -1;
+        status = umac_supp_dpp_qr_enrollee_start(umacd, &args->qr, &bootstrap_id);
+        if (status != MMWLAN_SUCCESS)
+        {
+            return status;
+        }
+        data->dpp_bootstrap_id = (int32_t)bootstrap_id;
+    }
+    else
+    {
+        status = umac_supp_dpp_push_button(umacd);
+        if (status != MMWLAN_SUCCESS)
+        {
+            return status;
+        }
     }
 
-    data->dpp_args.dpp_event_cb = args->dpp_event_cb;
-    data->dpp_args.dpp_event_cb_arg = args->dpp_event_cb_arg;
+    data->dpp_event_cb = args->dpp_event_cb;
+    data->dpp_event_cb_arg = args->dpp_event_cb_arg;
+    data->dpp_mode = args->mode;
 
 
     umac_ps_set_suspended(umacd, true);
@@ -196,29 +212,61 @@ enum mmwlan_status umac_connection_stop_dpp(struct umac_data *umacd)
         return MMWLAN_UNAVAILABLE;
     }
 
-    umac_supp_dpp_push_button_stop(umacd);
+    if (data->dpp_mode == MMWLAN_DPP_MODE_QR_ENROLLEE)
+    {
+        umac_supp_dpp_qr_enrollee_stop(umacd);
+    }
+    else
+    {
+        umac_supp_dpp_push_button_stop(umacd);
+    }
 
     umac_supp_remove_sta_interface(umacd);
 
 
     umac_ps_set_suspended(umacd, false);
 
-    data->dpp_args.dpp_event_cb = NULL;
-    data->dpp_args.dpp_event_cb_arg = NULL;
+    data->dpp_event_cb = NULL;
+    data->dpp_event_cb_arg = NULL;
+    data->dpp_bootstrap_id = -1;
     umac_interface_remove(umacd, UMAC_INTERFACE_STA);
     umac_sta_data_set_vif_id(data->stad, MMDRV_VIF_ID_INVALID);
     data->mode = UMAC_CONNECTION_MODE_NONE;
     return MMWLAN_SUCCESS;
 }
 
+enum mmwlan_status umac_connection_get_dpp_uri(struct umac_data *umacd,
+                                               char *uri_buf,
+                                               size_t buf_len)
+{
+    struct umac_connection_data *data = umac_data_get_connection(umacd);
+
+    if (data->mode != UMAC_CONNECTION_MODE_DPP || data->dpp_mode != MMWLAN_DPP_MODE_QR_ENROLLEE)
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+
+    return umac_supp_dpp_get_uri(umacd, data->dpp_bootstrap_id, uri_buf, buf_len);
+}
+
 void umac_connection_handle_dpp_event(struct umac_data *umacd,
                                       const struct mmwlan_dpp_cb_args *event)
 {
     struct umac_connection_data *data = umac_data_get_connection(umacd);
-    if (data->dpp_args.dpp_event_cb != NULL)
+
+    if (data->dpp_event_cb == NULL)
     {
-        data->dpp_args.dpp_event_cb(event, data->dpp_args.dpp_event_cb_arg);
+        return;
     }
+
+    if ((event->event == MMWLAN_DPP_EVT_PB_RESULT) &&
+        (data->dpp_mode == MMWLAN_DPP_MODE_QR_ENROLLEE))
+    {
+
+        return;
+    }
+
+    data->dpp_event_cb(event, data->dpp_event_cb_arg);
 }
 
 #endif
@@ -349,6 +397,7 @@ enum mmwlan_status umac_connection_stop(struct umac_data *umacd)
 
 
     umac_supp_disconnect(umacd);
+    umac_core_cancel_timeout(umacd, umac_connection_assoc_reassoc_req_retry, umacd, NULL);
     enum mmwlan_status status = umac_supp_remove_sta_interface(umacd);
     umac_sta_data_set_vif_id(data->stad, MMDRV_VIF_ID_INVALID);
 

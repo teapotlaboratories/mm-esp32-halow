@@ -77,42 +77,82 @@ bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_ar
         return false;
     }
 
-    const struct mmwlan_s1g_channel *chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
-    if (chan == NULL || !umac_regdb_op_class_match(umacd, args->op_class, chan))
+    bool auto_select = (args->op_class == 0 && args->s1g_chan_num == 0);
+
+    struct mmwlan_vif_channel_info sta_channel_info = {};
+    bool sta_active =
+        (mmwlan_get_vif_channel_info(MMWLAN_VIF_STA, &sta_channel_info) == MMWLAN_SUCCESS);
+
+    if (auto_select)
     {
-        MMLOG_ERR("No matching channel (reg_dom=%s, op_class=%u, chan#=%u)\n",
-                  umac_regdb_get_country_code(umacd),
-                  args->op_class,
-                  args->s1g_chan_num);
-#if MMLOG_LEVEL >= MMLOG_LEVEL_INF
-        const struct mmwlan_s1g_channel_list *channel_list = umac_config_get_channel_list(umacd);
-        if (channel_list != NULL)
+
+        if (!sta_active)
         {
-            MMLOG_INF("Configured channel list (%s):\n", channel_list->country_code);
-            for (size_t ii = 0; ii < channel_list->num_channels; ii++)
-            {
-                const struct mmwlan_s1g_channel *channel = &channel_list->channels[ii];
-                MMLOG_INF("  chan_num=%u, global_op_class=%u, s1g_op_class=%u, bw=%u MHz\n",
-                          channel->s1g_chan_num,
-                          channel->global_operating_class,
-                          channel->s1g_operating_class,
-                          channel->bw_mhz);
-            }
+            MMLOG_ERR("Auto channel selection requires an active STA VIF\n");
+            return false;
         }
+    }
+    else
+    {
+        if (sta_active && (args->op_class != sta_channel_info.op_class ||
+                           args->s1g_chan_num != sta_channel_info.s1g_chan_num ||
+                           args->pri_bw_mhz != sta_channel_info.pri_bw_mhz ||
+                           args->pri_1mhz_chan_idx != sta_channel_info.pri_1mhz_chan_idx))
+        {
+            MMLOG_ERR("AP channel must match active STA channel\n"
+                      "STA: op_class=%u chan=%u pri_bw=%u pri_1mhz_idx=%u\n"
+                      "AP: op_class=%u chan=%u pri_bw=%u pri_1mhz_idx=%u\n",
+                      sta_channel_info.op_class,
+                      sta_channel_info.s1g_chan_num,
+                      sta_channel_info.pri_bw_mhz,
+                      sta_channel_info.pri_1mhz_chan_idx,
+                      args->op_class,
+                      args->s1g_chan_num,
+                      args->pri_bw_mhz,
+                      args->pri_1mhz_chan_idx);
+            return false;
+        }
+
+        const struct mmwlan_s1g_channel *chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
+        if (chan == NULL || !umac_regdb_op_class_match(umacd, args->op_class, chan))
+        {
+            MMLOG_ERR("No matching channel (reg_dom=%s, op_class=%u, chan#=%u)\n",
+                      umac_regdb_get_country_code(umacd),
+                      args->op_class,
+                      args->s1g_chan_num);
+#if MMLOG_LEVEL >= MMLOG_LEVEL_INF
+            const struct mmwlan_s1g_channel_list *channel_list =
+                umac_config_get_channel_list(umacd);
+            if (channel_list != NULL)
+            {
+                MMLOG_INF("Configured channel list (%s):\n", channel_list->country_code);
+                for (size_t ii = 0; ii < channel_list->num_channels; ii++)
+                {
+                    const struct mmwlan_s1g_channel *channel = &channel_list->channels[ii];
+                    MMLOG_INF("  chan_num=%u, global_op_class=%u, s1g_op_class=%u, bw=%u MHz\n",
+                              channel->s1g_chan_num,
+                              channel->global_operating_class,
+                              channel->s1g_operating_class,
+                              channel->bw_mhz);
+                }
+            }
 #endif
-        return false;
-    }
+            return false;
+        }
 
-    if (args->pri_bw_mhz > MM_MIN(chan->bw_mhz, 2))
-    {
-        MMLOG_ERR("Invalid pri_bw_mhz, %u > %u\n", args->pri_bw_mhz, MM_MIN(chan->bw_mhz, 2));
-        return false;
-    }
+        if (args->pri_bw_mhz > MM_MIN(chan->bw_mhz, 2))
+        {
+            MMLOG_ERR("Invalid pri_bw_mhz, %u > %u\n", args->pri_bw_mhz, MM_MIN(chan->bw_mhz, 2));
+            return false;
+        }
 
-    if (args->pri_1mhz_chan_idx >= chan->bw_mhz)
-    {
-        MMLOG_ERR("Invalid pri_1mhz_chan_idx, %u > %u\n", args->pri_1mhz_chan_idx, chan->bw_mhz);
-        return false;
+        if (args->pri_1mhz_chan_idx >= chan->bw_mhz)
+        {
+            MMLOG_ERR("Invalid pri_1mhz_chan_idx, %u > %u\n",
+                      args->pri_1mhz_chan_idx,
+                      chan->bw_mhz);
+            return false;
+        }
     }
 
     if (args->max_stas > MMWLAN_AP_MAX_STAS_LIMIT)
@@ -127,6 +167,12 @@ bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_ar
 enum mmwlan_status umac_ap_enable_ap(struct umac_data *umacd, const struct mmwlan_ap_args *args)
 {
     enum mmwlan_status status = MMWLAN_ERROR;
+
+    if (!umac_ap_validate_ap_args(umacd, args))
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+
     struct umac_ap_data *data = umac_data_get_ap(umacd);
     if (data != NULL)
     {
@@ -174,21 +220,31 @@ enum mmwlan_status umac_ap_enable_ap(struct umac_data *umacd, const struct mmwla
         }
     }
 
+    memcpy(&(data->args), args, sizeof(data->args));
 
-    data->specified_chan = umac_regdb_get_channel(umacd, args->s1g_chan_num);
 
-    if (data->specified_chan == NULL ||
-        !umac_regdb_op_class_match(umacd, args->op_class, data->specified_chan))
+    if (args->op_class == 0 && args->s1g_chan_num == 0)
     {
-        MMLOG_ERR("No matching channel (reg_dom=%s, op_class=%u, chan#=%u)\n",
-                  umac_regdb_get_country_code(umacd),
-                  args->op_class,
-                  args->s1g_chan_num);
-        status = MMWLAN_INVALID_ARGUMENT;
-        goto error;
+        struct mmwlan_vif_channel_info sta_channel_info = {};
+        enum mmwlan_status sta_status =
+            mmwlan_get_vif_channel_info(MMWLAN_VIF_STA, &sta_channel_info);
+        MMOSAL_ASSERT(sta_status == MMWLAN_SUCCESS);
+
+        MMLOG_INF("STA VIF active; inheriting channel info "
+                  "(op_class=%u, chan=%u, pri_bw=%u, pri_1mhz_idx=%u)\n",
+                  sta_channel_info.op_class,
+                  sta_channel_info.s1g_chan_num,
+                  sta_channel_info.pri_bw_mhz,
+                  sta_channel_info.pri_1mhz_chan_idx);
+
+        data->args.op_class = sta_channel_info.op_class;
+        data->args.s1g_chan_num = sta_channel_info.s1g_chan_num;
+        data->args.pri_bw_mhz = sta_channel_info.pri_bw_mhz;
+        data->args.pri_1mhz_chan_idx = sta_channel_info.pri_1mhz_chan_idx;
     }
 
-    memcpy(&(data->args), args, sizeof(data->args));
+    data->specified_chan = umac_regdb_get_channel(umacd, data->args.s1g_chan_num);
+
     if (data->args.beacon_interval_tus == 0)
     {
         data->args.beacon_interval_tus = MMWLAN_DEFAULT_AP_BEACON_INTERVAL_TUS;
@@ -412,12 +468,51 @@ struct mmpkt *umac_ap_get_beacon(struct umac_data *umacd)
     return beacon;
 }
 
+
+static bool umac_ap_should_ignore_probe_req(struct umac_data *umacd,
+                                            struct mmdrv_rx_metadata *rx_metadata)
+{
+    const struct mmwlan_ap_args *args = umac_ap_get_args(umacd);
+    const struct mmwlan_s1g_channel *op_chan = umac_ap_get_specified_s1g_channel(umacd);
+
+    uint8_t check_bw_mhz = MM_MIN(rx_metadata->bw_mhz, args->pri_bw_mhz);
+
+    const struct mmwlan_s1g_channel *pri_chan =
+        umac_interface_calc_pri_channel(umacd, op_chan, args->pri_1mhz_chan_idx, check_bw_mhz);
+    if (pri_chan == NULL)
+    {
+        MMLOG_DBG("Probe request ignored: failed to resolve primary channel\n");
+        return true;
+    }
+
+    uint16_t pri_chan_freq_100khz = pri_chan->centre_freq_hz / 100000;
+    if (pri_chan_freq_100khz != rx_metadata->freq_100khz)
+    {
+        MMLOG_DBG("Probe request not on primary: %u.%u MHz (%u MHz BW) != %u.%u MHz\n",
+                  rx_metadata->freq_100khz / 10,
+                  rx_metadata->freq_100khz % 10,
+                  rx_metadata->bw_mhz,
+                  pri_chan_freq_100khz / 10,
+                  pri_chan_freq_100khz % 10);
+        return true;
+    }
+    return false;
+}
+
 void umac_ap_handle_probe_req(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     struct umac_ap_data *data = umac_data_get_ap(umacd);
     if (data == NULL)
     {
         MMLOG_WRN("Ignoring probe req\n");
+        return;
+    }
+
+    struct mmdrv_rx_metadata *rx_metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
+    MMOSAL_ASSERT(rx_metadata != NULL);
+
+    if (umac_ap_should_ignore_probe_req(umacd, rx_metadata))
+    {
         return;
     }
 
@@ -449,10 +544,6 @@ void umac_ap_handle_probe_req(struct umac_data *umacd, struct mmpktview *rxbufvi
         MMLOG_WRN("Failed to contruct probe rsp\n");
         return;
     }
-
-    struct mmdrv_rx_metadata *rx_metadata = mmpkt_get_metadata(mmpkt_from_view(rxbufview)).rx;
-
-    MMOSAL_ASSERT(rx_metadata != NULL);
 
     struct mmrc_rate mmrc_rate_override = {
         .attempts = 5,

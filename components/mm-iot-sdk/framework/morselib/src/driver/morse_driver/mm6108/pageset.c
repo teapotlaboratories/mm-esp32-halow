@@ -723,7 +723,7 @@ static int morse_pageset_num_pages(struct morse_pageset *pageset, struct mmpkt *
 static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *mq)
 {
     int ret = 0;
-    int num_pages;
+    int num_pages = 0;
     int num_items = 0;
     struct mmpkt *mmpkt;
     struct mmpkt_list skbq_to_send = MMPKT_LIST_INIT;

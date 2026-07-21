@@ -161,6 +161,18 @@ struct umac_evt
         struct
         {
 
+            char *uri_buf;
+
+            size_t buf_len;
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } dpp_get_uri;
+
+        struct
+        {
+
             enum mmwlan_ps_mode mode;
         } set_ps_mode;
 
@@ -268,12 +280,21 @@ struct umac_evt
 
             volatile enum mmwlan_status *status;
         } relay_stop;
+
+        struct
+        {
+
+            struct mmpkt *txbuf;
+
+        } tx_mgmt_frame;
     } args;
 };
 
+#ifndef UNIT_TESTS_64
 
 MM_STATIC_ASSERT(sizeof(struct umac_evt) == 32,
                  "struct umac_evt must be 32 bytes to maintain ROM compatibility");
+#endif
 
 
 #define UMAC_EVT_INIT(_handler) { .handler = (_handler) }
