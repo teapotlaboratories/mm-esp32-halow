@@ -163,6 +163,11 @@ uint32_t umac_mesh_next_seqnum(void)
     return mesh_seqnum++;
 }
 
+/* S2: the Mesh Formation Info + Mesh Capability bytes are computed from live state (defined later,
+ * after the gate counter + peer table + forwarding/gate globals). */
+static uint8_t mesh_formation_info_byte(void);
+static uint8_t mesh_capability_byte(void);
+
 /* Mesh Configuration element (7 octets) — open HWMP/airtime mesh accepting
  * peers. Matches mac80211's mesh_config defaults so a Linux mesh node treats us
  * as a compatible peer: a mesh node silently ignores beacons whose path
@@ -170,6 +175,7 @@ uint32_t umac_mesh_next_seqnum(void)
  * defaults the synchronization method to neighbour-offset (0x01). */
 static void mesh_build_config_ie(struct consbuf *buf)
 {
+    /* Not a compile-time constant: the last two octets are live state (mesh_add_meshconf_ie). */
     const uint8_t cfg[2 + 7] = {
         DOT11_IE_MESH_CONFIGURATION,
         7,
@@ -181,8 +187,8 @@ static void mesh_build_config_ie(struct consbuf *buf)
                * Linux mesh_matches_local (net/mac80211/mesh.c) compares meshconf_auth and drops a
                * candidate whose beacon advertises a different value, so a Linux SAE peer never creates
                * the ESP as a peer candidate and drops its SAE Commits ("peer not yet known"). P3d. */
-        0x00, /* Mesh Formation Info:            0 peerings */
-        0x01, /* Mesh Capability:                Accepting Additional Peerings */
+        mesh_formation_info_byte(), /* Mesh Formation Info: S2 — Connected-to-Gate bit0 + peer count */
+        mesh_capability_byte(),     /* Mesh Capability:     Accepting Peerings + Forwarding (S2)     */
     };
     consbuf_append(buf, cfg, sizeof(cfg));
 }
@@ -350,15 +356,19 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
  * unicast. */
 #define DOT11_CATEGORY_MESH               (13)
 #define WLAN_MESH_ACTION_HWMP_PATH_SEL    (1)
+#define DOT11_IE_RANN                     (126) /* WLAN_EID_RANN (precedes PREQ numerically) */
 #define DOT11_IE_PREQ                     (130)
 #define DOT11_IE_PREP                     (131)
 #define DOT11_IE_PERR                     (132)
 #define HWMP_PREQ_IE_LEN                  (37)
 #define HWMP_PREP_IE_LEN                  (31)
 #define HWMP_PERR_IE_LEN                  (15) /* ttl + num_dest(1) + one target (flags+addr+sn+rcode) */
+#define HWMP_RANN_IE_LEN                  (21) /* sizeof(struct ieee80211_rann_ie): flags+hop+ttl+addr(6)+sn+interval+metric */
 #define HWMP_ELEMENT_TTL                  (31)
 #define HWMP_MPATH_PREQ                   (0)
 #define HWMP_MPATH_PREP                   (1)
+#define HWMP_MPATH_RANN                   (2)
+#define RANN_FLAG_IS_GATE                 (1u << 0) /* enum ieee80211_rann_flags */
 
 /* Mesh path table (mesh_pathtbl.c) + HWMP on-demand routing. We keep a small path table and a per-link
  * airtime metric (P6c) — a port of net/mac80211 airtime_link_metric_get (mesh_hwmp.c:338-381): the exact
@@ -383,6 +393,9 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
  * metric, not SN). Chosen >> a single flood's arrival spread (tens of ms) and << the ~24 s refresh. */
 #define MESH_HWMP_NET_TRAVERSAL_MS (500)
 #define MESH_PREQ_MIN_GAP_MS  (250)   /* rate-limit path discovery per destination */
+/* S2: root-path confirmation interval — on a fresh RANN, at most one PREQ toward the root per this
+ * window (net/wireless/mesh.c MESH_ROOT_CONFIRMATION_INTERVAL == dot11MeshHWMPconfirmationInterval). */
+#define MESH_ROOT_CONFIRM_INTERVAL_MS (2000)
 /* The PREQ Lifetime field is in TUs, not ms (mesh_hwmp.c `MSEC_TO_TU(x) = x*1000/1024`). */
 #define MESH_MSEC_TO_TU(ms)   ((uint32_t)((ms) * 1000u / 1024u))
 /* PREQ per-target flags (ieee80211.h): Target-Only — only the target replies (not an
@@ -555,6 +568,23 @@ static bool g_mesh_multihop = true;
 void mmwlan_mesh_set_multihop(bool enabled)
 {
     g_mesh_multihop = enabled;
+}
+
+/* Proactive root/gate announcements (net/mac80211 ifmsh->mshcfg.{dot11MeshHWMPRootMode,
+ * dot11MeshGateAnnouncementProtocol, dot11MeshHWMPRannInterval}). S1 emits ONLY PROACTIVE_RANN.
+ * Off by default -- a plain mesh node is not a root and emits no RANN. */
+static bool     g_mesh_root_rann        = false; /* dot11MeshHWMPRootMode == IEEE80211_PROACTIVE_RANN */
+static bool     g_mesh_gate_announce    = false; /* dot11MeshGateAnnouncementProtocol -> RANN_FLAG_IS_GATE */
+static uint32_t g_mesh_rann_interval_ms = 5000;  /* dot11MeshHWMPRannInterval default (net/wireless/mesh.c) */
+
+void mmwlan_mesh_set_root_announcements(bool root_rann, bool is_gate, uint32_t interval_ms)
+{
+    g_mesh_root_rann     = root_rann;
+    g_mesh_gate_announce = is_gate;
+    if (interval_ms != 0)
+    {
+        g_mesh_rann_interval_ms = interval_ms;
+    }
 }
 
 static struct mesh_peer *mesh_peer_find(const uint8_t *mac)
@@ -1856,10 +1886,24 @@ struct mesh_path_entry
     uint32_t expiry_ms;
     uint32_t last_preq_ms;
     int16_t hnext; /* next entry index in this dest's hash bucket, or MESH_PATH_NIL */
+    /* S2 (mesh-gate RANN RX — net/mac80211 struct mesh_path, hwmp_rann_frame_process). A dest learned
+     * from a proactive Root Announcement is a "root"; if the RANN carried RANN_FLAG_IS_GATE it is also a
+     * "gate" (a way off the mesh). These are set by the RANN RX handler and are independent of the
+     * on-demand PREQ/PREP forwarding path (which fills next_hop/active/metric). */
+    bool is_root;                               /* mpath->is_root: dest is a PROACTIVE_RANN root */
+    bool is_gate;                               /* mpath->is_gate: root advertised RANN_FLAG_IS_GATE */
+    uint8_t rann_snd_addr[MMWLAN_MAC_ADDR_LEN]; /* neighbour that last forwarded this root's RANN (:990) */
+    uint32_t rann_metric;                       /* best metric to the root seen via RANN (freshness cmp) */
+    uint32_t last_preq_to_root_ms;              /* last root-confirmation PREQ time (rate-limit :970) */
 };
 
 static struct mesh_path_entry mesh_paths[MESH_MAX_PATHS];
 static int16_t mesh_path_bucket[MESH_PATH_BUCKETS]; /* bucket head index into mesh_paths, or NIL */
+
+/* S2: number of known gates (net/mac80211 ifmsh->num_gates, mesh_pathtbl.c). A path becomes a gate when
+ * its root advertises RANN_FLAG_IS_GATE (mesh_path_add_gate); the count drives the beacon Connected-to-
+ * Gate bit. The gate SET is the paths with is_gate==true (the S4 send_to_gates walk iterates those). */
+static uint8_t g_mesh_num_gates;
 
 /* Dest-MAC hash index over the fixed path pool — O(1) find/insert/remove by chaining int16_t pool
  * indices (position-independent, all-BSS, no heap/fragmentation). The embedded stand-in for
@@ -1911,6 +1955,7 @@ static void mesh_path_tbl_reset(void)
     {
         mesh_path_bucket[b] = MESH_PATH_NIL;
     }
+    g_mesh_num_gates = 0; /* S2: no gates until a RANN_FLAG_IS_GATE root is learned */
 }
 
 static uint32_t mesh_rd32(const uint8_t *p)
@@ -1954,6 +1999,10 @@ static struct mesh_path_entry *mesh_path_get_or_add(const uint8_t *dest)
     {
         if (victim->used)
         {
+            if (victim->is_gate && g_mesh_num_gates > 0)
+            {
+                g_mesh_num_gates--; /* S2: evicting a gate path removes it (mesh_path_del/gate cleanup) */
+            }
             mesh_path_hash_remove(victim); /* unlink the evicted dest from its bucket first */
         }
         memset(victim, 0, sizeof(*victim));
@@ -1963,6 +2012,195 @@ static struct mesh_path_entry *mesh_path_get_or_add(const uint8_t *dest)
         mesh_path_hash_insert(victim); /* index the new dest */
     }
     return victim;
+}
+
+/* S2: record a path's dest as a gate (net/mac80211 mesh_path_add_gate, mesh_pathtbl.c:337). Idempotent —
+ * a path already flagged is_gate is not counted twice (Linux returns -EEXIST). Called from the RANN RX
+ * handler when a root advertises RANN_FLAG_IS_GATE. */
+static void mesh_path_add_gate(struct mesh_path_entry *mpath)
+{
+    if (mpath->is_gate)
+    {
+        return; /* mesh_pathtbl.c:346 — already a gate, no double count */
+    }
+    mpath->is_gate = true;
+    g_mesh_num_gates++;
+    MMLOG_INF("MESH gate recorded: " MM_MAC_ADDR_FMT " (%u known)\n",
+              MM_MAC_ADDR_VAL(mpath->dest), (unsigned)g_mesh_num_gates);
+}
+
+/* Number of gates this node currently knows (net/mac80211 mesh_gate_num). Drives the beacon
+ * Connected-to-Gate bit and is the S2 verification signal (a node that learned a gate reports > 0). */
+uint8_t mmwlan_mesh_gate_count(void)
+{
+    return g_mesh_num_gates;
+}
+
+/* S3 — last received 6-address (AE_A5_A6) mesh frame's proxied endpoints. The datapath RX extraction
+ * records them here (morselib MMLOG isn't on the ESP UART); a fixture polls mmwlan_mesh_ae_rx_probe to
+ * confirm the FW delivered the AE frame and the host decrypted + parsed the AE Mesh Control. S4 will use
+ * the same eaddrs for MPP learning instead of just recording them. */
+static uint8_t  g_mesh_ae_rx_eaddr1[MMWLAN_MAC_ADDR_LEN];
+static uint8_t  g_mesh_ae_rx_eaddr2[MMWLAN_MAC_ADDR_LEN];
+static uint32_t g_mesh_ae_rx_count;
+
+void umac_mesh_note_ae_rx(const uint8_t *eaddr1, const uint8_t *eaddr2)
+{
+    mac_addr_copy(g_mesh_ae_rx_eaddr1, eaddr1);
+    mac_addr_copy(g_mesh_ae_rx_eaddr2, eaddr2);
+    g_mesh_ae_rx_count++;
+}
+
+/* S5 — app callback for a received AE frame's (eaddr1, eaddr2, payload). The gate registers it to bridge
+ * a proxied frame onto its AP side. The mesh RX ext-cb only sees the post-strip 802.3 frame and can't
+ * recover the proxied endpoints, so this is the gate's mesh->AP hook. */
+static mmwlan_mesh_ae_rx_cb_t g_mesh_ae_rx_cb;
+static void                  *g_mesh_ae_rx_cb_arg;
+
+void mmwlan_mesh_register_ae_rx_cb(mmwlan_mesh_ae_rx_cb_t cb, void *arg)
+{
+    g_mesh_ae_rx_cb     = cb;
+    g_mesh_ae_rx_cb_arg = arg;
+}
+
+bool umac_mesh_ae_rx_deliver(const uint8_t *eaddr1, const uint8_t *eaddr2, const uint8_t *payload,
+                             uint32_t payload_len)
+{
+    if (g_mesh_ae_rx_cb != NULL)
+    {
+        /* Returns true if the callback consumed the frame (delivered it off-mesh) — the datapath then
+         * skips local delivery, avoiding a double-delivery on the gate (S5 finishing touch). */
+        return g_mesh_ae_rx_cb(eaddr1, eaddr2, payload, payload_len, g_mesh_ae_rx_cb_arg);
+    }
+    return false;
+}
+
+uint32_t mmwlan_mesh_ae_rx_probe(uint8_t *eaddr1_out, uint8_t *eaddr2_out)
+{
+    if (eaddr1_out != NULL)
+    {
+        mac_addr_copy(eaddr1_out, g_mesh_ae_rx_eaddr1);
+    }
+    if (eaddr2_out != NULL)
+    {
+        mac_addr_copy(eaddr2_out, g_mesh_ae_rx_eaddr2);
+    }
+    return g_mesh_ae_rx_count;
+}
+
+/* S4 — MPP (Mesh Proxy Path) table: maps an off-mesh host address to the mesh node that proxies it into
+ * the mesh (net/mac80211 sdata->u.mesh.mpp_paths, mesh_pathtbl.c). Distinct from the mesh path table (which
+ * maps a MESH node -> next hop): an MPP entry answers "which mesh node do I send to, to reach this off-mesh
+ * host". Learned on 6-address AE RX (umac_mesh_mpp_learn == mpp_path_add); consumed by the send_to_gates TX
+ * fallback (S4b) + proxied delivery (S5). A small linear table — proxied hosts are few. */
+#define MESH_MPP_MAX 32
+struct mpp_path_entry
+{
+    bool used;
+    uint8_t dst[MMWLAN_MAC_ADDR_LEN];  /* off-mesh host (== AE eaddr2 on RX) */
+    uint8_t mpp[MMWLAN_MAC_ADDR_LEN];  /* the mesh node that proxies it (== the frame's mesh SA) */
+    uint32_t expiry_ms;
+};
+static struct mpp_path_entry mpp_paths[MESH_MPP_MAX];
+
+static struct mpp_path_entry *mpp_path_find(const uint8_t *dst)
+{
+    for (size_t i = 0; i < MESH_MPP_MAX; i++)
+    {
+        if (mpp_paths[i].used && memcmp(mpp_paths[i].dst, dst, MMWLAN_MAC_ADDR_LEN) == 0)
+        {
+            return &mpp_paths[i];
+        }
+    }
+    return NULL;
+}
+
+/* mpp_path_add(dst, mpp) — record that off-mesh `dst` is reachable via mesh node `mpp` (mesh_pathtbl.c:722).
+ * Never proxy ourselves or a multicast dst (:729-733). Refreshes an existing entry (new proxy + expiry) or
+ * takes a free/oldest slot. */
+void umac_mesh_mpp_learn(const uint8_t *dst, const uint8_t *mpp)
+{
+    if (memcmp(dst, mesh_ctx.mesh_mac, MMWLAN_MAC_ADDR_LEN) == 0 || mm_mac_addr_is_multicast(dst))
+    {
+        return;
+    }
+    struct mpp_path_entry *p = mpp_path_find(dst);
+    if (p == NULL)
+    {
+        struct mpp_path_entry *victim = NULL;
+        for (size_t i = 0; i < MESH_MPP_MAX; i++)
+        {
+            if (!mpp_paths[i].used)
+            {
+                victim = &mpp_paths[i];
+                break;
+            }
+            if (victim == NULL || mpp_paths[i].expiry_ms < victim->expiry_ms)
+            {
+                victim = &mpp_paths[i];
+            }
+        }
+        if (victim == NULL)
+        {
+            return;
+        }
+        p = victim;
+        p->used = true;
+        mac_addr_copy(p->dst, dst);
+    }
+    mac_addr_copy(p->mpp, mpp);
+    p->expiry_ms = mmosal_get_time_ms() + MESH_PATH_LIFETIME_MS;
+    MMLOG_INF("MESH MPP learn: " MM_MAC_ADDR_FMT " via " MM_MAC_ADDR_FMT "\n",
+              MM_MAC_ADDR_VAL(dst), MM_MAC_ADDR_VAL(mpp));
+}
+
+/* Public: which mesh node proxies off-mesh host `dst`? (S4 probe + the S4b send_to_gates target select.)
+ * Returns true + fills `mpp_out` (if non-NULL), or false if `dst` is not a known proxied host. */
+bool mmwlan_mesh_mpp_lookup(const uint8_t *dst, uint8_t *mpp_out)
+{
+    struct mpp_path_entry *p = mpp_path_find(dst);
+    if (p == NULL)
+    {
+        return false;
+    }
+    if (mpp_out != NULL)
+    {
+        mac_addr_copy(mpp_out, p->mpp);
+    }
+    return true;
+}
+
+/* S2: Mesh Formation Info byte for the beacon (net/mac80211 mesh_add_meshconf_ie:293-297):
+ * bit0 = Connected-to-Gate (we know a gate, or we announce ourselves as one), bits1-6 = number of
+ * established peerings (capped at the 6-bit field max), bit7 = Connected-to-AS (never set here). */
+static uint8_t mesh_formation_info_byte(void)
+{
+    uint8_t neighbors = 0;
+    for (size_t i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (mesh_peers[i].used && mesh_peers[i].state == MESH_PLINK_ESTAB)
+        {
+            neighbors++;
+        }
+    }
+    if (neighbors > 63)
+    {
+        neighbors = 63; /* IEEE80211_MAX_MESH_PEERINGS — the field is 6 bits */
+    }
+    bool connected_to_gate = (g_mesh_num_gates > 0) || g_mesh_gate_announce;
+    return (uint8_t)(((uint8_t)(neighbors << 1)) | (connected_to_gate ? 0x01u : 0x00u));
+}
+
+/* S2: Mesh Capability byte (mesh_add_meshconf_ie:299-303): ACCEPT_PLINKS (we always accept peerings)
+ * plus FORWARDING when this node forwards for others (dot11MeshForwarding == our g_mesh_multihop). */
+static uint8_t mesh_capability_byte(void)
+{
+    uint8_t cap = 0x01; /* IEEE80211_MESHCONF_CAPAB_ACCEPT_PLINKS */
+    if (g_mesh_multihop)
+    {
+        cap |= 0x08; /* IEEE80211_MESHCONF_CAPAB_FORWARDING */
+    }
+    return cap;
 }
 
 /* mult_frac(m, 10, 9) with a 64-bit intermediate + saturation (mesh_hwmp.c hysteresis constant). Lower
@@ -2095,6 +2333,20 @@ static void umac_mesh_build_hwmp(struct umac_data *umacd, struct consbuf *buf, v
     const uint8_t cat_act[2] = { DOT11_CATEGORY_MESH, WLAN_MESH_ACTION_HWMP_PATH_SEL };
     consbuf_append(buf, cat_act, sizeof(cat_act));
 
+    if (p->action == HWMP_MPATH_RANN)
+    {
+        /* RANN element (net/mac80211 mesh_path_sel_frame_tx, case MPATH_RANN). Byte layout ==
+         * struct ieee80211_rann_ie: flags, hopcount, ttl, root addr[6], seq, interval, metric. No
+         * PREQ/PREP tail. `orig_addr`/`orig_sn`/`lifetime` carry the root addr/seq/interval. */
+        const uint8_t rann_pre[5] = { DOT11_IE_RANN, HWMP_RANN_IE_LEN, p->flags, p->hop_count, p->ttl };
+        consbuf_append(buf, rann_pre, sizeof(rann_pre));
+        consbuf_append(buf, p->orig_addr, MMWLAN_MAC_ADDR_LEN); /* rann_addr = root/gate MAC */
+        umac_mesh_append_le32(buf, p->orig_sn);                 /* rann_seq */
+        umac_mesh_append_le32(buf, p->lifetime);               /* rann_interval (Linux passes the raw value) */
+        umac_mesh_append_le32(buf, p->metric);                 /* rann_metric */
+        return;
+    }
+
     const uint8_t pre[5] = { is_preq ? DOT11_IE_PREQ : DOT11_IE_PREP,
                              is_preq ? HWMP_PREQ_IE_LEN : HWMP_PREP_IE_LEN, p->flags, p->hop_count,
                              p->ttl };
@@ -2202,6 +2454,43 @@ void umac_mesh_start_discovery(const uint8_t *dest)
     mac_addr_copy(q.target_addr, dest);
     umac_mesh_tx_hwmp(&q);
     MMLOG_INF("MESH PREQ for " MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(dest));
+}
+
+/* Emit one proactive root announcement (net/mac80211 mesh_path_tx_root_frame, case
+ * IEEE80211_PROACTIVE_RANN). A root/gate floods a RANN so every node learns a path back to it -- the
+ * discovery half of the mesh-gate port (S1). Only the RANN root mode is emitted; PROACTIVE_PREQ is
+ * out of scope. Reuses the broadcast, group-unprotected HWMP TX path (umac_mesh_tx_hwmp). */
+static void umac_mesh_tx_root_frame(void)
+{
+    if (!mesh_ctx.active || !g_mesh_multihop || !g_mesh_root_rann)
+    {
+        return;
+    }
+    struct hwmp_frame_params q = { .action = HWMP_MPATH_RANN,
+                                   .da = mac_addr_broadcast,
+                                   .flags = g_mesh_gate_announce ? RANN_FLAG_IS_GATE : 0,
+                                   .hop_count = 0,
+                                   .ttl = HWMP_ELEMENT_TTL,
+                                   .orig_sn = ++mesh_hwmp_sn, /* ++ifmsh->sn */
+                                   .lifetime = g_mesh_rann_interval_ms, /* rann_interval (raw, per Linux) */
+                                   .metric = 0 };
+    mac_addr_copy(q.orig_addr, mesh_ctx.mesh_mac); /* rann_addr = our (root) MAC */
+    umac_mesh_tx_hwmp(&q);
+    MMLOG_INF("MESH RANN%s sn=%lu from " MM_MAC_ADDR_FMT "\n", g_mesh_gate_announce ? " (gate)" : "",
+              (unsigned long)mesh_hwmp_sn, MM_MAC_ADDR_VAL(mesh_ctx.mesh_mac));
+}
+
+/* Proactive-root timer (net/mac80211 ieee80211_mesh_path_root_timer). Armed at mesh start and
+ * self-reschedules at the RANN interval; each tick emits a RANN while root mode is on (a no-op
+ * otherwise). Unlike Linux -- which arms the timer only in root mode via ieee80211_mesh_root_setup --
+ * this stays armed and cheaply no-ops when not a root, so a runtime mode change needs no timer rearm. */
+static void umac_mesh_rann_tick(void *arg1, void *arg2)
+{
+    (void)arg2;
+    struct umac_data *umacd = (struct umac_data *)arg1;
+    umac_mesh_tx_root_frame();
+    uint32_t period = (g_mesh_rann_interval_ms != 0) ? g_mesh_rann_interval_ms : 5000;
+    (void)umac_core_register_timeout(umacd, period, umac_mesh_rann_tick, umacd, NULL);
 }
 
 /* --- HWMP PERR (path error) — mesh_path_error_tx / hwmp_perr_frame_process ---
@@ -2373,6 +2662,106 @@ static void umac_mesh_handle_hwmp(const uint8_t *body, uint32_t body_len, const 
             break;
         }
         const uint8_t *e = &body[off + 2];
+
+        if (id == DOT11_IE_RANN && len >= HWMP_RANN_IE_LEN)
+        {
+            /* RANN RX — port of net/mac80211 hwmp_rann_frame_process (mesh_hwmp.c:914). A root/gate
+             * flooded a Root Announcement; learn a path back to it, record it as a gate if flagged,
+             * kick a root-confirmation PREQ, and re-flood. Element (== S1 umac_mesh_build_hwmp RANN):
+             * flags[0] hop_count[1] ttl[2] rann_addr[3..8] rann_seq[9..12] interval[13..16]
+             * metric[17..20]. */
+            uint8_t flags = e[0], hop_count = e[1], ttl = e[2];
+            const uint8_t *orig_addr = &e[3]; /* the root/gate mesh MAC */
+            uint32_t orig_sn = mesh_rd32(&e[9]);
+            uint32_t interval = mesh_rd32(&e[13]);
+            uint32_t orig_metric = mesh_rd32(&e[17]);
+            bool root_is_gate = (flags & RANN_FLAG_IS_GATE) != 0;
+            hop_count++; /* mesh_hwmp.c:934 — count this hop */
+
+            /* Ignore our own RANNs (mesh_hwmp.c:938). */
+            if (memcmp(orig_addr, mesh_ctx.mesh_mac, MMWLAN_MAC_ADDR_LEN) == 0)
+            {
+                return;
+            }
+            /* Drop only if the forwarder is not a known peer at all (mesh_hwmp.c:948 sta_info_get ->
+             * return if !sta). A known-but-not-yet-ESTAB peer is still processed: mesh_last_hop_metric
+             * returns MESH_METRIC_MAX for a non-ESTAB plink (== Linux airtime_link_metric_get for a
+             * non-ESTAB sta), so the root path is kept but never preferred — we do NOT drop the RANN. */
+            if (mesh_peer_find(frame_sa) == NULL)
+            {
+                return;
+            }
+            uint32_t new_metric = orig_metric + mesh_last_hop_metric(frame_sa);
+            if (new_metric < orig_metric) /* overflow clamp (mesh_hwmp.c:955) */
+            {
+                new_metric = MESH_METRIC_MAX;
+            }
+
+            struct mesh_path_entry *mpath = mesh_path_get_or_add(orig_addr);
+            if (mpath == NULL)
+            {
+                return; /* table full (mesh_hwmp.c:961 dropped_frames_no_route) */
+            }
+            /* Freshness (mesh_hwmp.c:967): accept only a strictly-newer SN, or an equal SN with a
+             * better (lower) metric. Otherwise this is a stale/duplicate RANN — drop it. This is the
+             * RANN-flood suppressor (the analog of hwmp_route_info_get for PREQ/PREP). */
+            if (!MESH_SN_GT(orig_sn, mpath->sn) &&
+                !(mpath->sn == orig_sn && new_metric < mpath->rann_metric))
+            {
+                return;
+            }
+
+            uint32_t now = mmosal_get_time_ms();
+            mpath->sn = orig_sn;
+            mpath->rann_metric = new_metric;
+            mpath->is_root = true;
+            mac_addr_copy(mpath->rann_snd_addr, frame_sa); /* record the sender for the root PREQ (:990) */
+            /* Refresh the path's LRU expiry so a gate learned purely from RANN (before its confirmation
+             * PREQ/PREP fills next_hop/active/expiry via mesh_path_update) is not left at expiry_ms=0 and
+             * thus the first eviction victim in mesh_path_get_or_add. Each fresh RANN pushes it forward. */
+            mpath->expiry_ms = now + MESH_PATH_LIFETIME_MS;
+
+            /* Root-confirmation PREQ (mesh_hwmp.c:970): a RANN only records is_root + the sender, so
+             * establish an actual forwarding path to the root with a target-only refresh PREQ (we now
+             * know its SN). Rate-limited to the confirmation interval so a periodic RANN flood does not
+             * flood PREQs. umac_mesh_start_discovery has its own per-dest MESH_PREQ_MIN_GAP_MS gate. */
+            if (ttl != 0 &&
+                (!mpath->active ||
+                 (int32_t)(now - mpath->last_preq_to_root_ms) >= (int32_t)MESH_ROOT_CONFIRM_INTERVAL_MS))
+            {
+                umac_mesh_start_discovery(orig_addr);
+                mpath->last_preq_to_root_ms = now;
+            }
+
+            if (root_is_gate)
+            {
+                mesh_path_add_gate(mpath); /* mesh_hwmp.c:992 */
+            }
+
+            /* Re-flood (mesh_hwmp.c:995): TTL<=1 stops the flood; else decrement, and forward with the
+             * accumulated metric + incremented hop count, keeping the root's addr/sn/interval/flags. Our
+             * MAC becomes the SA (umac_mesh_build_hwmp), rann_addr stays the root. umac_mesh_tx_hwmp is
+             * itself gated on multihop/forwarding (leaf nodes never re-flood — dot11MeshForwarding). */
+            if (ttl <= 1)
+            {
+                return;
+            }
+            ttl--;
+            struct hwmp_frame_params rann_fwd = { .action = HWMP_MPATH_RANN,
+                                                  .da = mac_addr_broadcast,
+                                                  .flags = flags,
+                                                  .hop_count = hop_count,
+                                                  .ttl = ttl,
+                                                  .orig_sn = orig_sn,
+                                                  .lifetime = interval,
+                                                  .metric = new_metric };
+            mac_addr_copy(rann_fwd.orig_addr, orig_addr);
+            umac_mesh_tx_hwmp(&rann_fwd);
+            MMLOG_INF("MESH RANN%s relay orig=" MM_MAC_ADDR_FMT " sn=%lu hop=%u ttl=%u\n",
+                      root_is_gate ? " (gate)" : "", MM_MAC_ADDR_VAL(orig_addr),
+                      (unsigned long)orig_sn, (unsigned)hop_count, (unsigned)ttl);
+            return;
+        }
 
         if (id == DOT11_IE_PREQ && len >= HWMP_PREQ_IE_LEN)
         {
@@ -2567,6 +2956,12 @@ struct mesh_forward_params
     uint32_t seqnum;
     const uint8_t *payload; /* LLC/SNAP + IP, copied verbatim */
     uint32_t payload_len;
+    /* S3 — 6-address Address Extension (net/mac80211 MESH_FLAGS_AE_A5_A6). When `ae` is set the Mesh
+     * Control header carries the proxied endpoints: eaddr1 = the final DA (addr5), eaddr2 = the original
+     * SA (addr6, the off-mesh host). Set by a gate proxying an external frame into the mesh. */
+    bool ae;
+    uint8_t eaddr1[MMWLAN_MAC_ADDR_LEN]; /* addr5 — proxied DA */
+    uint8_t eaddr2[MMWLAN_MAC_ADDR_LEN]; /* addr6 — proxied SA */
 };
 
 static void umac_mesh_build_forward(struct umac_data *umacd, struct consbuf *buf, void *params)
@@ -2589,13 +2984,23 @@ static void umac_mesh_build_forward(struct umac_data *umacd, struct consbuf *buf
     }
     uint16_t qos = htole16(0x0100u); /* QoS Control: Mesh Control Present */
     consbuf_append(buf, (const uint8_t *)&qos, sizeof(qos));
-    const uint8_t mc[6] = { 0, HWMP_ELEMENT_TTL, (uint8_t)p->seqnum, (uint8_t)(p->seqnum >> 8),
+    /* Mesh Control: flags, ttl, seqnum, then (AE_A5_A6) eaddr1(addr5) + eaddr2(addr6). Byte layout ==
+     * struct ieee80211s_hdr; the AE eaddrs ride in the CCMP-encrypted body, so this is crypto-transparent
+     * (the AAD is over the 802.11 MAC header only — the frame is already 4-addr). */
+    const uint8_t flags = p->ae ? 0x02u /* MESH_FLAGS_AE_A5_A6 */ : 0x00u;
+    const uint8_t mc[6] = { flags, HWMP_ELEMENT_TTL, (uint8_t)p->seqnum, (uint8_t)(p->seqnum >> 8),
                             (uint8_t)(p->seqnum >> 16), (uint8_t)(p->seqnum >> 24) };
-    consbuf_append(buf, mc, sizeof(mc)); /* Mesh Control: flags, ttl, seqnum */
+    consbuf_append(buf, mc, sizeof(mc));
+    if (p->ae)
+    {
+        consbuf_append(buf, p->eaddr1, MMWLAN_MAC_ADDR_LEN); /* addr5 — proxied DA */
+        consbuf_append(buf, p->eaddr2, MMWLAN_MAC_ADDR_LEN); /* addr6 — proxied SA */
+    }
     consbuf_append(buf, p->payload, p->payload_len);
 }
 
-bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, const uint8_t *payload,
+bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, bool ae,
+                            const uint8_t *eaddr1, const uint8_t *eaddr2, const uint8_t *payload,
                             uint32_t payload_len)
 {
     if (!g_mesh_multihop)
@@ -2621,12 +3026,21 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     {
         return false; /* next hop is not an established peer — can't forward */
     }
+    /* S4c — preserve 6-address AE on relay: a proxied (AE_A5_A6) frame must keep eaddr1/eaddr2 through
+     * every hop (net/mac80211 forwards the mesh header verbatim), or a multi-hop gate loses the proxied
+     * endpoints. The mesh SA (addr4) is already preserved end-to-end; only addr2/TA changes per hop. */
     struct mesh_forward_params p = { .mesh_da = mesh_da,
                                      .mesh_sa = mesh_sa,
                                      .seqnum = umac_mesh_next_seqnum(),
                                      .payload = payload,
-                                     .payload_len = payload_len };
+                                     .payload_len = payload_len,
+                                     .ae = ae };
     mac_addr_copy(p.next_hop, next_hop);
+    if (ae)
+    {
+        mac_addr_copy(p.eaddr1, eaddr1);
+        mac_addr_copy(p.eaddr2, eaddr2);
+    }
 
     struct umac_data *umacd = umac_data_get_umacd();
     /* S3 — allocate the forwarded unicast on the per-TID data class so the FW enqueues it on the
@@ -2643,6 +3057,201 @@ bool umac_mesh_forward_data(const uint8_t *mesh_da, const uint8_t *mesh_sa, cons
     }
     mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
     (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
+    return true;
+}
+
+/* S3 test hook — originate a PROXIED 6-address (AE_A5_A6) mesh data frame to a directly-peered mesh node
+ * `mesh_da`, carrying the proxied endpoints eaddr1 (final DA / addr5) + eaddr2 (orig SA / addr6). Exercises
+ * the AE datapath primitive end-to-end (build -> SW-CCMP -> FW -> air -> peer RX -> decrypt -> AE parse) so
+ * it can be on-air byte-diffed vs a Linux AE frame and confirm the MM6108 FW delivers/accepts AE frames.
+ * This is a manual injector for verifying S3 — NOT the gate proxy datapath (that is S4/S5). */
+bool mmwlan_mesh_send_ae_test(const uint8_t *mesh_da, const uint8_t *eaddr1_da, const uint8_t *eaddr2_sa,
+                              const uint8_t *payload, uint32_t payload_len)
+{
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
+    {
+        return false;
+    }
+    /* Single-hop AE test: the target must be a directly-peered neighbour (its per-peer stad carries the
+     * pairwise MTK the SW-CCMP frame is keyed under, exactly like umac_mesh_forward_data). */
+    struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(mesh_da);
+    if (nh_stad == NULL)
+    {
+        return false;
+    }
+    struct mesh_forward_params p = { .mesh_da = mesh_da,
+                                     .mesh_sa = mesh_ctx.mesh_mac,
+                                     .seqnum = umac_mesh_next_seqnum(),
+                                     .payload = payload,
+                                     .payload_len = payload_len,
+                                     .ae = true };
+    mac_addr_copy(p.next_hop, mesh_da);
+    mac_addr_copy(p.eaddr1, eaddr1_da);
+    mac_addr_copy(p.eaddr2, eaddr2_sa);
+
+    struct umac_data *umacd = umac_data_get_umacd();
+#if MESH_FWD_DATA_AGGREGATE
+    struct mmpkt *frame = build_mesh_data_frame(umacd, umac_mesh_build_forward, &p, MESH_FWD_TID);
+#else
+    struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_forward, &p);
+#endif
+    if (frame == NULL)
+    {
+        return false;
+    }
+    mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
+    (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
+    MMLOG_INF("MESH AE test tx -> " MM_MAC_ADDR_FMT " eaddr1(DA)=" MM_MAC_ADDR_FMT " eaddr2(SA)="
+              MM_MAC_ADDR_FMT "\n", MM_MAC_ADDR_VAL(mesh_da), MM_MAC_ADDR_VAL(eaddr1_da),
+              MM_MAC_ADDR_VAL(eaddr2_sa));
+    return true;
+}
+
+/* S4b — send-to-gates fallback (net/mac80211 mesh_path_send_to_gates, mesh_pathtbl.c:969, + the
+ * prepare_for_gate rewrite, :134). When a node has no mesh path to a destination that is off-mesh, it
+ * reaches it through a discovered GATE: wrap the frame as a 6-address AE_A5_A6 frame addressed to the gate
+ * (mesh DA = gate, eaddr1 = the final off-mesh DA, eaddr2 = the original source) and send it. The gate
+ * (S5) bridges eaddr1 off-mesh. Iterates the known gates (paths flagged is_gate by the S2 RANN RX) and
+ * sends a copy via each reachable one, like Linux. Returns true if it went out via at least one gate.
+ * S5 will call this from the datapath TX on a next-hop miss for an off-mesh dest; for S4b a fixture drives
+ * it directly. `final_dst` = the off-mesh destination, `src` = the original source (an AP client behind us,
+ * or us). */
+bool mmwlan_mesh_send_to_gates(const uint8_t *final_dst, const uint8_t *src, const uint8_t *payload,
+                               uint32_t payload_len)
+{
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL || !g_mesh_multihop || g_mesh_num_gates == 0)
+    {
+        return false;
+    }
+    bool sent = false;
+    for (size_t i = 0; i < MESH_MAX_PATHS; i++)
+    {
+        struct mesh_path_entry *g = &mesh_paths[i];
+        if (!g->used || !g->is_gate)
+        {
+            continue;
+        }
+        /* Resolve the next hop to the gate: a directly-peered gate -> itself; else the HWMP next hop
+         * (which must be a peer whose per-pair MTK keys the SW-CCMP frame, as in umac_mesh_forward_data). */
+        uint8_t next_hop[MMWLAN_MAC_ADDR_LEN];
+        struct umac_sta_data *nh_stad = umac_mesh_get_peer_stad(g->dest);
+        if (nh_stad != NULL)
+        {
+            mac_addr_copy(next_hop, g->dest);
+        }
+        else if (umac_mesh_lookup_next_hop(g->dest, next_hop))
+        {
+            nh_stad = umac_mesh_get_peer_stad(next_hop);
+        }
+        if (nh_stad == NULL)
+        {
+            continue; /* no usable path to this gate — try the next one */
+        }
+        /* prepare_for_gate: the AE_A5_A6 frame via the gate. */
+        struct mesh_forward_params p = { .mesh_da = g->dest,
+                                         .mesh_sa = mesh_ctx.mesh_mac,
+                                         .seqnum = umac_mesh_next_seqnum(),
+                                         .payload = payload,
+                                         .payload_len = payload_len,
+                                         .ae = true };
+        mac_addr_copy(p.next_hop, next_hop);
+        mac_addr_copy(p.eaddr1, final_dst); /* addr5 — final off-mesh DA */
+        mac_addr_copy(p.eaddr2, src);       /* addr6 — original source   */
+
+        struct umac_data *umacd = umac_data_get_umacd();
+#if MESH_FWD_DATA_AGGREGATE
+        struct mmpkt *frame = build_mesh_data_frame(umacd, umac_mesh_build_forward, &p, MESH_FWD_TID);
+#else
+        struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_forward, &p);
+#endif
+        if (frame == NULL)
+        {
+            continue;
+        }
+        mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
+        (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
+        sent = true;
+        MMLOG_INF("MESH send_to_gates: " MM_MAC_ADDR_FMT " -> gate " MM_MAC_ADDR_FMT " (final DA "
+                  MM_MAC_ADDR_FMT ")\n", MM_MAC_ADDR_VAL(src), MM_MAC_ADDR_VAL(g->dest),
+                  MM_MAC_ADDR_VAL(final_dst));
+    }
+    return sent;
+}
+
+/* S5c — inject a PROXIED 6-address (AE_A5_A6) mesh data frame originated by this node on behalf of an
+ * off-mesh source `src` (e.g. an AP client behind a gate), toward `final_dst`. Resolves where to send:
+ *   1. final_dst is itself a reachable mesh node (direct peer or an HWMP path)  -> mesh DA = final_dst;
+ *   2. final_dst is an off-mesh host learned via MPP (behind another gate)      -> mesh DA = the proxy node;
+ *   3. otherwise                                                                -> send_to_gates fallback.
+ * eaddr1 = final_dst (the ultimate DA), eaddr2 = src (the proxied source), mesh SA = us. The AP->mesh leg
+ * of the gate L2 bridge (net/mac80211: the gate xmits the AP client's frame into the mesh with AE). */
+bool mmwlan_mesh_tx_proxied(const uint8_t *final_dst, const uint8_t *src, const uint8_t *payload,
+                            uint32_t payload_len)
+{
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL || !g_mesh_multihop)
+    {
+        return false;
+    }
+    uint8_t mesh_da[MMWLAN_MAC_ADDR_LEN];
+    uint8_t next_hop[MMWLAN_MAC_ADDR_LEN];
+    struct umac_sta_data *nh_stad = NULL;
+
+    /* 1/2. final_dst directly, else its MPP proxy — resolve the mesh DA + a next-hop peer stad. */
+    const uint8_t *want = final_dst;
+    uint8_t mpp[MMWLAN_MAC_ADDR_LEN];
+    for (int attempt = 0; attempt < 2 && nh_stad == NULL; attempt++)
+    {
+        struct umac_sta_data *peer = umac_mesh_get_peer_stad(want);
+        if (peer != NULL)
+        {
+            mac_addr_copy(mesh_da, want);
+            mac_addr_copy(next_hop, want);
+            nh_stad = peer;
+        }
+        else if (umac_mesh_lookup_next_hop(want, next_hop))
+        {
+            mac_addr_copy(mesh_da, want);
+            nh_stad = umac_mesh_get_peer_stad(next_hop);
+        }
+        if (nh_stad == NULL && attempt == 0 && mmwlan_mesh_mpp_lookup(final_dst, mpp))
+        {
+            want = mpp; /* final_dst is off-mesh behind a gate — aim at its proxy node next iteration */
+        }
+        else if (nh_stad == NULL)
+        {
+            break;
+        }
+    }
+    if (nh_stad == NULL)
+    {
+        /* 3. no direct/MPP route — fall back to the discovered gates. */
+        return mmwlan_mesh_send_to_gates(final_dst, src, payload, payload_len);
+    }
+
+    struct mesh_forward_params p = { .mesh_da = mesh_da,
+                                     .mesh_sa = mesh_ctx.mesh_mac,
+                                     .seqnum = umac_mesh_next_seqnum(),
+                                     .payload = payload,
+                                     .payload_len = payload_len,
+                                     .ae = true };
+    mac_addr_copy(p.next_hop, next_hop);
+    mac_addr_copy(p.eaddr1, final_dst); /* addr5 — the ultimate DA */
+    mac_addr_copy(p.eaddr2, src);       /* addr6 — the proxied source (AP client) */
+
+    struct umac_data *umacd = umac_data_get_umacd();
+#if MESH_FWD_DATA_AGGREGATE
+    struct mmpkt *frame = build_mesh_data_frame(umacd, umac_mesh_build_forward, &p, MESH_FWD_TID);
+#else
+    struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_forward, &p);
+#endif
+    if (frame == NULL)
+    {
+        return false;
+    }
+    mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
+    (void)umac_datapath_tx_mesh_unicast_frame(nh_stad, frame);
+    MMLOG_INF("MESH tx_proxied: " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT " via " MM_MAC_ADDR_FMT "\n",
+              MM_MAC_ADDR_VAL(src), MM_MAC_ADDR_VAL(final_dst), MM_MAC_ADDR_VAL(mesh_da));
     return true;
 }
 
@@ -2692,6 +3301,8 @@ struct mesh_rebcast_params
     const uint8_t *mesh_sa;
     uint8_t ttl;
     uint32_t seqnum;
+    bool ae_a4;              /* proxied multicast: preserve eaddr1 (MESH_FLAGS_AE_A4) in the re-broadcast */
+    const uint8_t *eaddr1;   /* proxied off-mesh source (valid iff ae_a4) */
     const uint8_t *payload;
     uint32_t payload_len;
 };
@@ -2717,14 +3328,21 @@ static void umac_mesh_build_rebcast(struct umac_data *umacd, struct consbuf *buf
      * acked (matches mac80211's QoS ack policy for multicast RA). */
     uint16_t qos = htole16(0x0100u | 0x0020u);
     consbuf_append(buf, (const uint8_t *)&qos, sizeof(qos));
-    const uint8_t mc[6] = { 0, (uint8_t)(p->ttl - 1), (uint8_t)p->seqnum, (uint8_t)(p->seqnum >> 8),
+    /* A proxied multicast (AE_A4) keeps flags=0x01 + eaddr1 through every hop (== net/mac80211, which
+     * forwards the mesh header verbatim); a plain group frame stays non-AE (byte-identical to before). */
+    const uint8_t flags = p->ae_a4 ? 0x01u : 0x00u;
+    const uint8_t mc[6] = { flags, (uint8_t)(p->ttl - 1), (uint8_t)p->seqnum, (uint8_t)(p->seqnum >> 8),
                             (uint8_t)(p->seqnum >> 16), (uint8_t)(p->seqnum >> 24) };
     consbuf_append(buf, mc, sizeof(mc));
+    if (p->ae_a4)
+    {
+        consbuf_append(buf, p->eaddr1, MMWLAN_MAC_ADDR_LEN);
+    }
     consbuf_append(buf, p->payload, p->payload_len);
 }
 
-bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t seqnum,
-                                 const uint8_t *payload, uint32_t payload_len)
+bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t seqnum, bool ae_a4,
+                                 const uint8_t *eaddr1, const uint8_t *payload, uint32_t payload_len)
 {
     if (!mesh_ctx.active)
     {
@@ -2741,10 +3359,11 @@ bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t s
     if (g_mesh_multihop && ttl > 1 && mesh_ctx.common_stad != NULL)
     {
         /* Leaf mode: deliver this group frame locally (we still return false below) but do NOT
-         * re-broadcast it onward — a leaf carries no one else's multicast either. */
+         * re-broadcast it onward — a leaf carries no one else's multicast either. A proxied multicast
+         * (ae_a4) is re-broadcast with eaddr1 preserved so downstream nodes still learn the source. */
         struct mesh_rebcast_params p = {
-            .mesh_sa = mesh_sa, .ttl = ttl, .seqnum = seqnum, .payload = payload,
-            .payload_len = payload_len
+            .mesh_sa = mesh_sa, .ttl = ttl, .seqnum = seqnum, .ae_a4 = ae_a4, .eaddr1 = eaddr1,
+            .payload = payload, .payload_len = payload_len
         };
         struct umac_data *umacd = umac_data_get_umacd();
         struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_rebcast, &p);
@@ -2758,6 +3377,69 @@ bool umac_mesh_handle_group_data(const uint8_t *mesh_sa, uint8_t ttl, uint32_t s
         }
     }
     return false; /* fresh — deliver locally too */
+}
+
+/* S5 (broadcast bridging) — build a gate-ORIGINATED proxied multicast frame: a group-addressed AE_A4 data
+ * frame (mesh DA = broadcast, mesh SA = us, Mesh Control flags=0x01 + eaddr1 = the off-mesh source). Same
+ * 3-address group shape as umac_mesh_build_rebcast but originated (fresh seqnum, full TTL) with AE. */
+struct mesh_group_proxied_params
+{
+    const uint8_t *eaddr1;   /* proxied off-mesh source (addr for AE_A4) */
+    uint32_t seqnum;
+    const uint8_t *payload;  /* LLC/SNAP + L3 */
+    uint32_t payload_len;
+};
+
+static void umac_mesh_build_group_proxied(struct umac_data *umacd, struct consbuf *buf, void *params)
+{
+    (void)umacd;
+    const struct mesh_group_proxied_params *p = (const struct mesh_group_proxied_params *)params;
+
+    struct dot11_hdr *hdr = (struct dot11_hdr *)consbuf_reserve(buf, sizeof(*hdr));
+    if (hdr)
+    {
+        memset(hdr, 0, sizeof(*hdr));
+        uint16_t fc = ((uint16_t)DOT11_FC_TYPE_DATA << DOT11_SHIFT_FC_TYPE) |
+                      ((uint16_t)DOT11_FC_SUBTYPE_QOS_DATA << DOT11_SHIFT_FC_SUBTYPE) |
+                      (uint16_t)DOT11_MASK_FC_FROM_DS; /* group: 3-address, fromDS */
+        hdr->frame_control = htole16(fc);
+        mac_addr_copy(hdr->addr1, mac_addr_broadcast);   /* DA = broadcast */
+        mac_addr_copy(hdr->addr2, mesh_ctx.mesh_mac);    /* TA = us */
+        mac_addr_copy(hdr->addr3, mesh_ctx.mesh_mac);    /* mesh SA = us (the originating gate) */
+    }
+    uint16_t qos = htole16(0x0100u | 0x0020u); /* Mesh Control Present + No Ack (group) */
+    consbuf_append(buf, (const uint8_t *)&qos, sizeof(qos));
+    /* AE_A4 Mesh Control: flags=0x01, ttl (full, we originate), seqnum, then eaddr1 (proxied source). */
+    const uint8_t mc[6] = { 0x01u, HWMP_ELEMENT_TTL, (uint8_t)p->seqnum, (uint8_t)(p->seqnum >> 8),
+                            (uint8_t)(p->seqnum >> 16), (uint8_t)(p->seqnum >> 24) };
+    consbuf_append(buf, mc, sizeof(mc));
+    consbuf_append(buf, p->eaddr1, MMWLAN_MAC_ADDR_LEN); /* proxied off-mesh source */
+    consbuf_append(buf, p->payload, p->payload_len);
+}
+
+bool mmwlan_mesh_tx_group_proxied(const uint8_t *src, const uint8_t *payload, uint32_t payload_len)
+{
+    if (!mesh_ctx.active || mesh_ctx.common_stad == NULL)
+    {
+        return false;
+    }
+    struct mesh_group_proxied_params p = { .eaddr1 = src,
+                                           .seqnum = umac_mesh_next_seqnum(),
+                                           .payload = payload,
+                                           .payload_len = payload_len };
+    struct umac_data *umacd = umac_data_get_umacd();
+    /* Group frames go out on the mgmt build path (never A-MPDU'd) + are CCMP-encrypted under our own
+     * MGTK by umac_datapath_tx_mesh_group_frame (the common/MBSS stad), exactly like a re-broadcast. */
+    struct mmpkt *frame = build_mgmt_frame(umacd, umac_mesh_build_group_proxied, &p);
+    if (frame == NULL)
+    {
+        return false;
+    }
+    mmdrv_get_tx_metadata(frame)->vif_id = mesh_ctx.vif_id;
+    (void)umac_datapath_tx_mesh_group_frame(mesh_ctx.common_stad, frame);
+    MMLOG_INF("MESH tx_group_proxied: src " MM_MAC_ADDR_FMT " %u B\n", MM_MAC_ADDR_VAL(src),
+              (unsigned)payload_len);
+    return true;
 }
 
 void umac_mesh_handle_action(struct umac_data *umacd, struct mmpktview *rxbufview)
@@ -3135,6 +3817,7 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
     memset(&mesh_ctx, 0, sizeof(mesh_ctx));
     memset(mesh_peers, 0, sizeof(mesh_peers)); /* fresh peer table for this MBSS */
     mesh_path_tbl_reset(); /* fresh HWMP path table (NILs the hash buckets — not a bare memset) */
+    memset(mpp_paths, 0, sizeof(mpp_paths));   /* S4: fresh MPP (proxied-host) table for this MBSS */
     memset(mesh_rmc, 0, sizeof(mesh_rmc));     /* fresh duplicate cache */
     mesh_ctx.vif_id = vif_id;
     /* The mesh vif's MAC = the address it was created with: the app's if_addr, or the
@@ -3194,6 +3877,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
      * while the mesh is active; serves Open/Confirm retransmits so handshakes reach ESTAB. */
     (void)umac_core_register_timeout(umacd, MESH_PLINK_RETRY_INTERVAL_MS, umac_mesh_plink_tick,
                                      umacd, NULL);
+
+    /* Start the proactive-root (RANN) tick (ieee80211_mesh_path_root_timer equivalent). Always armed;
+     * emits nothing unless root/gate mode is enabled via mmwlan_mesh_set_root_announcements. */
+    (void)umac_core_register_timeout(umacd, g_mesh_rann_interval_ms, umac_mesh_rann_tick, umacd, NULL);
 
     /* BSS_BEACON_CONFIG(enable) — morse_driver sends this on BSS_CHANGED_BEACON_ENABLED,
      * alongside the mesh config. Periodic beaconing itself is started by MESH_CONFIG(START)
@@ -3271,6 +3958,7 @@ enum mmwlan_status mmwlan_mesh_stop(void)
 
     struct umac_data *umacd = umac_data_get_umacd();
     (void)umac_core_cancel_timeout(umacd, umac_mesh_plink_tick, umacd, NULL);
+    (void)umac_core_cancel_timeout(umacd, umac_mesh_rann_tick, umacd, NULL);
     (void)mmdrv_cfg_mesh(mesh_ctx.vif_id, false, false); /* MESH_CONFIG(STOP) */
     mesh_ctx.active = false;
     /* Free per-peer stads so they don't leak across stop/start (start re-memsets mesh_peers). */
