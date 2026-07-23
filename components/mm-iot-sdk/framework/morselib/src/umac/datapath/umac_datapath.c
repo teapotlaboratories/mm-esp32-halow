@@ -859,6 +859,12 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
      * (mirrors net/mac80211): base 6 (flags, ttl, seqnum), +6 for AE_A4, +12 for AE_A5_A6. */
     uint8_t mesh_ttl = 0;
     uint32_t mesh_seqnum = 0;
+    /* S4c — carry the proxied endpoints of an AE_A5_A6 frame to the relay branch below, so a relayed
+     * proxied frame keeps eaddr1/eaddr2 (a multi-hop gate would otherwise lose them). */
+    bool rx_ae = false;      /* AE_A5_A6 (unicast, 6-addr): eaddr1 = final DA, eaddr2 = original SA */
+    bool rx_ae_a4 = false;   /* AE_A4 (multicast, proxied group): eaddr1 = original off-mesh source */
+    uint8_t rx_eaddr1[MMWLAN_MAC_ADDR_LEN] = { 0 };
+    uint8_t rx_eaddr2[MMWLAN_MAC_ADDR_LEN] = { 0 };
     if (mesh_ctrl_present)
     {
         const uint8_t *mctrl = (const uint8_t *)mmpkt_get_data_start(rxbufview);
@@ -872,13 +878,58 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             if (ae == 0x01u)
             {
                 mctrl_len += 6;
+                /* S5 broadcast bridging — AE_A4 (net/mac80211 multicast Address-Extension): eaddr1
+                 * (mctrl[6..11]) = the proxied off-mesh SOURCE. Learn mpp(eaddr1 -> mesh_sa) so a reply
+                 * to that source routes back via this originator, and deliver the frame locally as
+                 * [dst=group][src=eaddr1] (RX-deliver below). Bounds-checked against the view. */
+                if (mmpkt_get_data_length(rxbufview) >= mctrl_len)
+                {
+                    rx_ae_a4 = true;
+                    memcpy(rx_eaddr1, &mctrl[6], MMWLAN_MAC_ADDR_LEN);
+                    umac_mesh_mpp_learn(&mctrl[6], dot11_get_sa_data(data_hdr));
+                }
             }
             else if (ae == 0x02u)
             {
                 mctrl_len += 12;
+                /* S3 — 6-address Address Extension (net/mac80211 ieee80211_rx_mesh_data): EXTRACT the
+                 * proxied endpoints instead of discarding them. eaddr1 (mctrl[6..11]) = final DA (addr5),
+                 * eaddr2 (mctrl[12..17]) = original SA (addr6, the off-mesh host). S4 will use eaddr2 for
+                 * MPP learning (mpp_path_add(eaddr2, mesh_sa)) + eaddr1 for proxied delivery; S3 proves the
+                 * parse. Bounds-checked against the view so a truncated AE frame can't over-read. */
+                if (mmpkt_get_data_length(rxbufview) >= mctrl_len)
+                {
+                    MMLOG_INF("MESH AE rx: eaddr1(DA)=" MM_MAC_ADDR_FMT " eaddr2(SA)=" MM_MAC_ADDR_FMT
+                              "\n", MM_MAC_ADDR_VAL(&mctrl[6]), MM_MAC_ADDR_VAL(&mctrl[12]));
+                    /* Record for the S3 probe accessor (MMLOG above isn't on the ESP UART). */
+                    umac_mesh_note_ae_rx(&mctrl[6], &mctrl[12]);
+                    /* S4 — MPP learning (net/mac80211 mpp_path_add on AE RX, rx.c:2889): the off-mesh
+                     * source eaddr2 is reachable via this frame's mesh SA (addr4). Proxied delivery to
+                     * eaddr1 (the final DA) is wired in S5 (the gate L2 bridge). */
+                    umac_mesh_mpp_learn(&mctrl[12], dot11_get_sa_data(data_hdr));
+                    /* S4c — capture the endpoints so the relay branch can re-emit AE (multi-hop gates). */
+                    rx_ae = true;
+                    memcpy(rx_eaddr1, &mctrl[6], MMWLAN_MAC_ADDR_LEN);
+                    memcpy(rx_eaddr2, &mctrl[12], MMWLAN_MAC_ADDR_LEN);
+                }
             }
         }
         (void)mmpkt_remove_from_start(rxbufview, mctrl_len);
+        /* S5 — hand the proxied AE frame's endpoints + payload to the app (the gate delivers it to its AP
+         * side, addressed to eaddr1). The buffer is now [LLC/SNAP][L3] after the strip; the mesh RX ext-cb
+         * downstream can't recover eaddr1/eaddr2. Notification only — the relay/delivery below is unchanged. */
+        if (rx_ae)
+        {
+            /* S5 finishing touch — if the app cb CONSUMED the frame (a gate that injected it onto its AP
+             * side, S5b), skip the normal local delivery below to avoid a double-delivery (the gate's own
+             * mesh netif would otherwise also see it + spuriously ip_forward it). A plain endpoint node
+             * registers no cb / returns false, so its local delivery (RX-deliver-eaddrs) is unaffected. */
+            if (umac_mesh_ae_rx_deliver(rx_eaddr1, rx_eaddr2, mmpkt_get_data_start(rxbufview),
+                                        mmpkt_get_data_length(rxbufview)))
+            {
+                goto drop;
+            }
+        }
     }
 
     /* MESH forwarding (ESP as an intermediate hop). The buffer is now [LLC/SNAP][payload].
@@ -891,7 +942,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         const uint8_t *mesh_sa = dot11_get_sa_data(data_hdr);
         if (mm_mac_addr_is_multicast(mesh_da))
         {
-            if (umac_mesh_handle_group_data(mesh_sa, mesh_ttl, mesh_seqnum,
+            if (umac_mesh_handle_group_data(mesh_sa, mesh_ttl, mesh_seqnum, rx_ae_a4, rx_eaddr1,
                                             mmpkt_get_data_start(rxbufview),
                                             mmpkt_get_data_length(rxbufview)))
             {
@@ -901,9 +952,12 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         else if (!umac_interface_addr_matches_mac_addr(stad, mesh_da))
         {
-            MMLOG_INF("MESH relay " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT "\n",
-                      MM_MAC_ADDR_VAL(mesh_sa), MM_MAC_ADDR_VAL(mesh_da));
-            (void)umac_mesh_forward_data(mesh_da, mesh_sa, mmpkt_get_data_start(rxbufview),
+            MMLOG_INF("MESH relay%s " MM_MAC_ADDR_FMT " -> " MM_MAC_ADDR_FMT "\n",
+                      rx_ae ? " (AE)" : "", MM_MAC_ADDR_VAL(mesh_sa), MM_MAC_ADDR_VAL(mesh_da));
+            /* S4c — a relayed AE_A5_A6 frame is re-emitted AE (eaddr1/eaddr2 preserved) so a multi-hop
+             * gate keeps the proxied endpoints; a plain frame relays non-AE as before. */
+            (void)umac_mesh_forward_data(mesh_da, mesh_sa, rx_ae, rx_eaddr1, rx_eaddr2,
+                                         mmpkt_get_data_start(rxbufview),
                                          mmpkt_get_data_length(rxbufview));
             goto drop;
         }
@@ -936,11 +990,33 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     }
 
 
+    /* S5c round-trip — for a proxied AE_A5_A6 frame delivered to the LOCAL stack, the 802.3 header must
+     * carry the PROXIED endpoints (dst=eaddr1, src=eaddr2), so the stack sees the frame as from the real
+     * off-mesh source (e.g. an AP client behind a gate) and replies to IT, not to the mesh forwarder/gate.
+     * Mirrors net/mac80211 ieee80211_strip_8023_mesh_hdr. GATED on eaddr1==us ("we are the true final
+     * endpoint"): a GATE proxying for an off-mesh client has mesh_da(addr3)==us but eaddr1=client!=us and
+     * also reaches this line (its relay branch doesn't fire) — it MUST keep the [dst=addr3][src=addr4]
+     * header (its mesh->AP delivery is the separate S5b hook; rewriting would disturb its ip_forward path).
+     * Non-AE frames keep the mesh DA/SA. (relayed AE frames already `goto drop` above and never reach here.) */
+    bool deliver_ae = rx_ae && umac_interface_addr_matches_mac_addr(stad, rx_eaddr1);
     struct umac_8023_hdr header_8023 = { 0 };
-    umac_datapath_generate_8023_header(dot11_get_da(header),
-                                       dot11_get_sa_data(data_hdr),
-                                       llc_ethertype,
-                                       &header_8023);
+    if (deliver_ae)
+    {
+        /* AE_A5_A6 unicast, we are the final endpoint: [dst=eaddr1][src=eaddr2]. */
+        umac_datapath_generate_8023_header(rx_eaddr1, rx_eaddr2, llc_ethertype, &header_8023);
+    }
+    else if (rx_ae_a4)
+    {
+        /* AE_A4 proxied multicast: keep the group DA, take the SRC from eaddr1 (the real off-mesh source)
+         * == net/mac80211 ieee80211_strip_8023_mesh_hdr (h_source=eaddr1, h_dest unchanged). So a node's
+         * stack sees an AP client's broadcast (e.g. ARP) as [dst=broadcast][src=client] and can reply. */
+        umac_datapath_generate_8023_header(dot11_get_da(header), rx_eaddr1, llc_ethertype, &header_8023);
+    }
+    else
+    {
+        umac_datapath_generate_8023_header(dot11_get_da(header), dot11_get_sa_data(data_hdr),
+                                           llc_ethertype, &header_8023);
+    }
 
     mmwlan_rx_pkt_ext_cb_t rx_pkt_cb;
     void *arg = NULL;
@@ -2203,7 +2279,39 @@ static void umac_datapath_aggr_check(struct umac_data *umacd,
  * transmitted RA=destination (only correct for a direct peer; for a multi-hop-only dest it wastes airtime
  * on an unreachable RA + loses first packets). EAPOL (peering) and group/multicast are never dropped here.
  * Side effect: kicks (rate-limited) path discovery when it returns true, so subsequent frames resolve. */
-static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h8023, bool is_eapol)
+/* S5c round-trip — a mesh node's own unicast to a dst with no mesh path but that is a KNOWN off-mesh host
+ * (in the MPP table, i.e. reachable via a gate) is PROXIED into the mesh as an AE frame toward its gate,
+ * instead of being dropped: eaddr1 = the dst (off-mesh), eaddr2 = us (the source). The frame is
+ * [802.3 hdr][L3]; re-encapsulate the L3 as [LLC/SNAP][L3] for mmwlan_mesh_tx_proxied. Only fires for an
+ * MPP-known dst — a plain (undiscovered) mesh dst is NOT proxied (it falls through to discovery). */
+static bool umac_datapath_mesh_proxy_offmesh(const struct umac_8023_hdr *h8023, struct mmpktview *txbufview)
+{
+    if (txbufview == NULL || !mmwlan_mesh_mpp_lookup(h8023->dest_addr, NULL))
+    {
+        return false; /* not a known off-mesh host — let discovery handle it (it may be a mesh node) */
+    }
+    const uint8_t *frame = (const uint8_t *)mmpkt_get_data_start(txbufview);
+    uint32_t flen = mmpkt_get_data_length(txbufview);
+    if (frame == NULL || flen < sizeof(struct umac_8023_hdr))
+    {
+        return false;
+    }
+    uint32_t l3 = flen - sizeof(struct umac_8023_hdr);
+    static uint8_t snap_l3[sizeof(snap_802_1h) + 2 + 1514];
+    if (l3 > sizeof(snap_l3) - sizeof(snap_802_1h) - 2)
+    {
+        return false;
+    }
+    memcpy(snap_l3, snap_802_1h, sizeof(snap_802_1h)); /* aa aa 03 00 00 00 */
+    snap_l3[6] = frame[12];                             /* ethertype (BE) from the 802.3 header */
+    snap_l3[7] = frame[13];
+    memcpy(snap_l3 + 8, frame + sizeof(struct umac_8023_hdr), l3);
+    /* final_dst = the 802.3 dst (the off-mesh host); src = the 802.3 src (us). */
+    return mmwlan_mesh_tx_proxied(frame, frame + DOT11_MAC_ADDR_LEN, snap_l3, 8 + l3);
+}
+
+static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h8023, bool is_eapol,
+                                                   struct mmpktview *txbufview)
 {
     if (is_eapol || mm_mac_addr_is_multicast(h8023->dest_addr))
     {
@@ -2217,6 +2325,12 @@ static bool umac_datapath_mesh_frame_undeliverable(const struct umac_8023_hdr *h
     if (umac_mesh_get_peer_stad(h8023->dest_addr) != NULL)
     {
         return false; /* dest is a direct peer -> RA=dest is correct (single-hop, no path needed) */
+    }
+    /* S5c — no mesh path. If the dst is a known off-mesh host (MPP), proxy it via the gate (re-sent as an
+     * AE frame); the original is dropped either way. Otherwise kick discovery (it may be a mesh node). */
+    if (umac_datapath_mesh_proxy_offmesh(h8023, txbufview))
+    {
+        return true; /* proxied -> drop the original (already re-originated as AE) */
     }
     umac_mesh_start_discovery(h8023->dest_addr);
     return true;
@@ -2264,7 +2378,7 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
      * the Mesh Control insertion, next-hop keying, BA session and SW-CCMP paths below all key off
      * it (replaces the old global umac_mesh_is_active() / gateway test). */
     const bool tx_is_mesh_frame = (datapath_ops == umac_datapath_ops_mesh);
-    if (tx_is_mesh_frame && umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol))
+    if (tx_is_mesh_frame && umac_datapath_mesh_frame_undeliverable(header_8023, is_eapol, txbufview))
     {
         /* D1: dropped pending HWMP path discovery; counted like any other TX drop. SUCCESS (not
          * ERROR): the frame is deliberately consumed while discovery is in flight, not a failure
