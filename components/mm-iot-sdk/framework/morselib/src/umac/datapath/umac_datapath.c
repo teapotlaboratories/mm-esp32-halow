@@ -2297,6 +2297,11 @@ static bool umac_datapath_mesh_proxy_offmesh(const struct umac_8023_hdr *h8023, 
         return false;
     }
     uint32_t l3 = flen - sizeof(struct umac_8023_hdr);
+    /* Scratch to prepend an 8-byte LLC/SNAP to the L3 before mmwlan_mesh_tx_proxied copies it. It is
+     * `static` (not a ~1.5 KB stack frame) and safe because umac_datapath_process_tx_frame runs only on the
+     * single umac datapath context — the same single-event-loop, no-concurrent-writers invariant the mesh
+     * path/RMC/MPP tables rely on. It is written then consumed synchronously within this call, so it is not
+     * a persistent global. If TX is ever driven from a second context this must become per-call. */
     static uint8_t snap_l3[sizeof(snap_802_1h) + 2 + 1514];
     if (l3 > sizeof(snap_l3) - sizeof(snap_802_1h) - 2)
     {
