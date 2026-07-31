@@ -426,10 +426,10 @@ void umac_ap_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *pa
      * (page 0, AID 1..), 1F=end_aid>>3. It is byte-identical to what the reference AP transmits.
      *
      * This is a feasibility probe, not a RAW implementation: the schedule is these constant bytes
-     * and nothing enforces or updates them, which is why it is compile-gated to the one fixture
-     * that asks for it (firmware/test-raw-rps). umac_ap_build_beacon is shared morselib and 27 apps
-     * build the AP path, so an unguarded splice would put a RAW advertisement on air from every one
-     * of them. The append is unconditional and fixed-size, so the sizing pass and the write pass of
+     * and nothing enforces or updates them, which is why it is compile-gated -- only a build that
+     * defines RIMBA_RAW_S0B_SPIKE arms it. umac_ap_build_beacon is shared morselib, so without the
+     * guard every application that starts an AP vif would put a RAW advertisement on air.
+     * The append is unconditional and fixed-size, so the sizing pass and the write pass of
      * build_frame_with_class() agree by construction -- a pass-1/pass-2 disagreement here would be
      * a hard hang on the MMOSAL_ASSERT in consbuf_append. */
     static const uint8_t k_rps_golden[8] = { 0xD0, 0x06, 0x20, 0x40, 0x09, 0x04, 0xE0, 0x1F };
