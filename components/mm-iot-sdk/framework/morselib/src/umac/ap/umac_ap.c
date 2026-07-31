@@ -416,6 +416,25 @@ void umac_ap_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *pa
                      data->config.dtim_period,
                      *traffic_indicator,
                      data->bitmap);
+#ifdef RIMBA_RAW_S0B_SPIKE
+    /* S0b-4 spike: a fixed RPS element (EID 208), spliced directly after the TIM because that is
+     * where Linux puts it -- 236/236 hostapd_s1g beacons captured on the bench carried the IE chain
+     * [213, 5, 208, 217, 232, 214, 0, 221], RPS immediately following TIM. Every octet is the
+     * morse_driver raw.c encoder's output for one GENERIC assignment, start_aid=1, end_aid=255,
+     * format 0, num_slots=2, slot_duration=10100 us: D0=EID 208, 06=length, 20=RAW Control with
+     * GROUP_IND, 40 09=slot definition (cslot 80 -> 500+9600 us, 2 slots), 04 E0=RAW group
+     * (page 0, AID 1..), 1F=end_aid>>3. It is byte-identical to what the reference AP transmits.
+     *
+     * This is a feasibility probe, not a RAW implementation: the schedule is these constant bytes
+     * and nothing enforces or updates them, which is why it is compile-gated to the one fixture
+     * that asks for it (firmware/test-raw-rps). umac_ap_build_beacon is shared morselib and 27 apps
+     * build the AP path, so an unguarded splice would put a RAW advertisement on air from every one
+     * of them. The append is unconditional and fixed-size, so the sizing pass and the write pass of
+     * build_frame_with_class() agree by construction -- a pass-1/pass-2 disagreement here would be
+     * a hard hang on the MMOSAL_ASSERT in consbuf_append. */
+    static const uint8_t k_rps_golden[8] = { 0xD0, 0x06, 0x20, 0x40, 0x09, 0x04, 0xE0, 0x1F };
+    consbuf_append(buf, k_rps_golden, sizeof(k_rps_golden));
+#endif
     consbuf_append(buf, data->config.tail, data->config.tail_len);
 }
 
