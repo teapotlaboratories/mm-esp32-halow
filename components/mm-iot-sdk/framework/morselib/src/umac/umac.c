@@ -1655,9 +1655,11 @@ int mmwlan_twt_agreement_installed(uint16_t flow_id)
  * aggregation eligibility gate reads at umac_datapath.c via MORSE_CAP_SUPPORTED(..., AMPDU) -- so a
  * stack bump that silently closes that gate fails the check. Used by firmware/test-ampdu-cap. The
  * name matches the mmwlan* glob in protected_syms.txt, so it is exported unmangled.
- * NB: per-vif capabilities are fetched at interface-add time (mmdrv_get_capabilities in
- * umac_interface_add), so this reads 0 until a vif is up -- call it AFTER mmwlan_mesh_start. Returns:
- *    1  FW advertises AMPDU for the active vif
+ * NB: the capabilities are DEVICE-GLOBAL, not per-vif -- mmdrv_get_capabilities() is called with
+ * MMDRV_VIF_ID_INVALID (umac_interface.c) and umac_interface_get_capabilities() takes the global
+ * umac_data. They are fetched during the first interface-add, so this reads 0 until *some* vif is up
+ * -- call it AFTER mmwlan_mesh_start -- but that vif need not be a mesh one. Returns:
+ *    1  FW advertises AMPDU
  *    0  FW does not advertise AMPDU (or no vif has been added yet)
  *   -1  morselib not initialised */
 int mmwlan_ampdu_capability_advertised(void)
@@ -1671,8 +1673,8 @@ int mmwlan_ampdu_capability_advertised(void)
 }
 
 /* Public accessors for the firmware's advertised RAW / page-slicing capabilities -- S0a of the RAW
- * AP-side feasibility spike (docs/design-specification/rimba-raw-apside-design.md §6). RAW's whole
- * viability rests on whether the MM6108 blob enforces Restricted Access Window slots at all, and
+ * AP-side feasibility spike (see rimba-raw-apside-design.md in the superproject). RAW's whole
+ * viability rests on whether the MM6108 blob acts on a Restricted Access Window schedule at all, and
  * these are the cheapest signal: one board, no sniffer, no Linux reference.
  *
  * mmprobe_dump_fw_caps() (driver.c) already prints the raw flags[] words, but undecoded and via
@@ -1684,10 +1686,15 @@ int mmwlan_ampdu_capability_advertised(void)
  * umac_data. The fetch happens during the first interface-add, so this reads 0 until *some* vif is
  * up -- but that vif need not be an AP.
  *
- * WHAT A SET BIT DOES NOT MEAN: the flag says the blob claims the feature; it carries no direction.
- * STA-side RAW is already known to work, so a set bit does NOT establish that AP-direction
- * enforcement is present -- that stays an on-air question (S0b Q3). A CLEAR bit is the decisive
- * outcome, being strong evidence RAW is absent from the shipped image.
+ * WHAT A SET BIT DOES NOT MEAN: the flag says the blob claims the feature; it carries no direction,
+ * so it does NOT by itself establish that the chip acts on an AP-authored schedule. That is an
+ * on-air question, and it is deliberately NOT what this read answers. A CLEAR bit is the decisive
+ * outcome here, being strong evidence RAW is absent from the shipped image.
+ *
+ * Do not read "enforcement" into RAW: 802.11ah has no AP primitive that polices peers -- a STA
+ * restricts ITSELF on parsing the RPS, and the chip's own RAW counters only ever count the local
+ * transmitter deferring its own frames. A test written against AP-policing reports failure for a
+ * feature that works.
  *    1  FW advertises the capability
  *    0  FW does not advertise it (or no vif has been added yet)
  *   -1  morselib not initialised */
