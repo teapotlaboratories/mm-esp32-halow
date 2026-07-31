@@ -1670,6 +1670,50 @@ int mmwlan_ampdu_capability_advertised(void)
     return MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), AMPDU) ? 1 : 0;
 }
 
+/* Public accessors for the firmware's advertised RAW / page-slicing capabilities -- S0a of the RAW
+ * AP-side feasibility spike (docs/design-specification/rimba-raw-apside-design.md §6). RAW's whole
+ * viability rests on whether the MM6108 blob enforces Restricted Access Window slots at all, and
+ * these are the cheapest signal: one board, no sniffer, no Linux reference.
+ *
+ * mmprobe_dump_fw_caps() (driver.c) already prints the raw flags[] words, but undecoded and via
+ * MMLOG, which does not reliably reach the ESP console -- hence a named accessor, matching the
+ * mmwlan* glob in protected_syms.txt so it is exported unmangled. Used by firmware/test-raw-cap.
+ *
+ * NB the capabilities are DEVICE-GLOBAL, not per-vif: mmdrv_get_capabilities() is called with
+ * MMDRV_VIF_ID_INVALID (umac_interface.c) and umac_interface_get_capabilities() takes the global
+ * umac_data. The fetch happens during the first interface-add, so this reads 0 until *some* vif is
+ * up -- but that vif need not be an AP.
+ *
+ * WHAT A SET BIT DOES NOT MEAN: the flag says the blob claims the feature; it carries no direction.
+ * STA-side RAW is already known to work, so a set bit does NOT establish that AP-direction
+ * enforcement is present -- that stays an on-air question (S0b Q3). A CLEAR bit is the decisive
+ * outcome, being strong evidence RAW is absent from the shipped image.
+ *    1  FW advertises the capability
+ *    0  FW does not advertise it (or no vif has been added yet)
+ *   -1  morselib not initialised */
+int mmwlan_raw_capability_advertised(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return -1;
+    }
+    return MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), RAW) ? 1 : 0;
+}
+
+/* Companion to mmwlan_raw_capability_advertised(). Page slicing is orthogonal to RAW and separately
+ * portable, but it is read in the same probe because it costs nothing and its presence or absence is
+ * a useful cross-check on how complete the blob's S1G feature set is. */
+int mmwlan_page_slicing_capability_advertised(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return -1;
+    }
+    return MORSE_CAP_SUPPORTED(umac_interface_get_capabilities(umacd), PAGE_SLICING) ? 1 : 0;
+}
+
 enum mmwlan_status mmwlan_twt_teardown(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
