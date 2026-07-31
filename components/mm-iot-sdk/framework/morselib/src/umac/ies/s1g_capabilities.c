@@ -273,11 +273,24 @@ void ie_s1g_capabilities_build_ap(struct umac_data *umacd, struct consbuf *buf)
         }
 
 
+#ifdef RIMBA_RAW_S0B_SPIKE
+        /* S0b-3 spike: advertise RAW Operation Support. Linux treats this bit as LIVE STATE, not a
+         * static capability -- morse_driver sets it once per vif from the firmware manifest and then
+         * re-clears it on every beacon and every management frame unless a RAW schedule is actually
+         * running (mac.c morse_raw_is_enabled). The on-air A/B is one bit: the reference AP emits
+         * caps octet[6] 0x08 with RAW enabled and 0x00 with it disabled, byte-identical otherwise.
+         * So flipping this on unconditionally would advertise RAW on an AP with no schedule. It is
+         * honest only under this same #ifdef, which is exactly when umac_ap_build_beacon splices a
+         * schedule into every beacon. Note this file, unlike umac_ap.c, is compiled into STA and
+         * mesh builds too, so the guard is load-bearing rather than hygiene. */
+        ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
+#else
         if (false)
         {
 
             ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
         }
+#endif
 
 
         ie->s1g_capabilities_information[7] |= DOT11_MASK_S1G_CAP7_DUP_1MHZ_SUPPORT;
