@@ -281,8 +281,10 @@ void ie_s1g_capabilities_build_ap(struct umac_data *umacd, struct consbuf *buf)
          * caps octet[6] 0x08 with RAW enabled and 0x00 with it disabled, byte-identical otherwise.
          * So flipping this on unconditionally would advertise RAW on an AP with no schedule. It is
          * honest only under this same #ifdef, which is exactly when umac_ap_build_beacon splices a
-         * schedule into every beacon. Note this file, unlike umac_ap.c, is compiled into STA and
-         * mesh builds too, so the guard is load-bearing rather than hygiene. */
+         * schedule into every beacon -- without the guard, every application that starts an AP vif
+         * would claim RAW support it cannot back. (This file is compiled unconditionally, unlike
+         * umac_ap.c, but this builder's only caller is driver_ap.c, which is not, so a pure STA or
+         * mesh build never reaches here.) */
         ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
 #else
         if (false)
