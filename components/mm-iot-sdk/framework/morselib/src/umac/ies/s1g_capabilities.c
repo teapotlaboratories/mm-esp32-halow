@@ -10,6 +10,7 @@
 #include "umac/connection/umac_connection.h"
 #include "umac/rc/umac_rc.h"
 #include "umac/interface/umac_interface.h"
+#include "umac/ap/umac_ap.h"
 
 void ie_s1g_capabilities_build(struct umac_data *umacd, struct consbuf *buf)
 {
@@ -273,26 +274,27 @@ void ie_s1g_capabilities_build_ap(struct umac_data *umacd, struct consbuf *buf)
         }
 
 
-#ifdef RIMBA_RAW_S0B_SPIKE
-        /* S0b-3 spike: advertise RAW Operation Support. Linux treats this bit as LIVE STATE, not a
-         * static capability -- morse_driver sets it once per vif from the firmware manifest and then
-         * re-clears it on every beacon and every management frame unless a RAW schedule is actually
-         * running (mac.c morse_raw_is_enabled). The on-air A/B is one bit: the reference AP emits
-         * caps octet[6] 0x08 with RAW enabled and 0x00 with it disabled, byte-identical otherwise.
-         * So flipping this on unconditionally would advertise RAW on an AP with no schedule. It is
-         * honest only under this same #ifdef, which is exactly when umac_ap_build_beacon splices a
-         * schedule into every beacon -- without the guard, every application that starts an AP vif
-         * would claim RAW support it cannot back. (This file is compiled unconditionally, unlike
-         * umac_ap.c, but this builder's only caller is driver_ap.c, which is not, so a pure STA or
-         * mesh build never reaches here.) */
-        ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
-#else
-        if (false)
+        /*
+         * S3: advertise RAW Operation Support only while RAW is actually enabled for this AP.
+         *
+         * Linux treats this bit as LIVE STATE, not a static capability: it sets it once per vif from
+         * the firmware manifest (mac.c:1228-1229) and then RE-CLEARS it on every beacon and every
+         * management frame unless RAW is running (mac.c:1392-1393, predicate morse_raw_is_enabled).
+         * The on-air A/B is one bit: caps octet[6] reads 0x08 with RAW on and 0x00 with it off,
+         * byte-identical otherwise.
+         *
+         * DELIBERATE DIVERGENCE: this is evaluated ONCE, at AP start, not per frame. The element is
+         * built here and memcpy'd into the supplicant's hw_mode->s1g_capab (driver_ap.c:130-139),
+         * which caches it for the AP's lifetime -- the ESP has no per-beacon capabilities rebuild to
+         * hook. That is why RAW is configured through mmwlan_ap_args and fixed for the lifetime of
+         * the AP: a runtime toggle would leave this advertisement stale, which is worse than not
+         * offering one. The ordering that makes this work is that umac_ap_enable_ap() stores the
+         * args (umac_ap.c:224) before starting the supplicant (:289).
+         */
+        if (umac_ap_raw_is_enabled(umacd))
         {
-
             ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
         }
-#endif
 
 
         ie->s1g_capabilities_information[7] |= DOT11_MASK_S1G_CAP7_DUP_1MHZ_SUPPORT;

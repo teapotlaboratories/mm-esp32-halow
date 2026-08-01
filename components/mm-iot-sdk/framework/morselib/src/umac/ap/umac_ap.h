@@ -23,6 +23,19 @@ enum mmwlan_status umac_ap_disable_ap(struct umac_data *umacd);
 
 bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_args *args);
 
+/**
+ * Is RAW enabled for this AP?
+ *
+ * Port of `morse_raw_is_enabled()` (morse_driver raw.c:1630-1632), which requires BOTH that the vif
+ * is an AP and that RAW is in the enabled state. Here the AP data pointer being non-NULL carries the
+ * first condition -- it is allocated only for an AP vif -- and the configured flag carries the second.
+ *
+ * This is the predicate that gates the S1G Capabilities RAW Operation Support bit. Linux treats that
+ * bit as live state rather than a static capability, and so must this: advertising RAW on an AP with
+ * no schedule is exactly the case the design rules out.
+ */
+bool umac_ap_raw_is_enabled(struct umac_data *umacd);
+
 
 struct umac_ap_config
 {

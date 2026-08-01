@@ -16,6 +16,7 @@
 #include "umac/datapath/umac_datapath.h"
 #include "umac/frames/frames_common.h"
 #include "umac/frames/probe_response.h"
+#include "umac/ies/ie_rps.h"
 #include "umac/ies/s1g_tim.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/keys/umac_keys.h"
@@ -69,8 +70,45 @@ static void dump_sta_list(struct umac_ap_data *data)
 }
 #endif
 
+bool umac_ap_raw_is_enabled(struct umac_data *umacd)
+{
+    struct umac_ap_data *data = umac_data_get_ap(umacd);
+
+    /* umac_data_get_ap() returns NULL unless an AP vif is up, which is the ESP analogue of Linux's
+     * `mors_vif->ap` check -- that pointer is likewise allocated only for AP-type vifs. */
+    return (data != NULL) && data->args.raw.enabled;
+}
+
 bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_args *args)
 {
+    /*
+     * Port of `morse_raw_is_config_valid()` (raw.c:1046-1052), including the reference's own caveat:
+     * "Note that AID ranges are not required for the spec, but we do require it for now."
+     *
+     * Validating here rather than at beacon-build time is deliberate: a bad schedule should fail
+     * mmwlan_ap_enable() loudly, not silently emit a malformed element on every beacon thereafter.
+     */
+    if (args->raw.enabled)
+    {
+        if (args->raw.slot_duration_us == 0 || args->raw.start_aid == 0 || args->raw.end_aid == 0)
+        {
+            MMLOG_ERR("RAW requires non-zero slot_duration_us, start_aid and end_aid\n");
+            return false;
+        }
+        if (args->raw.end_aid < args->raw.start_aid)
+        {
+            MMLOG_ERR("RAW end_aid (%u) is below start_aid (%u)\n",
+                      args->raw.end_aid,
+                      args->raw.start_aid);
+            return false;
+        }
+        if (args->raw.num_slots == 0)
+        {
+            MMLOG_ERR("RAW requires at least one slot\n");
+            return false;
+        }
+    }
+
     if (args->security_type == MMWLAN_OWE)
     {
         MMLOG_ERR("OWE security is not currently supported by AP mode\n");
@@ -416,25 +454,38 @@ void umac_ap_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *pa
                      data->config.dtim_period,
                      *traffic_indicator,
                      data->bitmap);
-#ifdef RIMBA_RAW_S0B_SPIKE
-    /* S0b-4 spike: a fixed RPS element (EID 208), spliced directly after the TIM because that is
-     * where Linux puts it -- 236/236 hostapd_s1g beacons captured on the bench carried the IE chain
-     * [213, 5, 208, 217, 232, 214, 0, 221], RPS immediately following TIM. Every octet is the
-     * morse_driver raw.c encoder's output for one GENERIC assignment, start_aid=1, end_aid=255,
-     * format 0, num_slots=2, slot_duration=10100 us: D0=EID 208, 06=length, 20=RAW Control with
-     * GROUP_IND, 40 09=slot definition (cslot 80 -> 500+9600 us, 2 slots), 04 E0=RAW group
-     * (page 0, AID 1..), 1F=end_aid>>3. It is byte-identical to what the reference AP transmits.
+    /*
+     * S3: the RPS element, built from the AP's own configuration. Position is load-bearing --
+     * directly after the TIM, which is where Linux puts it: 236/236 hostapd_s1g beacons captured on
+     * the bench carried the chain [213, 5, 208, 217, 232, 214, 0, 221].
      *
-     * This is a feasibility probe, not a RAW implementation: the schedule is these constant bytes
-     * and nothing enforces or updates them, which is why it is compile-gated -- only a build that
-     * defines RIMBA_RAW_S0B_SPIKE arms it. umac_ap_build_beacon is shared morselib, so without the
-     * guard every application that starts an AP vif would put a RAW advertisement on air.
-     * The append is unconditional and fixed-size, so the sizing pass and the write pass of
-     * build_frame_with_class() agree by construction -- a pass-1/pass-2 disagreement here would be
-     * a hard hang on the MMOSAL_ASSERT in consbuf_append. */
-    static const uint8_t k_rps_golden[8] = { 0xD0, 0x06, 0x20, 0x40, 0x09, 0x04, 0xE0, 0x1F };
-    consbuf_append(buf, k_rps_golden, sizeof(k_rps_golden));
-#endif
+     * No compile-time guard any more. RAW is off unless the application asked for it
+     * (MMWLAN_AP_ARGS_INIT zeroes `raw`), which is the real containment the S0b spike's #ifdef was
+     * standing in for -- and it is per-deployment rather than per-build, which is what the feature
+     * needs: whether RAW pays depends on the traffic mix, and that is the integrator's knowledge.
+     */
+    if (umac_ap_raw_is_enabled(umacd))
+    {
+        struct ie_rps_config rps = {
+            .start_time_us = data->args.raw.start_time_us,
+            .start_aid = data->args.raw.start_aid,
+            .end_aid = data->args.raw.end_aid,
+            .slot_definition = {
+                .cross_slot_boundary = data->args.raw.cross_slot_boundary,
+                .num_slots = data->args.raw.num_slots,
+                .slot_duration_us = data->args.raw.slot_duration_us,
+            },
+            .periodic = { 0 },
+        };
+        ie_rps_build(buf, &rps);
+
+        /*
+         * The encoder caps num_slots and writes the capped value back, replicating the reference
+         * (raw.c:329-333). Propagate that back into the stored config so a caller reading its own
+         * AP args sees what is actually being advertised, rather than what it asked for.
+         */
+        data->args.raw.num_slots = rps.slot_definition.num_slots;
+    }
     consbuf_append(buf, data->config.tail, data->config.tail_len);
 }
 

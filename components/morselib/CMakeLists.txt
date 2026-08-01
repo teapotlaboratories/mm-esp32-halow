@@ -52,6 +52,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/ies/s1g_capabilities.c
     ${ROOT_DIR}/src/umac/ies/s1g_operation.c
     ${ROOT_DIR}/src/umac/ies/s1g_tim.c
+    ${ROOT_DIR}/src/umac/ies/ie_rps.c
     ${ROOT_DIR}/src/umac/ies/ies_common.c
     ${ROOT_DIR}/src/umac/ies/wmm.c
     ${ROOT_DIR}/src/umac/ies/morse_ie.c
