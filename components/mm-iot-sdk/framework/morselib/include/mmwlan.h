@@ -2009,6 +2009,53 @@ enum mmwlan_status mmwlan_ap_get_sta_status(const uint8_t *sta_addr,
  *     status = mmwlan_ap_enable(&ap_args);
  * @endcode
  */
+/**
+ * RAW (Restricted Access Window) configuration for an AP -- 802.11ah 9.4.2.191.
+ *
+ * RAW publishes a schedule in the beacon that divides medium access among the associated stations,
+ * to cut contention when many of them transmit at once. It is DISABLED BY DEFAULT and must be opted
+ * into per deployment, because it is not free: the AP defers some of its own downlink to honour the
+ * window. Whether that trade pays depends on the traffic mix -- a downlink-heavy deployment gives up
+ * airtime to relieve contention it does not suffer from, while an uplink-heavy one (the archetypal
+ * sensor network) is where the benefit lands.
+ *
+ * @warning ALPHA NOTICE: This is an alpha API that is under development; the fields and semantics
+ *          may change.
+ */
+struct mmwlan_ap_raw_args
+{
+    /** Enable RAW. When false every other field is ignored and no RPS element is advertised. */
+    bool enabled;
+    /**
+     * First AID in the RAW group. Must be non-zero when @c enabled.
+     */
+    uint16_t start_aid;
+    /**
+     * Last AID in the RAW group. Must be non-zero when @c enabled.
+     */
+    uint16_t end_aid;
+    /**
+     * Number of slots the window is divided into.
+     *
+     * @warning SILENTLY CAPPED AT 6 (or 3 for long slot durations), not the 63 the field can encode
+     *          -- the reference driver uses the slot-count field's bit WIDTH as the maximum. A larger
+     *          request is reduced without error, and the reduced value is written back here.
+     */
+    uint16_t num_slots;
+    /**
+     * Duration of each slot in microseconds. Quantised to 500 + 120k; values in between are rounded
+     * down. Must be non-zero when @c enabled.
+     */
+    uint32_t slot_duration_us;
+    /** Allow a transmitting STA to bleed past the end of its slot. */
+    bool cross_slot_boundary;
+    /**
+     * Offset from the END OF THE BEACON carrying the schedule to the start of the window, in
+     * microseconds -- not from the TBTT. Zero omits the field from the element entirely.
+     */
+    uint32_t start_time_us;
+};
+
 struct mmwlan_ap_args
 {
     /** SSID of the AP. */
@@ -2115,6 +2162,14 @@ struct mmwlan_ap_args
      * @ref MMWLAN_UNAVAILABLE until active.
      */
     bool async_start;
+    /**
+     * RAW (Restricted Access Window) configuration. Disabled by default.
+     *
+     * @note RAW is fixed for the lifetime of the AP: the S1G Capabilities RAW Operation Support bit
+     *       is reported to the supplicant once, at AP start, so enabling or disabling RAW after
+     *       @ref mmwlan_ap_enable() would leave that advertisement stale. Restart the AP to change it.
+     */
+    struct mmwlan_ap_raw_args raw;
 };
 
 /**
@@ -2142,6 +2197,7 @@ struct mmwlan_ap_args
         .sta_status_cb_arg = NULL,       \
         .max_stas = 0,                   \
         .async_start = false,            \
+        .raw = { 0 },                    \
     }
 
 /**
