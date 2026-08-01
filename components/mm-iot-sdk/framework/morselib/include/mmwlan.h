@@ -1993,23 +1993,6 @@ enum mmwlan_status mmwlan_ap_get_sta_status(const uint8_t *sta_addr,
                                             struct mmwlan_ap_sta_status *sta_status);
 
 /**
- * Arguments data structure for @ref mmwlan_ap_enable().
- *
- * @warning ALPHA NOTICE: This is an alpha API that is under development;
- *          breaking changes may be introduced in future releases.
- *
- * This structure should be initialized using @ref MMWLAN_AP_ARGS_INIT for sensible
- * default values, particularly for forward compatibility with new releases that may add
- * new fields to the struct. For example:
- *
- * @code{.c}
- *     enum mmwlan_status status;
- *     struct mmwlan_ap_args ap_args = MMWLAN_AP_ARGS_INIT;
- *     // HERE: initialize arguments
- *     status = mmwlan_ap_enable(&ap_args);
- * @endcode
- */
-/**
  * RAW (Restricted Access Window) configuration for an AP -- 802.11ah 9.4.2.191.
  *
  * RAW publishes a schedule in the beacon that divides medium access among the associated stations,
@@ -2056,6 +2039,23 @@ struct mmwlan_ap_raw_args
     uint32_t start_time_us;
 };
 
+/**
+ * Arguments data structure for @ref mmwlan_ap_enable().
+ *
+ * @warning ALPHA NOTICE: This is an alpha API that is under development;
+ *          breaking changes may be introduced in future releases.
+ *
+ * This structure should be initialized using @ref MMWLAN_AP_ARGS_INIT for sensible
+ * default values, particularly for forward compatibility with new releases that may add
+ * new fields to the struct. For example:
+ *
+ * @code{.c}
+ *     enum mmwlan_status status;
+ *     struct mmwlan_ap_args ap_args = MMWLAN_AP_ARGS_INIT;
+ *     // HERE: initialize arguments
+ *     status = mmwlan_ap_enable(&ap_args);
+ * @endcode
+ */
 struct mmwlan_ap_args
 {
     /** SSID of the AP. */

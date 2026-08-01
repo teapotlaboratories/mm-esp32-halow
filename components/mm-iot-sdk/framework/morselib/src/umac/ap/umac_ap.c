@@ -81,34 +81,6 @@ bool umac_ap_raw_is_enabled(struct umac_data *umacd)
 
 bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_args *args)
 {
-    /*
-     * Port of `morse_raw_is_config_valid()` (raw.c:1046-1052), including the reference's own caveat:
-     * "Note that AID ranges are not required for the spec, but we do require it for now."
-     *
-     * Validating here rather than at beacon-build time is deliberate: a bad schedule should fail
-     * mmwlan_ap_enable() loudly, not silently emit a malformed element on every beacon thereafter.
-     */
-    if (args->raw.enabled)
-    {
-        if (args->raw.slot_duration_us == 0 || args->raw.start_aid == 0 || args->raw.end_aid == 0)
-        {
-            MMLOG_ERR("RAW requires non-zero slot_duration_us, start_aid and end_aid\n");
-            return false;
-        }
-        if (args->raw.end_aid < args->raw.start_aid)
-        {
-            MMLOG_ERR("RAW end_aid (%u) is below start_aid (%u)\n",
-                      args->raw.end_aid,
-                      args->raw.start_aid);
-            return false;
-        }
-        if (args->raw.num_slots == 0)
-        {
-            MMLOG_ERR("RAW requires at least one slot\n");
-            return false;
-        }
-    }
-
     if (args->security_type == MMWLAN_OWE)
     {
         MMLOG_ERR("OWE security is not currently supported by AP mode\n");
@@ -197,6 +169,34 @@ bool umac_ap_validate_ap_args(struct umac_data *umacd, const struct mmwlan_ap_ar
     {
         MMLOG_ERR("Unable to support %u STAs\n", args->max_stas);
         return false;
+    }
+
+    /*
+     * Port of `morse_raw_is_config_valid()` (raw.c:1046-1052), including the reference's own caveat:
+     * "Note that AID ranges are not required for the spec, but we do require it for now."
+     *
+     * Validating here rather than at beacon-build time is deliberate: a bad schedule should fail
+     * mmwlan_ap_enable() loudly, not silently emit a malformed element on every beacon thereafter.
+     */
+    if (args->raw.enabled)
+    {
+        if (args->raw.slot_duration_us == 0 || args->raw.start_aid == 0 || args->raw.end_aid == 0)
+        {
+            MMLOG_ERR("RAW requires non-zero slot_duration_us, start_aid and end_aid\n");
+            return false;
+        }
+        if (args->raw.end_aid < args->raw.start_aid)
+        {
+            MMLOG_ERR("RAW end_aid (%u) is below start_aid (%u)\n",
+                      args->raw.end_aid,
+                      args->raw.start_aid);
+            return false;
+        }
+        if (args->raw.num_slots == 0)
+        {
+            MMLOG_ERR("RAW requires at least one slot\n");
+            return false;
+        }
     }
 
     return true;
@@ -481,10 +481,15 @@ void umac_ap_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *pa
 
         /*
          * The encoder caps num_slots and writes the capped value back, replicating the reference
-         * (raw.c:329-333). Propagate that back into the stored config so a caller reading its own
-         * AP args sees what is actually being advertised, rather than what it asked for.
+         * (raw.c:329-333). Propagate that into the stored config so a caller reading its own AP args
+         * sees what is actually being advertised rather than what it asked for. Guarded because the
+         * cap is idempotent: this fires at most once, on the first beacon, instead of writing shared
+         * config state on every TBTT.
          */
-        data->args.raw.num_slots = rps.slot_definition.num_slots;
+        if (data->args.raw.num_slots != rps.slot_definition.num_slots)
+        {
+            data->args.raw.num_slots = rps.slot_definition.num_slots;
+        }
     }
     consbuf_append(buf, data->config.tail, data->config.tail_len);
 }

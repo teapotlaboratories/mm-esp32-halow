@@ -18,6 +18,15 @@
  * with the reference is a porting bug, not an interpretation difference.
  */
 
+#ifndef GENMASK16
+/* Inclusive bit range, as the kernel's GENMASK does, narrowed to 16 bits. */
+#define GENMASK16(h, l) ((uint16_t)((0xFFFFu << (l)) & (0xFFFFu >> (15 - (h)))))
+#endif
+
+#ifndef BIT
+#define BIT(n) (1u << (n))
+#endif
+
 /* raw.c:15-16 */
 #define RPS_RAW_CONTROL_TYPE_SHIFT          0
 #define RPS_RAW_CONTROL_TYPE                GENMASK16(1, 0)
@@ -89,15 +98,6 @@
 #define RPS_START_TIME_LEN                  1
 #define RPS_GROUP_LEN                       3
 #define RPS_PERIODIC_LEN                    3
-
-#ifndef GENMASK16
-/* Inclusive bit range, as the kernel's GENMASK does, narrowed to 16 bits. */
-#define GENMASK16(h, l) ((uint16_t)((0xFFFFu << (l)) & (0xFFFFu >> (15 - (h)))))
-#endif
-
-#ifndef BIT
-#define BIT(n) (1u << (n))
-#endif
 
 /** raw.c:303-306 -- a config is a PRAW iff its validity is non-zero. */
 static bool rps_cfg_is_periodic(const struct ie_rps_config *config)

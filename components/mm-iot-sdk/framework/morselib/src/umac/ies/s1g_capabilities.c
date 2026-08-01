@@ -10,7 +10,9 @@
 #include "umac/connection/umac_connection.h"
 #include "umac/rc/umac_rc.h"
 #include "umac/interface/umac_interface.h"
+#if !(defined(MMWLAN_AP_DISABLED) && MMWLAN_AP_DISABLED)
 #include "umac/ap/umac_ap.h"
+#endif
 
 void ie_s1g_capabilities_build(struct umac_data *umacd, struct consbuf *buf)
 {
@@ -291,10 +293,19 @@ void ie_s1g_capabilities_build_ap(struct umac_data *umacd, struct consbuf *buf)
          * offering one. The ordering that makes this work is that umac_ap_enable_ap() stores the
          * args (umac_ap.c:224) before starting the supplicant (:289).
          */
+        /*
+         * The predicate lives in umac_ap.c, which is compiled only under CONFIG_HALOW_AP_MODE, while
+         * this file is in the unconditional SRCS. Without the guard a STA-only build compiles a call
+         * to a symbol that is never linked, and only survives because --gc-sections drops this
+         * (unreferenced) function -- a dependency resolved by an optimisation rather than by
+         * construction. Same idiom as umac.c:487.
+         */
+#if !(defined(MMWLAN_AP_DISABLED) && MMWLAN_AP_DISABLED)
         if (umac_ap_raw_is_enabled(umacd))
         {
             ie->s1g_capabilities_information[6] |= DOT11_MASK_S1G_CAP6_RAW_OPERATION_SUPPORT;
         }
+#endif
 
 
         ie->s1g_capabilities_information[7] |= DOT11_MASK_S1G_CAP7_DUP_1MHZ_SUPPORT;
