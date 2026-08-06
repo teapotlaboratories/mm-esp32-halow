@@ -607,8 +607,12 @@ enum mmwlan_status mmwlan_set_health_check_interval(uint32_t min_interval_ms,
  *          triggers an assert, and a mesh interface is not restored at all. Do not call this in
  *          production.
  *
- * @return @ref MMWLAN_SUCCESS if the restart was queued, @ref MMWLAN_UNAVAILABLE if the WLAN
- *         subsystem is not running.
+ * @warning Must not be called before the WLAN subsystem has been booted. Like the other public UMAC
+ *          accessors it resolves the UMAC data root unguarded, and that root asserts rather than
+ *          reporting an error when it has not been initialised.
+ *
+ * @return @ref MMWLAN_SUCCESS if the restart was queued, or @ref MMWLAN_UNAVAILABLE if no interface
+ *         is currently active (so there is nothing to restart).
  */
 enum mmwlan_status mmwlan_force_hw_restart(void);
 
