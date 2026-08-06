@@ -595,6 +595,24 @@ enum mmwlan_status mmwlan_set_health_check_interval(uint32_t min_interval_ms,
                                                     uint32_t max_interval_ms);
 
 /**
+ * Force a chip restart, for fault-injection testing.
+ *
+ * Queues the same recovery path the driver takes when it detects the chip has stopped responding
+ * (@c mmdrv_host_hw_restart_required), so a test can exercise restart recovery deliberately instead
+ * of waiting for a real fault. The restart runs asynchronously on the UMAC event loop; this returns
+ * as soon as the event is queued.
+ *
+ * @warning DIAGNOSTIC ONLY. This tears the driver down and re-initialises it, dropping every
+ *          interface. Recovery is only implemented for a STA connection: an active AP interface
+ *          triggers an assert, and a mesh interface is not restored at all. Do not call this in
+ *          production.
+ *
+ * @return @ref MMWLAN_SUCCESS if the restart was queued, @ref MMWLAN_UNAVAILABLE if the WLAN
+ *         subsystem is not running.
+ */
+enum mmwlan_status mmwlan_force_hw_restart(void);
+
+/**
  * Arguments data structure for @ref mmwlan_boot().
  *
  * This structure should be initialized using @ref MMWLAN_BOOT_ARGS_INIT for sensible
