@@ -100,6 +100,24 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
     mmdrv_hw_restart_completed();
 }
 
+/* Public fault-injection entry point. Lives here, beside the handler it drives, so the restart path has
+ * exactly one place to read. Deliberately a morselib API rather than an app reaching into
+ * morselib/src/internal/mmdrv.h: the internal header is not on an app's link surface, and widening that
+ * surface to suit one test fixture would make every internal mmdrv symbol app-callable. */
+enum mmwlan_status mmwlan_force_hw_restart(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+
+    if (umacd == NULL || !umac_interface_is_active(umacd))
+    {
+        return MMWLAN_UNAVAILABLE;
+    }
+
+    MMLOG_WRN("Forcing a hardware restart on request (fault injection)\n");
+    mmdrv_host_hw_restart_required();
+    return MMWLAN_SUCCESS;
+}
+
 void mmdrv_host_hw_restart_required(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
