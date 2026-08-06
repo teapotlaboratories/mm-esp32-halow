@@ -106,9 +106,14 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
  * surface to suit one test fixture would make every internal mmdrv symbol app-callable. */
 enum mmwlan_status mmwlan_force_hw_restart(void)
 {
+    /* No umacd NULL check: umac_data_get_umacd() returns the address of a static and cannot return
+     * NULL -- it asserts on an uninitialised subsystem instead (umac_data.c:57). The sibling public
+     * accessors (mmwlan_get_umac_stats, mmwlan_clear_umac_stats) call it unguarded for the same
+     * reason, so a check here would be dead code that reads as a boot-safety guarantee it cannot
+     * make. Callers must boot the WLAN subsystem first; see the header. */
     struct umac_data *umacd = umac_data_get_umacd();
 
-    if (umacd == NULL || !umac_interface_is_active(umacd))
+    if (!umac_interface_is_active(umacd))
     {
         return MMWLAN_UNAVAILABLE;
     }
