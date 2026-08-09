@@ -105,6 +105,14 @@ void mmwlan_mesh_send_test_action(void);
 /** True while a mesh interface is active (routes beacon generation here). */
 bool umac_mesh_is_active(void);
 
+/** Restore the mesh vif after a hardware restart tore the chip down and re-inited it.
+ *
+ * Counterpart to @c umac_connection_handle_hw_restarted() for a mesh interface: reinstalls the vif,
+ * replays the chip-side BSS configuration, re-pushes every ESTAB peer (state ladder + keys) and
+ * re-arms beaconing. Host state -- the peer table, HWMP paths, MPP table -- is preserved, not rebuilt.
+ * No-op when no mesh interface is active. Called from the hw_restart event handler. */
+void umac_mesh_handle_hw_restarted(struct umac_data *umacd);
+
 /** #P5 — true when mesh CCMP data crypto runs on the HOST (no FW key offload), required for multi-hop
  *  forwarding (the FW keys decryption by the mesh-SA/A4, so it drops forwarded A4!=TA frames). When
  *  false the node uses FW HW crypto (single-hop only). Switches the FW-offload gate + the datapath

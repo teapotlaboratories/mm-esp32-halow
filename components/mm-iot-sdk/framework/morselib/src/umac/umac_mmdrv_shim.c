@@ -92,8 +92,49 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
 
         umac_health_check_start(umacd);
         umac_stats_increment_hw_restart_counter(umacd);
+
+        /* HW-GLOBAL settings first, before any per-interface handler -- mirroring net/mac80211, where
+         * ieee80211_reconfig() restores the frag/RTS thresholds (util.c:1836/1839) after drv_start()
+         * and before the vif loop. The fragmentation threshold lived inside
+         * umac_connection_handle_hw_restarted()'s STA-gated body until 2026-08-06, which meant a mesh
+         * node -- which never enters that body -- lost it on every restart. It is not STA state: the
+         * value comes from umacd's config and mmdrv_set_frag_threshold() takes no vif.
+         * ⚠ The RTS threshold (MORSE_PARAM_ID_RTS_THRESHOLD) is NOT restored here or anywhere, for any
+         * interface type; Linux restores it alongside. Tracked separately rather than fixed in passing,
+         * because it changes STA behaviour too and needs its own verification. */
+        unsigned fragment_threshold = umac_config_get_frag_threshold(umacd);
+        if (mmdrv_set_frag_threshold(fragment_threshold) != MMWLAN_SUCCESS)
+        {
+            MMLOG_WRN("Failed to reconfigure fragmentation threshold.\n");
+        }
+
         umac_scan_handle_hw_restarted(umacd);
-        umac_connection_handle_hw_restarted(umacd);
+
+        /* Dispatch by interface type, EXPLICITLY -- mirroring net/mac80211, where ieee80211_reconfig
+         * runs a per-type switch and no vif takes two arms.
+         *
+         * ⚠ The exclusivity must be enforced here; it cannot be inferred from the handlers. It is
+         * tempting to call both and assume the connection handler no-ops on a mesh node, because it
+         * opens on `umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA)`. It does NOT no-op:
+         * UMAC_INTERFACE_STA is inside VIF_STA_INTERFACE_TYPES_MASK (umac_interface.c:118-120), so
+         * get_vif_id() returns vif_data_sta->vif_id WITHOUT consulting active_interface_types
+         * (umac_interface.c:492-499) -- and mesh shares that very slot. On a mesh node the guard is
+         * true and the body runs, which was confirmed on hardware (probe, 2026-08-06: "BODY RUNNING
+         * vif_id=0" on a meshing node).
+         *
+         * Left unguarded, the connection handler would then run umac_interface_reinstall_vif() a
+         * SECOND time, immediately after the mesh handler had reinstalled the vif, reprogrammed the
+         * BSS, re-pushed every peer and armed beaconing -- re-adding the FW interface underneath all
+         * of it, and driving mmdrv_update_sta_state() with the connection stad's aid 0 and all-zero
+         * BSSID. It happened to survive on the bench; that is not a property worth depending on. */
+        if (umac_mesh_is_active())
+        {
+            umac_mesh_handle_hw_restarted(umacd);
+        }
+        else
+        {
+            umac_connection_handle_hw_restarted(umacd);
+        }
     }
 
     MMLOG_DBG("Notify MMDRV that restart has completed\n");
@@ -279,10 +320,12 @@ struct mmpkt *mmdrv_host_get_beacon(uint16_t vif_id)
     {
         return umac_mesh_get_beacon(umacd);
     }
+#if !(defined(MMWLAN_AP_DISABLED) && MMWLAN_AP_DISABLED)
     if (vif_types & UMAC_INTERFACE_AP)
     {
         return umac_ap_get_beacon(umacd);
     }
+#endif
 
     /* Fallback preserves the legacy single-vif behaviour if the vif->type
      * lookup comes back empty (e.g. a beacon in flight during teardown). */
@@ -290,5 +333,18 @@ struct mmpkt *mmdrv_host_get_beacon(uint16_t vif_id)
     {
         return umac_mesh_get_beacon(umacd);
     }
+#if !(defined(MMWLAN_AP_DISABLED) && MMWLAN_AP_DISABLED)
     return umac_ap_get_beacon(umacd);
+#else
+    /* AP support is compiled out (CONFIG_HALOW_AP_MODE=n): there is no AP vif that could have asked
+     * for this beacon, so there is nothing to serve.
+     *
+     * These guards are not cosmetic. umac_ap.c is not compiled in this configuration, so every
+     * umac_ap_get_beacon() reference above is undefined -- the build only ever succeeded because
+     * --gc-sections dropped this whole function when nothing referenced it. That made the STA-only
+     * build silently dependent on an accident of dead-code elimination: adding any new call into this
+     * chain broke the link. It did, on 2026-08-06, when the hw-restart handler started calling
+     * umac_mesh_handle_hw_restarted() and pulled umac_mesh.o (and this dispatcher) back in. */
+    return NULL;
+#endif
 }
