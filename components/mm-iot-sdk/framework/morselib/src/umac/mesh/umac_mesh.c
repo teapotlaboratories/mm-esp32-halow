@@ -3744,6 +3744,175 @@ static void umac_mesh_tear_down_active_interfaces(struct umac_data *umacd)
     }
 }
 
+/* Re-push one ESTAB peer to a freshly re-inited chip: the station state ladder, then its keys.
+ *
+ * This is the CHIP-side subset of umac_mesh_peer_secure_estab() -- the same ladder and the same two
+ * key installs, and deliberately nothing else. The MTK/AEK derivation there consumes nonces exchanged
+ * during peering; those results already live in the peer struct, which the restart did not touch, so
+ * re-deriving would be busywork at best and wrong at worst.
+ *
+ * Mirrors ieee80211_reconfig_stations() (net/mac80211/util.c:1662), which walks the vif's stations and
+ * steps each back up to the state it already held. Divergence: Linux replays every transition from
+ * NOTEXIST; morse_driver filters NOTEXIST/NONE (mac.c:4813), so this starts at AUTHENTICATED -- the
+ * same sequence the normal ESTAB path sends.
+ */
+static bool umac_mesh_peer_reinstall_on_chip(struct mesh_peer *peer)
+{
+    if (peer->stad == NULL)
+    {
+        /* The caller already skips set_vif_id on a NULL stad; be consistent rather than relying on
+         * mesh_peer_alloc() never publishing a peer without one. umac_keys_reinstall_keys() would
+         * MMOSAL_ASSERT here (umac_sta_data_get_keys), i.e. panic rather than skip. */
+        MMLOG_ERR("MESH: peer aid=%u has no stad; cannot restore it\n", peer->aid);
+        return false;
+    }
+
+    uint16_t vif = mesh_ctx.vif_id;
+    bool ok = true;
+
+#if MMWLAN_MESH_SEC_PHASE1
+    /* Gated to match the ONLY path that installs these states in the first place: the ladder lives in
+     * umac_mesh_peer_secure_estab(), whose two call sites (:3682, :3700) are both inside this same
+     * #if. In an open-mesh build the chip holds no station entries for peers, so replaying a ladder
+     * here would put it somewhere it has never been -- the opposite of restoring it. */
+    static const enum morse_sta_state seq[] = {
+        MORSE_STA_AUTHENTICATED, MORSE_STA_ASSOCIATED, MORSE_STA_AUTHORIZED
+    };
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+    {
+        int ret = mmdrv_update_sta_state(vif, peer->aid, peer->mac, seq[i]);
+        if (ret != 0)
+        {
+            MMLOG_ERR("MESH: restore sta_state aid=%u state=%u FAILED ret=%d\n",
+                      peer->aid, seq[i], ret);
+            ok = false;
+        }
+    }
+#else
+    MM_UNUSED(vif);
+#endif
+
+#if MMWLAN_MESH_SEC_PHASE1
+    /* Re-push the keychain the peer ALREADY has to the firmware -- do NOT rebuild the keys.
+     *
+     * Only the chip lost its copy; the host keychain survived the restart intact, PN counters and all.
+     * umac_keys_reinstall_keys() walks that keychain and re-issues each key to the driver, leaving
+     * tx_seq/rx_seq untouched. This is the same primitive the STA path uses
+     * (umac_connection.c:1721) and the same intent as ieee80211_reenable_keys()
+     * (net/mac80211/util.c:2108), which re-enables existing key objects rather than reinstalling.
+     *
+     * ⚠ Rebuilding them with fresh `struct umac_key` values is a silent trap, and it cost a bench
+     * cycle: connection_keys_install_key() COPIES tx_seq/rx_seq out of the struct it is handed
+     * (connection_keys.c:118-121), so a stack-allocated key resets our CCMP PN to 0 while the peer --
+     * which never restarted -- keeps its replay window where it was. Every frame we send is then
+     * discarded by the peer as a replay. Measured: every install returned success, beacons resumed
+     * for 190 s, and the node answered 0/5 pings having answered 5/5 a minute earlier. */
+    enum mmwlan_status st = umac_keys_reinstall_keys(peer->stad, vif);
+    if (st != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("MESH: reinstall peer keychain aid=%u FAILED st=%d\n", peer->aid, (int)st);
+        ok = false;
+    }
+#endif
+
+    return ok;
+}
+
+/* ---- chip-side mesh configuration, shared by start and hw-restart recovery -------------------
+ *
+ * Split out of mmwlan_mesh_start() for umac_mesh_handle_hw_restarted(). The two phases exist
+ * because the ORDER in start is load-bearing and must not change: phase 1 configures the BSS on a
+ * freshly added vif, then start populates mesh_ctx and arms the host beacon engine, and only then
+ * does phase 2 tell the firmware to beacon. mmdrv_host_get_beacon() routes via umac_mesh_is_active(),
+ * so MESH_CONFIG(START) must not run until the host can serve a beacon -- otherwise the firmware
+ * beacons into an unready host and the command channel backs up (page exhaustion).
+ *
+ * Factored rather than duplicated on purpose: a second copy of this sequence would drift from the
+ * first exactly the way the gate's two ARP builders did.
+ */
+
+/* Phase 1: channel + BSS + BSSID onto a freshly (re)installed mesh vif. */
+/* The CHANNEL is deliberately NOT set here -- the caller does it, because start and restart need
+ * different primitives and picking the wrong one fails silently.
+ *
+ * ⚠ umac_interface_set_channel_from_regdb() is a NO-OP after a hardware restart.
+ * umac_interface_set_channel_internal() short-circuits on
+ * `ie_s1g_operation_is_equal(&data->current_s1g_operation, s1g_operation)` (umac_interface.c) and
+ * returns success without touching the chip. mmdrv_init() wipes the chip's channel but leaves that
+ * HOST cache intact, so re-requesting the same channel programs nothing and reports success.
+ * umac_interface_reconfigure_channel() exists exactly for this: it clears the cached operation first,
+ * then re-applies it, which is why the STA restart path uses it (umac_connection.c:1713).
+ *
+ * This cost a bench cycle. The mesh restore had this wrong from the start and got away with it only
+ * because the connection handler ran afterwards and re-did the channel; enforcing handler exclusivity
+ * removed that accidental cover and the node came back on no channel at all -- beaconing, and 0/5. */
+static enum mmwlan_status mesh_chip_configure_bss(struct umac_data *umacd,
+                                                  uint16_t vif_id, uint16_t beacon_interval_tu,
+                                                  const uint8_t *bssid)
+{
+    MM_UNUSED(umacd);
+
+    int ret = mmdrv_cfg_bss(vif_id, beacon_interval_tu, 1, 0);
+    if (ret != 0)
+    {
+        MMLOG_ERR("MESH: cfg_bss failed fw_status=%d\n", ret);
+        return MMWLAN_ERROR;
+    }
+
+    /* Set the BSSID = this node's own MAC (mac80211 sets bss_conf.bssid = vif->addr
+     * for mesh; morse_driver sends BSSID_SET on BSS_CHANGED_BSSID). Unlike IBSS,
+     * MESH_CONFIG doesn't carry the BSSID, so it must be set separately first. */
+    ret = mmdrv_set_bssid(vif_id, bssid);
+    if (ret != 0)
+    {
+        MMLOG_ERR("MESH: set_bssid failed fw_status=%d\n", ret);
+        return MMWLAN_ERROR;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
+/* Phase 2: arm beaconing. Caller must already have the host beacon engine ready (see above). */
+static enum mmwlan_status mesh_chip_start_beaconing(uint16_t vif_id)
+{
+    /* BSS_BEACON_CONFIG(enable) — morse_driver sends this on BSS_CHANGED_BEACON_ENABLED,
+     * alongside the mesh config. Periodic beaconing itself is started by MESH_CONFIG(START)
+     * below; this just enables the BSS beacon path first, matching the driver order. */
+    int ret = mmdrv_config_beacon_timer(vif_id, true);
+    if (ret != 0)
+    {
+        /* fw 1.17.8 rejects a standalone BSS_BEACON_CONFIG on a mesh vif (fw_status 14); the Linux
+         * 1.17.8 driver does NOT send it on the INITIAL mesh start (its comment: "Start mesh will be
+         * handled when supplicant configures mesh id") — MESH_CONFIG(enable_beaconing) below arms
+         * beaconing. This pre-call was tolerated by 1.17.6 but is now redundant/rejected, so treat it
+         * as non-fatal rather than failing the whole bring-up. */
+        MMLOG_ERR("MESH: config_beacon_timer fw_status=%d (non-fatal on 1.17.8; MESH_CONFIG arms beaconing)\n",
+                  ret);
+    }
+
+    /* Host beacon engine on (unmask the beacon IRQ) so the host serves each beacon
+     * the firmware's timer requests. */
+    ret = mmdrv_start_beaconing(vif_id);
+    if (ret != 0)
+    {
+        MMLOG_ERR("MESH: start_beaconing failed: %d\n", ret);
+        return MMWLAN_ERROR;
+    }
+
+    /* MESH_CONFIG(START, enable_beaconing=1): the firmware runs an MBSS TBTT-selection
+     * scan (~2 s) then starts generating beacon interrupts, which the armed host beacon
+     * engine above serves. mbca_config must be non-zero (handled in mmdrv_cfg_mesh) —
+     * zero == beaconless mode, which contradicts enable_beaconing and wedges the chip. */
+    ret = mmdrv_cfg_mesh(vif_id, true, true);
+    if (ret != 0)
+    {
+        MMLOG_ERR("MESH: cfg_mesh(enable beaconing) failed fw_status=%d\n", ret);
+        return MMWLAN_ERROR;
+    }
+
+    return MMWLAN_SUCCESS;
+}
+
 enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
 {
     if (args == NULL || args->mesh_id_len == 0 || args->mesh_id_len > MORSE_CMD_MESH_ID_LEN_MAX)
@@ -3779,31 +3948,31 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
         goto fail;
     }
 
+    /* MMWLAN_VIF_STA, not vif_id. This takes an `enum mmwlan_vif` (the host slot), not the firmware
+     * vif id, and mesh occupies the STA slot. Passing vif_id -- normally 0 on a mesh-only node --
+     * selected MMWLAN_VIF_UNSPECIFIED, so umac_data_get_interface_vif() returned NULL, the function
+     * returned MMWLAN_UNAVAILABLE without writing, the discarded return hid it, and mmdrv_set_bssid()
+     * was handed six zero bytes on every mesh start. Nothing reads that BSSID today, which is why it
+     * went unnoticed -- the same shape as the gate's malformed proxy-ARP field. It surfaced because
+     * the hw-restart path passes the real MAC, so start and recovery were programming DIFFERENT
+     * BSSIDs and the recovery bench was validating a configuration the node never normally runs. */
+    uint8_t mesh_mac[MMWLAN_MAC_ADDR_LEN] = { 0 };
+    enum mmwlan_status mac_st = umac_interface_get_vif_mac_addr(umacd, MMWLAN_VIF_STA, mesh_mac);
+    if (mac_st != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("MESH: could not read the mesh vif MAC for the BSSID: %d\n", (int)mac_st);
+        status = mac_st;
+        goto fail;
+    }
     status = umac_interface_set_channel_from_regdb(umacd, chan, false);
     if (status != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("MESH: set_channel failed: %d\n", (int)status);
         goto fail;
     }
-
-    int ret = mmdrv_cfg_bss(vif_id, args->beacon_interval_tu, 1, 0);
-    if (ret != 0)
+    status = mesh_chip_configure_bss(umacd, vif_id, args->beacon_interval_tu, mesh_mac);
+    if (status != MMWLAN_SUCCESS)
     {
-        MMLOG_ERR("MESH: cfg_bss failed fw_status=%d\n", ret);
-        status = MMWLAN_ERROR;
-        goto fail;
-    }
-
-    /* Set the BSSID = this node's own MAC (mac80211 sets bss_conf.bssid = vif->addr
-     * for mesh; morse_driver sends BSSID_SET on BSS_CHANGED_BSSID). Unlike IBSS,
-     * MESH_CONFIG doesn't carry the BSSID, so it must be set separately first. */
-    uint8_t mesh_mac[MMWLAN_MAC_ADDR_LEN] = { 0 };
-    (void)umac_interface_get_vif_mac_addr(umacd, vif_id, mesh_mac);
-    ret = mmdrv_set_bssid(vif_id, mesh_mac);
-    if (ret != 0)
-    {
-        MMLOG_ERR("MESH: set_bssid failed fw_status=%d\n", ret);
-        status = MMWLAN_ERROR;
         goto fail;
     }
 
@@ -3885,39 +4054,10 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
     /* BSS_BEACON_CONFIG(enable) — morse_driver sends this on BSS_CHANGED_BEACON_ENABLED,
      * alongside the mesh config. Periodic beaconing itself is started by MESH_CONFIG(START)
      * below; this just enables the BSS beacon path first, matching the driver order. */
-    ret = mmdrv_config_beacon_timer(vif_id, true);
-    if (ret != 0)
+    status = mesh_chip_start_beaconing(vif_id);
+    if (status != MMWLAN_SUCCESS)
     {
-        /* fw 1.17.8 rejects a standalone BSS_BEACON_CONFIG on a mesh vif (fw_status 14); the Linux
-         * 1.17.8 driver does NOT send it on the INITIAL mesh start (its comment: "Start mesh will be
-         * handled when supplicant configures mesh id") — MESH_CONFIG(enable_beaconing) below arms
-         * beaconing. This pre-call was tolerated by 1.17.6 but is now redundant/rejected, so treat it
-         * as non-fatal rather than failing the whole bring-up. */
-        MMLOG_ERR("MESH: config_beacon_timer fw_status=%d (non-fatal on 1.17.8; MESH_CONFIG arms beaconing)\n",
-                  ret);
-    }
-
-    /* Host beacon engine on (unmask the beacon IRQ) so the host serves each beacon
-     * the firmware's timer requests. */
-    ret = mmdrv_start_beaconing(vif_id);
-    if (ret != 0)
-    {
-        MMLOG_ERR("MESH: start_beaconing failed: %d\n", ret);
         mesh_ctx.active = false;
-        status = MMWLAN_ERROR;
-        goto fail;
-    }
-
-    /* MESH_CONFIG(START, enable_beaconing=1): the firmware runs an MBSS TBTT-selection
-     * scan (~2 s) then starts generating beacon interrupts, which the armed host beacon
-     * engine above serves. mbca_config must be non-zero (handled in mmdrv_cfg_mesh) —
-     * zero == beaconless mode, which contradicts enable_beaconing and wedges the chip. */
-    ret = mmdrv_cfg_mesh(vif_id, true, true);
-    if (ret != 0)
-    {
-        MMLOG_ERR("MESH: cfg_mesh(enable beaconing) failed fw_status=%d\n", ret);
-        mesh_ctx.active = false;
-        status = MMWLAN_ERROR;
         goto fail;
     }
 
@@ -3947,6 +4087,186 @@ fail:
     mesh_ctx.active = false;
     umac_interface_remove(umacd, UMAC_INTERFACE_MESH);
     return status;
+}
+
+/* Abort the restore: the chip-side mesh could not be rebuilt, so stop pretending the host still has
+ * one. Leaving mesh_ctx.active set would keep umac_mesh_is_active() true, keep mmdrv_host_get_beacon()
+ * routing to the mesh beacon builder, keep the plink/RANN ticks running and keep the datapath queueing
+ * at a vif that was never configured -- a silently-deaf node with no retry and nothing reported. That
+ * is the exact failure mode this whole work exists to eliminate, so it must not be reintroduced on the
+ * error path. Mirrors mmwlan_mesh_start()'s `fail:` label, which also clears active and drops the vif. */
+static void umac_mesh_abort_restore(struct umac_data *umacd, const char *why)
+{
+    MMLOG_ERR("MESH: hw-restart restore ABORTED (%s) -- mesh is DOWN, not merely degraded\n", why);
+    mesh_ctx.active = false;
+    umac_interface_remove(umacd, UMAC_INTERFACE_MESH);
+}
+
+/* Restore a mesh vif after the chip was torn down and re-inited (hw_restart).
+ *
+ * Ported from net/mac80211 ieee80211_reconfig() (util.c:1753). Linux restores a mesh vif in three
+ * places, and this mirrors that order:
+ *   1. drv_add_interface()                       util.c:1853/1865  -> reinstall the vif
+ *   2. switch #1 `default:` arm                  util.c:1956/1965  -> ieee80211_reconfig_stations()
+ *      (MESH_POINT has no case label in that switch, so it DOES take `default:`; its own case at
+ *       util.c:2043 belongs to the SECOND switch at util.c:1980 -- do not conflate them)
+ *   3. switch #2 case NL80211_IFTYPE_MESH_POINT  util.c:2043       -> re-enable beaconing
+ *   4. ieee80211_reenable_keys()                 util.c:2108       -> unguarded, so mesh included
+ *
+ * DELIBERATE DIVERGENCES from the reference, all forced by morselib's shape:
+ *  - Linux's mesh arm is three lines because mac80211 pushes channel/BSS/beacon through one
+ *    bss_info_change_notify(BSS_CHANGED_BEACON | BSS_CHANGED_BEACON_ENABLED) and the driver reacts.
+ *    morselib has no notify layer, so the same intent is the explicit mmdrv_* sequence in the two
+ *    chip helpers above.
+ *  - Linux reinstalls keys (step 4) AFTER the beacon re-enable (step 3). Here keys ride along with
+ *    the per-peer state ladder, because umac_mesh_peer_secure_estab() already pairs them and reusing
+ *    that pairing keeps one description of "a peer is installed" rather than two. Beaconing is armed
+ *    last regardless, which the host-beacon-engine ordering constraint requires anyway.
+ *  - Linux steps a station up through EVERY intermediate state; morse_driver filters NOTEXIST/NONE
+ *    (mac.c:4813), so the ladder here starts at AUTHENTICATED -- identical to what the normal
+ *    peering path sends at ESTAB.
+ *
+ * ⚠ This must NOT call mmwlan_mesh_start(). That path opens by memset-ing mesh_ctx, mesh_peers[],
+ * the HWMP path table, mpp_paths and mesh_rmc for a "fresh MBSS" -- it would destroy exactly the
+ * peer/path state this function exists to preserve, and do it silently.
+ */
+void umac_mesh_handle_hw_restarted(struct umac_data *umacd)
+{
+    if (!mesh_ctx.active)
+    {
+        return; /* not meshing: nothing of ours to restore */
+    }
+
+    MMLOG_INF("MESH: restoring vif after hardware restart\n");
+
+    /* 1. Reinstall the vif. MESH shares the STA slot (umac_interface.c:265-275) but carries its own
+     *    firmware interface type, and umac_interface_reinstall_vif() already maps
+     *    UMAC_INTERFACE_MESH -> MMDRV_INTERFACE_TYPE_MESH (umac_interface.c:579). */
+    enum mmwlan_status status = umac_interface_reinstall_vif(umacd, MMWLAN_VIF_STA);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_mesh_abort_restore(umacd, "vif reinstall failed");
+        return;
+    }
+
+    /* The driver may hand back a different vif id, so re-read it and re-tag every stad that carries
+     * one. A stale vif_id would send the gateway TX framing and the per-peer commands at an
+     * interface that no longer exists -- silently, since nothing validates it. */
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH);
+    if (vif_id == MMDRV_VIF_ID_INVALID)
+    {
+        umac_mesh_abort_restore(umacd, "no mesh vif after reinstall");
+        return;
+    }
+    mesh_ctx.vif_id = vif_id;
+    if (mesh_ctx.common_stad != NULL)
+    {
+        umac_sta_data_set_vif_id(mesh_ctx.common_stad, vif_id);
+    }
+
+    /* 2. Chip-side BSS config. The BSSID comes from mesh_ctx.mesh_mac -- the node's own MAC, which is
+     *    what it advertises as SA/BSSID in its beacons -- NOT from umac_interface_get_vif_mac_addr(),
+     *    which does not resolve a mesh vif. */
+    status = umac_interface_reconfigure_channel(umacd);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_mesh_abort_restore(umacd, "channel reconfigure failed");
+        return;
+    }
+    status = mesh_chip_configure_bss(umacd, vif_id, mesh_ctx.beacon_interval_tu,
+                                     mesh_ctx.mesh_mac);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_mesh_abort_restore(umacd, "chip BSS config failed");
+        return;
+    }
+
+#if MMWLAN_MESH_SEC_PHASE1
+    /* 3. Re-install the COMMON stad's keys. Missing this is invisible in a beacon capture and fatal to
+     *    everything else: beacons are host-generated and unencrypted, so the node looks fully
+     *    recovered on air while every data frame dies -- "the common_stad drives ALL mesh TX (every
+     *    mesh frame dequeues from it)", per umac_mesh_install_common_keys(). Measured 2026-08-06:
+     *    without this the node beaconed for 190 s straight and answered 0/5 pings, having answered
+     *    5/5 moments earlier.
+     *    Guarded on group_tx_key_installed so a mesh that never got this far does not get keys it
+     *    never had. */
+    if (mesh_ctx.group_tx_key_installed && mesh_ctx.common_stad != NULL)
+    {
+        /* Re-push, don't reinstall -- same PN-preservation reason as the per-peer keychain below. */
+        enum mmwlan_status kst = umac_keys_reinstall_keys(mesh_ctx.common_stad, vif_id);
+        if (kst != MMWLAN_SUCCESS)
+        {
+            MMLOG_ERR("MESH: reinstall common-stad keychain FAILED st=%d -- mesh TX will not work\n",
+                      (int)kst);
+        }
+    }
+#endif
+
+    /* Re-push the chip's sequence-number spaces for every mesh stad, mirroring what the STA path does
+     * via umac_datapath_handle_hw_restarted() (umac_connection.c:1796 -> umac_datapath.c:3512). The
+     * chip's counters restart at 0 after mmdrv_init while the peers -- which did not restart -- keep
+     * their duplicate-detection state. Same hazard class as the CCMP PN reset this path is careful to
+     * avoid, only for the numbers the chip stamps rather than the host. */
+    /* Re-push the chip's sequence-number spaces for the mesh stads, mirroring the STA path
+     * (umac_connection.c:1796 -> umac_datapath.c:3512). mmdrv_init() restarts the chip's counters at 0
+     * while the peers -- which did not restart -- keep their duplicate-detection state: the same
+     * hazard class as the CCMP PN reset this path is careful to avoid, for the numbers the chip stamps
+     * rather than the host. Done AFTER the station exists on the chip, not before. */
+    if (mesh_ctx.common_stad != NULL)
+    {
+        umac_datapath_handle_hw_restarted(umacd, mesh_ctx.common_stad);
+    }
+
+    /* 4. Re-push every ESTAB peer to the chip: the state ladder, then its keys. Peers that had not
+     *    reached ESTAB are left alone -- the plink retry tick is still running and will drive them,
+     *    exactly as it would have before the restart. */
+    int restored = 0;
+    int failed = 0;
+    for (size_t i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        struct mesh_peer *peer = &mesh_peers[i];
+        if (!peer->used || peer->state != MESH_PLINK_ESTAB)
+        {
+            continue;
+        }
+        if (peer->stad != NULL)
+        {
+            umac_sta_data_set_vif_id(peer->stad, vif_id);
+        }
+        if (umac_mesh_peer_reinstall_on_chip(peer))
+        {
+            umac_datapath_handle_hw_restarted(umacd, peer->stad);
+            restored++;
+        }
+        else
+        {
+            failed++;
+        }
+    }
+
+    /* 5. Arm beaconing last: the host beacon engine is already live (mesh_ctx.active never dropped),
+     *    so MESH_CONFIG(START) has a server for the beacons it will start requesting. */
+    status = mesh_chip_start_beaconing(vif_id);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_mesh_abort_restore(umacd, "could not re-arm beaconing");
+        return;
+    }
+
+    /* Report failures rather than a bare success count. This feature exists because "silently deaf"
+     * is unobservable from the host, so a counter that cannot distinguish a restored peer from a
+     * rejected one is the wrong instrument. */
+    if (failed > 0)
+    {
+        MMLOG_ERR("MESH: vif %u restored on chan %u, but %d of %d peer(s) FAILED to reinstall -- "
+                  "traffic to them will not work\n",
+                  vif_id, mesh_ctx.s1g_primary_chan, failed, failed + restored);
+    }
+    else
+    {
+        MMLOG_INF("MESH: restored vif %u on chan %u with %d established peer(s)\n",
+                  vif_id, mesh_ctx.s1g_primary_chan, restored);
+    }
 }
 
 enum mmwlan_status mmwlan_mesh_stop(void)

@@ -1768,13 +1768,12 @@ void umac_connection_handle_hw_restarted(struct umac_data *umacd)
         MMLOG_DBG("Restore power save state\n");
         umac_ps_handle_hw_restarted(umacd);
 
-        MMLOG_DBG("Reconfigure fragmentation threshold\n");
-        unsigned fragment_threshold = umac_config_get_frag_threshold(umacd);
-        status = mmdrv_set_frag_threshold(fragment_threshold);
-        if (status != MMWLAN_SUCCESS)
-        {
-            MMLOG_WRN("Failed to reconfigure fragmentation threshold.\n");
-        }
+        /* The fragmentation threshold used to be restored here. It is HW-GLOBAL -- read from umacd's
+         * config, and mmdrv_set_frag_threshold() takes no vif -- so restoring it inside this STA-gated
+         * body meant a mesh (or any non-STA) node silently lost it across a restart. It has moved up to
+         * hw_restart_evt_handler(), before the per-interface handlers, which is also where
+         * net/mac80211 puts it: drv_set_frag_threshold() at util.c:1836 runs unconditionally, after
+         * drv_start() and before the vif loop. */
 
         if (data->non_tim_mode_supported && umac_config_is_non_tim_mode_enabled(umacd))
         {
