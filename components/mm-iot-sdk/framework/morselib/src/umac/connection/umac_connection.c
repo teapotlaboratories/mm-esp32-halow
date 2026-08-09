@@ -1765,8 +1765,9 @@ void umac_connection_handle_hw_restarted(struct umac_data *umacd)
             }
         }
 
-        MMLOG_DBG("Restore power save state\n");
-        umac_ps_handle_hw_restarted(umacd);
+        /* Power-save restoration moved to hw_restart_evt_handler(), for the same reason as the
+         * fragmentation threshold below: it is not STA state. umac_ps_handle_hw_restarted() takes only
+         * umacd, and leaving it in this STA-gated body meant a mesh node never got it. */
 
         /* The fragmentation threshold used to be restored here. It is HW-GLOBAL -- read from umacd's
          * config, and mmdrv_set_frag_threshold() takes no vif -- so restoring it inside this STA-gated

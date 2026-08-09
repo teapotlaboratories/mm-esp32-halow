@@ -102,6 +102,17 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
          * ⚠ The RTS threshold (MORSE_PARAM_ID_RTS_THRESHOLD) is NOT restored here or anywhere, for any
          * interface type; Linux restores it alongside. Tracked separately rather than fixed in passing,
          * because it changes STA behaviour too and needs its own verification. */
+        /* Power save, for the same reason and by the same argument. It is NOT enough to let
+         * umac_interface_reinstall_vif() -> umac_interface_init_vif() call umac_ps_update_mode():
+         * that early-returns on `data->pwr_mode == new_mode` (umac_ps.c), and pwr_mode is HOST state
+         * that survived the restart. The chip comes back with PS off while the host still believes it
+         * is on, so no mmdrv_set_chip_power_save_enabled() is ever issued -- and every later
+         * update_mode() short-circuits too, so nothing can fix it. umac_ps_handle_hw_restarted()
+         * exists precisely to break that: it calls umac_ps_reset() (clearing pwr_mode) BEFORE
+         * update_mode(). Third instance of the same trap in this path -- see the channel cache and the
+         * CCMP PN counters. */
+        umac_ps_handle_hw_restarted(umacd);
+
         unsigned fragment_threshold = umac_config_get_frag_threshold(umacd);
         if (mmdrv_set_frag_threshold(fragment_threshold) != MMWLAN_SUCCESS)
         {
