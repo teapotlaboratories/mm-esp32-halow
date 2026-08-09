@@ -3994,7 +3994,14 @@ enum mmwlan_status mmwlan_mesh_start(const struct mmwlan_mesh_args *args)
      * here — it only resolves the STA/AP roles and returns zero for a mesh vif, which made
      * every beacon/action frame advertise a 00:00 source address (so peers could never be
      * identified — this was the real cause of the "firmware strips the source addr" red
-     * herring). This is the node's SA and BSSID in its mesh beacons. */
+     * herring). This is the node's SA and BSSID in its mesh beacons.
+     *
+     * ⚠ Historical note, corrected 2026-08-08: this warning used to say outright "Do NOT use
+     * umac_interface_get_vif_mac_addr() here". That was aimed at the OLD miscall, which passed a
+     * firmware vif id where an `enum mmwlan_vif` is expected and so resolved MMWLAN_VIF_UNSPECIFIED
+     * and returned nothing. Called correctly -- with MMWLAN_VIF_STA, the slot mesh shares -- it does
+     * resolve a mesh vif, and the BSSID passed to mmdrv_set_bssid() above now depends on exactly
+     * that. Do not "restore" the old prohibition; it would bring the all-zero BSSID back. */
     if (iface_mac != NULL)
     {
         mac_addr_copy(mesh_ctx.mesh_mac, iface_mac);
@@ -4098,7 +4105,25 @@ fail:
 static void umac_mesh_abort_restore(struct umac_data *umacd, const char *why)
 {
     MMLOG_ERR("MESH: hw-restart restore ABORTED (%s) -- mesh is DOWN, not merely degraded\n", why);
+
+    /* Full teardown, matching mmwlan_mesh_stop(). Clearing `active` alone is a trap: mesh_stop()
+     * guards on it and returns MMWLAN_UNAVAILABLE, so the app could never clean up afterwards --
+     * every per-peer stad would leak (the next mmwlan_mesh_start() memsets mesh_peers[] and loses the
+     * pointers), and the plink/RANN ticks would stay armed, umac_mesh_rann_tick() self-rescheduling
+     * with no `active` guard of its own. */
+    (void)umac_core_cancel_timeout(umacd, umac_mesh_plink_tick, umacd, NULL);
+    (void)umac_core_cancel_timeout(umacd, umac_mesh_rann_tick, umacd, NULL);
+
     mesh_ctx.active = false;
+
+    for (size_t i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (mesh_peers[i].used)
+        {
+            mesh_peer_free(&mesh_peers[i]);
+        }
+    }
+
     umac_interface_remove(umacd, UMAC_INTERFACE_MESH);
 }
 
@@ -4202,16 +4227,15 @@ void umac_mesh_handle_hw_restarted(struct umac_data *umacd)
     }
 #endif
 
-    /* Re-push the chip's sequence-number spaces for every mesh stad, mirroring what the STA path does
-     * via umac_datapath_handle_hw_restarted() (umac_connection.c:1796 -> umac_datapath.c:3512). The
-     * chip's counters restart at 0 after mmdrv_init while the peers -- which did not restart -- keep
-     * their duplicate-detection state. Same hazard class as the CCMP PN reset this path is careful to
-     * avoid, only for the numbers the chip stamps rather than the host. */
     /* Re-push the chip's sequence-number spaces for the mesh stads, mirroring the STA path
      * (umac_connection.c:1796 -> umac_datapath.c:3512). mmdrv_init() restarts the chip's counters at 0
      * while the peers -- which did not restart -- keep their duplicate-detection state: the same
      * hazard class as the CCMP PN reset this path is careful to avoid, for the numbers the chip stamps
-     * rather than the host. Done AFTER the station exists on the chip, not before. */
+     * rather than the host.
+     *
+     * The common stad is done here rather than with the peers: it has no chip station entry of its own
+     * (its peer_addr is this node's own MAC), so there is nothing for it to be ordered after. The
+     * PER-PEER call further down is the one that must follow the station install. */
     if (mesh_ctx.common_stad != NULL)
     {
         umac_datapath_handle_hw_restarted(umacd, mesh_ctx.common_stad);
