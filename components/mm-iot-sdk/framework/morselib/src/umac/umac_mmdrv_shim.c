@@ -148,13 +148,32 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
          * being here rather than in an arm: it drives the shutdown path, which tears the mesh and the
          * AP down honestly instead of leaving mesh_ctx.active true over a dead chip. It is also
          * exactly what the STA arm did before. */
-        bool channel_ok = (umac_interface_reconfigure_channel(umacd) == MMWLAN_SUCCESS);
+        enum mmwlan_status chan_status = umac_interface_reconfigure_channel(umacd);
+        bool channel_ok = (chan_status == MMWLAN_SUCCESS);
         if (!channel_ok)
         {
-            MMLOG_ERR("Failed to reconfigure the channel after a hardware restart -- the node cannot "
-                      "transmit or receive; aborting the restore rather than beaconing on a chip with "
-                      "no channel\n");
-            UMAC_FATAL_ERROR(umacd);
+            /* Either way the arms are skipped -- beaconing on a chip with no channel is the
+             * silently-deaf state this path exists to prevent -- but the two causes are not the same
+             * fault and must not read as one.
+             *
+             * MMWLAN_UNAVAILABLE means there was no channel configured to restore. That is not an
+             * error the node caused: it is reachable on an interface that is active but has never been
+             * given a channel (the boot vif), and escalating it to a fatal shutdown would turn a benign
+             * early restart into a dead node. Anything else means the chip REJECTED a channel it was
+             * operating on moments ago, which is fatal. */
+            if (chan_status == MMWLAN_UNAVAILABLE)
+            {
+                MMLOG_WRN("No channel was configured before the hardware restart, so there is nothing "
+                          "to restore; skipping the per-slot restore rather than beaconing on a chip "
+                          "with no channel\n");
+            }
+            else
+            {
+                MMLOG_ERR("Failed to reconfigure the channel after a hardware restart (%d) -- the node "
+                          "cannot transmit or receive; aborting the restore rather than beaconing on a "
+                          "chip with no channel\n", (int)chan_status);
+                UMAC_FATAL_ERROR(umacd);
+            }
         }
 
         /* Restore per HOST-SLOT, not by picking one interface type -- mirroring net/mac80211, where

@@ -937,23 +937,36 @@ enum mmwlan_status umac_interface_reconfigure_channel(struct umac_data *umacd)
         /* On failure the cache is deliberately LEFT ZEROED, which is the honest state: nothing was
          * programmed, so the host must not claim a channel the chip does not have.
          *
-         * A previous revision restored the saved operation here, to keep a later retry from reading
-         * operating_channel_index == 0, taking the empty branch below and returning SUCCESS having
-         * programmed nothing. That traded one silent no-op for a worse one: with the cache restored,
-         * the next umac_interface_set_channel() for the same operation short-circuits on
-         * ie_s1g_operation_is_equal() (:815), logs "Channel is the same, skipping set channel" and
-         * also returns SUCCESS having programmed nothing -- and meanwhile every reader of
-         * umac_interface_get_current_s1g_operation_info() (mmwlan_get_vif_channel_info, which the AP
-         * uses to inherit the STA's channel) is told a falsehood.
+         * A previous revision restored the saved operation here, to keep a later call from reading
+         * operating_channel_index == 0 and taking the empty branch below. That traded one silent no-op
+         * for a worse one: with the cache restored, the next umac_interface_set_channel() for the same
+         * operation short-circuits on ie_s1g_operation_is_equal() (:815), logs "Channel is the same,
+         * skipping set channel" and also returns SUCCESS having programmed nothing.
          *
-         * The retry it was protecting does not exist: both callers on the hw-restart path --
-         * hw_restart_evt_handler() and, on the WNM chip-powerdown wake,
-         * umac_connection_handle_hw_restarted() -- treat a failure here as fatal and stop. */
+         * The concrete route by which a restored-but-false cache does damage is a LATER start, not the
+         * restart itself: umac_data_init() -- the only place this cache is zeroed wholesale -- runs
+         * from mmwlan_init() at app boot and NOT from the fatal shutdown, so a stale value survives it.
+         * An app that calls mmwlan_mesh_start() or mmwlan_ap_enable() afterwards reaches
+         * umac_interface_set_channel_from_regdb(), short-circuits on the equality check, and beacons on
+         * a channel the chip was never given.
+         * (Its live readers are umac_rc.c:166 and :410 and the ECSA handler at umac_connection.c:1492.
+         * NOT mmwlan_get_vif_channel_info(): the STA arm reads bss_cfg.channel_cfg and the AP arm reads
+         * its own args, so AP channel inheritance cannot be misled through this cache in either
+         * direction. An earlier version of this comment claimed otherwise and was wrong.) */
         return umac_interface_set_channel(umacd, &s1g_operation);
     }
     else
     {
-        return MMWLAN_SUCCESS;
+        /* Nothing to reconfigure, and that is NOT success. The cache reads zero in exactly two
+         * situations -- no channel was ever configured, or a previous attempt failed and left it
+         * zeroed -- and in both the chip has no channel. Returning MMWLAN_SUCCESS here made the two
+         * indistinguishable from "restored", so a caller that is not terminal-on-failure would carry on
+         * and beacon on an unprogrammed chip: the silently-deaf state this path exists to prevent.
+         * Reachable today by a second hardware restart arriving after a first one already failed,
+         * because umac_fatal_error() early-returns once data->fatal_error is latched (umac.c:2109) and
+         * therefore does not stop the second pass. MMWLAN_UNAVAILABLE says what is true, and lets the
+         * caller tell "no channel to restore" apart from "the chip rejected one". */
+        return MMWLAN_UNAVAILABLE;
     }
 }
 
