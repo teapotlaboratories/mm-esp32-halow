@@ -934,19 +934,22 @@ enum mmwlan_status umac_interface_reconfigure_channel(struct umac_data *umacd)
 
     if (s1g_operation.operating_channel_index != 0)
     {
-        enum mmwlan_status status = umac_interface_set_channel(umacd, &s1g_operation);
-        if (status != MMWLAN_SUCCESS)
-        {
-            /* Put the cache back. set_channel_internal() only writes current_s1g_operation on a
-             * SUCCESSFUL mmdrv_set_channel(), so without this a failure leaves it zeroed -- and every
-             * later reconfigure_channel() then reads operating_channel_index == 0, takes the branch
-             * below and returns SUCCESS having programmed nothing. One failure would permanently
-             * disable the retry, silently. That is not hypothetical: the hw-restart path deliberately
-             * has a second caller (umac_connection_handle_hw_restarted, reached from the WNM
-             * chip-powerdown wake), and it would have inherited a poisoned cache. */
-            data->current_s1g_operation = s1g_operation;
-        }
-        return status;
+        /* On failure the cache is deliberately LEFT ZEROED, which is the honest state: nothing was
+         * programmed, so the host must not claim a channel the chip does not have.
+         *
+         * A previous revision restored the saved operation here, to keep a later retry from reading
+         * operating_channel_index == 0, taking the empty branch below and returning SUCCESS having
+         * programmed nothing. That traded one silent no-op for a worse one: with the cache restored,
+         * the next umac_interface_set_channel() for the same operation short-circuits on
+         * ie_s1g_operation_is_equal() (:815), logs "Channel is the same, skipping set channel" and
+         * also returns SUCCESS having programmed nothing -- and meanwhile every reader of
+         * umac_interface_get_current_s1g_operation_info() (mmwlan_get_vif_channel_info, which the AP
+         * uses to inherit the STA's channel) is told a falsehood.
+         *
+         * The retry it was protecting does not exist: both callers on the hw-restart path --
+         * hw_restart_evt_handler() and, on the WNM chip-powerdown wake,
+         * umac_connection_handle_hw_restarted() -- treat a failure here as fatal and stop. */
+        return umac_interface_set_channel(umacd, &s1g_operation);
     }
     else
     {
