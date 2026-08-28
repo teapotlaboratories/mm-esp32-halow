@@ -64,6 +64,20 @@ struct umac_ap_config
 enum mmwlan_status umac_ap_start(struct umac_data *umacd, const struct umac_ap_config *cfg);
 
 
+/**
+ * Restore an AP vif after the chip was torn down and re-inited by a hardware restart.
+ *
+ * Counterpart to @c umac_connection_handle_hw_restarted() and @c umac_mesh_handle_hw_restarted()
+ * for the VIF_AP host-slot: reinstalls the vif, re-pushes the BSS config, re-arms beaconing, then
+ * re-adds every associated station and its keys. Self-guards, so it is a no-op on a node with no AP
+ * (or with one enabled but not yet started).
+ *
+ * The channel is NOT restored here -- it is HW-global and the caller restores it once, before any
+ * per-slot arm.
+ */
+void umac_ap_handle_hw_restarted(struct umac_data *umacd);
+
+
 const struct mmwlan_ap_args *umac_ap_get_args(struct umac_data *umacd);
 
 

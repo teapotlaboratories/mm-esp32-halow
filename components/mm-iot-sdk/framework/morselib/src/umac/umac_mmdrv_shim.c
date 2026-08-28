@@ -72,12 +72,6 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
 {
     MM_UNUSED(evt);
 
-    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != MMDRV_VIF_ID_INVALID)
-    {
-        MMLOG_ERR("Unable to recover from hardware restart with AP interface active\n");
-        MMOSAL_ASSERT(false);
-    }
-
     if (umac_interface_is_active(umacd))
     {
         const char *country_code = umac_regdb_get_country_code(umacd);
@@ -121,8 +115,51 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
 
         umac_scan_handle_hw_restarted(umacd);
 
-        /* Dispatch by interface type, EXPLICITLY -- mirroring net/mac80211, where ieee80211_reconfig
-         * runs a per-type switch and no vif takes two arms.
+        /* The channel, also HW-GLOBAL and hoisted here for the same reason. mmdrv_set_channel() is
+         * issued with MMDRV_VIF_ID_INVALID (driver.c:864) -- it is a radio-wide command, and so are
+         * the txpower / duty-cycle / mpsw commands that ride with it (umac_interface.c:834-866).
+         * Linux agrees on the placement: ieee80211_hw_config() runs once, after drv_start() and
+         * before the per-vif loop, not inside the type switch.
+         *
+         * It has to be OUT of the per-slot arms because the mesh gateway runs a mesh vif AND an AP
+         * vif. With the call inside each arm the gate would program the channel a second time from
+         * the AP arm, after the mesh arm had already armed beaconing. One radio, one channel, one
+         * restore.
+         *
+         * ⚠ It must be reconfigure_channel(), NOT set_channel_from_regdb(): the latter short-circuits
+         * on ie_s1g_operation_is_equal() against data->current_s1g_operation (umac_interface.c:815),
+         * a HOST cache that mmdrv_init() does not clear -- so it programs nothing and returns
+         * SUCCESS. Fourth instance of that trap on this path; see the pwr_mode note above.
+         *
+         * ⚠ umac_connection_handle_hw_restarted() KEEPS its own copy of this call, and that is not
+         * dead code. It has a second caller that never comes through this handler:
+         * wnm_sleep_fsm_active_exit() (umac_wnm_sleep.c:281-286) re-inits the chip after a WNM
+         * chip-powerdown and drives the connection restore directly. Dropping it there would silently
+         * lose the channel on the power-save wake path. The cost here is one redundant SET_CHANNEL
+         * with the same value on a STA node, issued before any vif is beaconing. */
+        if (umac_interface_reconfigure_channel(umacd) != MMWLAN_SUCCESS)
+        {
+            MMLOG_ERR("Failed to reconfigure the channel after a hardware restart -- the node will "
+                      "be unable to transmit or receive\n");
+        }
+
+        /* Restore per HOST-SLOT, not by picking one interface type -- mirroring net/mac80211, where
+         * ieee80211_reconfig() LOOPS over every interface (util.c:1902) and each one independently
+         * takes its own arm of the type switch.
+         *
+         * morselib has exactly two host slots: VIF_STA (STA / IBSS / mesh / scan / the boot vif) and
+         * VIF_AP (VIF_STA_INTERFACE_TYPES_MASK, umac_interface.c:118-120). The shipped mesh gateway
+         * -- rimba-halow-mesh-ap -- runs BOTH at once, which a single `mesh else connection` choice
+         * cannot express: whichever arm won, the other interface stayed dead on the chip. Two
+         * independent slot restores can, and that is the only structural change needed to make the
+         * gateway recoverable.
+         *
+         * Order is mesh-then-AP, matching the order the gateway is brought up in: mmwlan_mesh_start()
+         * first, then mmwlan_ap_enable(), whose enable path inherits the STA slot's channel
+         * (umac_ap.c:265-281).
+         *
+         * Within the VIF_STA slot the choice IS exclusive -- STA, IBSS and mesh share one FW vif --
+         * so that arm stays an either/or.
          *
          * ⚠ The exclusivity must be enforced here; it cannot be inferred from the handlers. It is
          * tempting to call both and assume the connection handler no-ops on a mesh node, because it
@@ -146,6 +183,23 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
         {
             umac_connection_handle_hw_restarted(umacd);
         }
+
+#if !(defined(MMWLAN_AP_DISABLED) && MMWLAN_AP_DISABLED)
+        /* The VIF_AP slot, restored independently of the one above.
+         *
+         * This replaces an MMOSAL_ASSERT(false) that used to be the FIRST statement in this handler:
+         * an active AP vif panicked the node instead of recovering it, which made the gateway the one
+         * configuration a hardware restart could not survive. Linux does not refuse an AP either --
+         * NL80211_IFTYPE_AP takes the same generic restore as every other type plus drv_start_ap()
+         * (util.c:2036-2038). umac_ap_handle_hw_restarted() self-guards, so this is a no-op on a node
+         * with no AP.
+         *
+         * The #if is load-bearing, not cosmetic. umac_ap.c is not compiled when AP support is off, so
+         * an unguarded reference here is an undefined symbol at link -- exactly the trap documented on
+         * umac_mmdrv_get_beacon() below, which the S2 work tripped once already by pulling this
+         * translation unit back in. */
+        umac_ap_handle_hw_restarted(umacd);
+#endif
     }
 
     MMLOG_DBG("Notify MMDRV that restart has completed\n");

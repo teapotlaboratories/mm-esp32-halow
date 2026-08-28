@@ -1709,6 +1709,12 @@ void umac_connection_handle_hw_restarted(struct umac_data *umacd)
             return;
         }
 
+        /* Kept here even though hw_restart_evt_handler() now restores the channel HW-globally before
+         * dispatching. This function has a SECOND caller that never goes through that handler:
+         * wnm_sleep_fsm_active_exit() (umac_wnm_sleep.c:281-286) re-inits the chip after a WNM
+         * chip-powerdown and drives the connection restore directly. Removing this line would
+         * silently drop the channel restore on the power-save wake path. On the restart path it costs
+         * one redundant SET_CHANNEL with the same value, before any vif is beaconing. */
         MMLOG_DBG("Reconfigure channel\n");
         status = umac_interface_reconfigure_channel(umacd);
         if (status != MMWLAN_SUCCESS)

@@ -441,6 +441,250 @@ failure:
     return status;
 }
 
+/* Abort the AP half of a hardware-restart restore.
+ *
+ * Deliberately NOT umac_ap_disable_ap(). That path is written for an app-initiated shutdown and is
+ * unsafe from here: it issues mmdrv_stop_beaconing() at a chip that has just failed a command, tears
+ * the hostapd interface down (umac_supp_remove_ap_interface()) and sleeps 100 ms -- all from inside
+ * the umac event loop that is currently servicing the restart. What the app needs instead is the
+ * truth, delivered where it can act on it: the AP link is DOWN. The umac_ap_data allocation is left
+ * intact so a later mmwlan_ap_disable() can still clean up normally.
+ *
+ * The mesh arm's umac_mesh_abort_restore() does tear down, and the asymmetry is deliberate: a
+ * half-restored mesh leaves self-rescheduling plink/RANN timers armed and every peer stad leaked.
+ * The AP has neither -- its stads live in data->stas[] and its beacons are driven by the chip asking
+ * for them, which a dead vif stops doing. */
+static void umac_ap_abort_restore(struct umac_data *umacd, const char *why)
+{
+    MMLOG_ERR("AP: hw-restart restore ABORTED (%s) -- the AP is DOWN, not merely degraded\n", why);
+
+    struct mmwlan_vif_state state = {
+        .vif = MMWLAN_VIF_AP,
+        .link_state = MMWLAN_LINK_DOWN,
+    };
+    umac_interface_invoke_vif_state_cb(umacd, &state);
+}
+
+/* Restore an AP vif after the chip was torn down and re-inited (hw_restart).
+ *
+ * Counterpart to umac_mesh_handle_hw_restarted() / umac_connection_handle_hw_restarted(), and the
+ * thing that replaces the MMOSAL_ASSERT(false) that used to open hw_restart_evt_handler(). Linux
+ * does not refuse to recover an AP either: NL80211_IFTYPE_AP takes the same generic restore as every
+ * other interface type, plus drv_start_ap().
+ *
+ * Ported from net/mac80211 ieee80211_reconfig() (util.c:1753). Linux restores an AP in four places,
+ * and this mirrors that order:
+ *   1. drv_add_interface()                        util.c:1853/1865  -> reinstall the vif
+ *   2. switch #1 `case NL80211_IFTYPE_AP:`        util.c:1967       -> per-AC TX config ONLY.
+ *      ⚠ The comment on that label -- "AP stations are handled later" -- is the whole point: the AP
+ *      arm deliberately does NOT fall into ieee80211_reconfig_stations() with everyone else, because
+ *      an AP's stations must be re-added after its beacon is up.
+ *   3. switch #2 `case NL80211_IFTYPE_AP:`        util.c:2036-2038  -> drv_start_ap(), then it falls
+ *      through to MESH_POINT's enable_beacon arm (util.c:2041-2046)
+ *   4. the SECOND interface loop                  util.c:2093-2103  -> ieee80211_reconfig_stations()
+ *      for AP / AP_VLAN, then ieee80211_reenable_keys() (util.c:2108) for every vif
+ *
+ * DELIBERATE DIVERGENCES from the reference, all forced by morselib's shape:
+ *  - Linux pushes the BSS config through bss_info_change_notify(BSS_CHANGED_BEACON |
+ *    BSS_CHANGED_BEACON_ENABLED) and lets the driver react. morselib has no notify layer, so the
+ *    same intent is the explicit mmdrv_cfg_bss() + mmdrv_start_beaconing() pair that
+ *    umac_ap_start() uses.
+ *  - The channel is NOT restored here. It is HW-global on this radio (mmdrv_set_channel() is issued
+ *    with MMDRV_VIF_ID_INVALID) and the caller restores it once, before any per-slot arm -- which is
+ *    also where Linux puts ieee80211_hw_config(). On the mesh gateway both slots are live, and one
+ *    radio gets one channel restore.
+ *  - Linux steps a station up through EVERY intermediate state from NOTEXIST; morse_driver filters
+ *    NOTEXIST/NONE (mac.c:4813), so the ladder here starts at AUTHENTICATED -- identical to what
+ *    umac_ap_update_sta() sends on the normal association path.
+ *
+ * NOT restored, stated rather than hidden:
+ *  - TWT responder agreements. umac_interface_init_vif() re-arms the responder itself (via
+ *    umac_twt_init_vif() on the AP arm), but any per-STA agreement the chip was holding
+ *    (MORSE_CMD_ID_TWT_AGREEMENT_ADD) is gone. The STA path has umac_twt_install_pending_agreements()
+ *    for the requester side; there is no responder-side equivalent to call. A STA in an agreement
+ *    will wake on its next TWT service period and find the AP no longer honouring it. Tracked
+ *    separately rather than fixed in passing.
+ */
+void umac_ap_handle_hw_restarted(struct umac_data *umacd)
+{
+    struct umac_ap_data *data = umac_data_get_ap(umacd);
+    if (data == NULL)
+    {
+        return; /* AP not enabled: nothing of ours to restore */
+    }
+
+    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) == MMDRV_VIF_ID_INVALID)
+    {
+        /* mmwlan_ap_enable() allocates this data and starts the supplicant; the vif is not added
+         * until hostapd calls back into umac_ap_start(). In between there is no chip state for an
+         * AP, and umac_interface_reinstall_vif() would refuse anyway (nothing active in the slot). */
+        MMLOG_INF("AP: enabled but not started; nothing to restore after the hardware restart\n");
+        return;
+    }
+
+    MMLOG_INF("AP: restoring vif after hardware restart\n");
+
+    /* 1. Reinstall the vif. umac_interface_reinstall_vif() maps MMWLAN_VIF_AP ->
+     *    MMDRV_INTERFACE_TYPE_AP and re-runs umac_interface_init_vif(), which re-arms the TWT
+     *    responder for the AP slot. */
+    enum mmwlan_status status = umac_interface_reinstall_vif(umacd, MMWLAN_VIF_AP);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_ap_abort_restore(umacd, "vif reinstall failed");
+        return;
+    }
+
+    /* The driver may hand back a different vif id, so re-read it and re-tag every stad that carries
+     * one. A stale vif_id would aim the per-STA commands and all AP TX framing at an interface that
+     * no longer exists -- silently, since nothing validates it. */
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP);
+    if (vif_id == MMDRV_VIF_ID_INVALID)
+    {
+        umac_ap_abort_restore(umacd, "no AP vif after reinstall");
+        return;
+    }
+    /* sta_common is allocated by mmwlan_ap_enable() and only freed by mmwlan_ap_disable(), which frees
+     * `data` with it -- so reaching here with it NULL should be impossible. Guarded anyway rather than
+     * relying on that: umac_sta_data_set_vif_id() and umac_keys_reinstall_keys() both MMOSAL_ASSERT on
+     * a NULL stad, i.e. they would panic the node in the middle of recovering it. Same reasoning as
+     * the mesh arm's peer->stad check. */
+    if (data->sta_common == NULL)
+    {
+        umac_ap_abort_restore(umacd, "no sta_common; group keys and AP TX cannot be restored");
+        return;
+    }
+    umac_sta_data_set_vif_id(data->sta_common, vif_id);
+    for (size_t ii = 1; ii < data->max_stas; ii++)
+    {
+        if (data->stas[ii] != NULL)
+        {
+            umac_sta_data_set_vif_id(data->stas[ii], vif_id);
+        }
+    }
+
+    /* 2. Chip-side BSS config, from the config umac_ap_start() stored. The compressed SSID is
+     *    recomputed rather than cached, so there is one definition of it (umac_ap_start():425). */
+    uint32_t cssid = umac_ap_generate_cssid(data->config.ssid, data->config.ssid_len);
+    status = mmdrv_cfg_bss(vif_id,
+                           data->config.beacon_interval_tus,
+                           data->config.dtim_period,
+                           cssid);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_ap_abort_restore(umacd, "chip BSS config failed");
+        return;
+    }
+
+    /* 3. drv_start_ap() -- re-arm beaconing. The host beacon engine never stopped, so the chip has a
+     *    server for the beacons it will now start asking for. */
+    status = mmdrv_start_beaconing(vif_id);
+    if (status != MMWLAN_SUCCESS)
+    {
+        umac_ap_abort_restore(umacd, "could not re-arm beaconing");
+        return;
+    }
+
+    /* 4. Re-add the associated stations, AFTER beaconing -- Linux's second interface loop
+     *    (util.c:2093-2103), and the reason its first loop skips AP. */
+    int restored = 0;
+    int failed = 0;
+    for (size_t ii = 1; ii < data->max_stas; ii++)
+    {
+        struct umac_sta_data *stad = data->stas[ii];
+        if (stad == NULL)
+        {
+            continue;
+        }
+
+        struct umac_ap_sta_data *sta_data = umac_sta_data_get_ap(stad);
+        if (sta_data->sta_state < MORSE_STA_AUTHENTICATED)
+        {
+            /* Nothing was ever pushed to the chip for this STA (morse_driver filters NOTEXIST/NONE),
+             * so there is nothing to put back. Leave it to the supplicant, which still holds it. */
+            continue;
+        }
+
+        const uint8_t *sta_addr = umac_sta_data_peek_peer_addr(stad);
+        uint16_t aid = umac_sta_data_get_aid(stad);
+        bool ok = true;
+        for (enum morse_sta_state state = MORSE_STA_AUTHENTICATED; state <= sta_data->sta_state;
+             state++)
+        {
+            status = mmdrv_update_sta_state(vif_id, aid, sta_addr, state);
+            if (status != MMWLAN_SUCCESS)
+            {
+                MMLOG_ERR("AP: restore sta_state aid=%u " MM_MAC_ADDR_FMT
+                          " state=%u FAILED (%u)\n",
+                          aid, MM_MAC_ADDR_VAL(sta_addr), (unsigned)state, status);
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+        {
+            restored++;
+        }
+        else
+        {
+            failed++;
+        }
+    }
+
+    /* 5. Keys last, for every stad on the vif -- ieee80211_reenable_keys() (util.c:2108), which is
+     *    outside the type switch and so runs for an AP like any other vif.
+     *
+     * ⚠ Re-PUSH the surviving host keychain; never rebuild the keys. connection_keys_install_key()
+     * COPIES tx_seq/rx_seq out of the struct handed to it (connection_keys.c:118-121), so a freshly
+     * built key rewinds this node's CCMP PN to 0 while the associated STAs -- which did not restart
+     * -- keep their replay windows. Every frame would then be dropped as a replay, with every install
+     * returning success and nothing logged. This is the same trap the mesh restore documents.
+     *
+     * sta_common carries the group (broadcast/multicast) keys, so it is not optional: without it the
+     * AP beacons and answers unicast fine while every group-addressed frame dies. */
+    if (umac_keys_reinstall_keys(data->sta_common, vif_id) != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("AP: reinstall group keychain FAILED -- group-addressed TX will not work\n");
+    }
+    umac_datapath_handle_hw_restarted(umacd, data->sta_common);
+
+    for (size_t ii = 1; ii < data->max_stas; ii++)
+    {
+        struct umac_sta_data *stad = data->stas[ii];
+        if (stad == NULL)
+        {
+            continue;
+        }
+        struct umac_ap_sta_data *sta_data = umac_sta_data_get_ap(stad);
+        if (sta_data->sta_state < MORSE_STA_AUTHENTICATED)
+        {
+            continue;
+        }
+        if (umac_keys_reinstall_keys(stad, vif_id) != MMWLAN_SUCCESS)
+        {
+            MMLOG_ERR("AP: reinstall keychain FAILED for aid=%u -- traffic to it will not work\n",
+                      umac_sta_data_get_aid(stad));
+        }
+        /* Re-push the chip's sequence-number spaces, mirroring the STA and mesh paths
+         * (umac_connection.c:1796, umac_mesh.c:4262). mmdrv_init() restarts the chip's counters at 0
+         * while the STAs -- which did not restart -- keep their duplicate-detection state. */
+        umac_datapath_handle_hw_restarted(umacd, stad);
+    }
+
+    /* Report failures rather than a bare success count: "silently deaf" is the failure mode this
+     * whole feature exists to make observable, so a counter that cannot tell a restored STA from a
+     * rejected one is the wrong instrument. */
+    if (failed > 0)
+    {
+        MMLOG_ERR("AP: vif %u restored, but %d of %d STA(s) FAILED to reinstall -- "
+                  "traffic to them will not work\n",
+                  vif_id, failed, failed + restored);
+    }
+    else
+    {
+        MMLOG_INF("AP: restored vif %u with %d associated STA(s)\n", vif_id, restored);
+    }
+}
+
 void umac_ap_build_beacon(struct umac_data *umacd, struct consbuf *buf, void *params)
 {
     const bool *traffic_indicator = (const bool *)params;
