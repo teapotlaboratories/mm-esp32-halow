@@ -513,11 +513,24 @@ void umac_ap_handle_hw_restarted(struct umac_data *umacd)
         return; /* AP not enabled: nothing of ours to restore */
     }
 
-    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) == MMDRV_VIF_ID_INVALID)
+    /* "Started" needs BOTH: a vif AND a live config.
+     *
+     * The vif alone is not enough. umac_ap_start()'s failure path (:437-440) frees config.head/tail and
+     * memsets data->config, but does NOT remove the interface it added at :369 -- reachable from a
+     * missing or invalid S1G Operation IE, or a failing set_channel / cfg_bss / start_beaconing. A
+     * restart would then sail past a vif-only guard and push mmdrv_cfg_bss(vif, beacon_interval=0,
+     * dtim_period=0, crc32("")) and re-arm beaconing on a dead config, after which the chip starts
+     * asking for beacons that umac_ap_build_beacon() would assemble from NULL head/tail.
+     * config.head is the discriminator: hostapd supplies it on a real start, and the failure path
+     * NULLs it. (The interface left behind by that failure path is a separate leak, not fixed here --
+     * it wants its own change and its own verification.)
+     *
+     * The vif check also covers the ordinary in-between state: mmwlan_ap_enable() allocates this data
+     * and starts the supplicant, and the vif is not added until hostapd calls back into
+     * umac_ap_start(). */
+    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) == MMDRV_VIF_ID_INVALID ||
+        data->config.head == NULL)
     {
-        /* mmwlan_ap_enable() allocates this data and starts the supplicant; the vif is not added
-         * until hostapd calls back into umac_ap_start(). In between there is no chip state for an
-         * AP, and umac_interface_reinstall_vif() would refuse anyway (nothing active in the slot). */
         MMLOG_INF("AP: enabled but not started; nothing to restore after the hardware restart\n");
         return;
     }
@@ -645,7 +658,12 @@ void umac_ap_handle_hw_restarted(struct umac_data *umacd)
     {
         MMLOG_ERR("AP: reinstall group keychain FAILED -- group-addressed TX will not work\n");
     }
-    umac_datapath_handle_hw_restarted(umacd, data->sta_common);
+    /* NO umac_datapath_handle_hw_restarted() for sta_common, unlike the mesh arm. The mesh common stad
+     * carries this node's own MAC as its peer_addr, so the sequence-number-space push has a meaningful
+     * address to key on; the AP's sta_common never gets a peer address at all -- umac_ap_enable_ap()
+     * and umac_ap_start() only ever call umac_sta_data_set_bssid() on it (:309, :323, :360) and it is
+     * calloc'd -- so the same call would push a baseline for 00:00:00:00:00:00. It also has no chip
+     * station entry of its own. Group TX has no per-peer duplicate detection to restore. */
 
     for (size_t ii = 1; ii < data->max_stas; ii++)
     {
@@ -664,10 +682,13 @@ void umac_ap_handle_hw_restarted(struct umac_data *umacd)
             MMLOG_ERR("AP: reinstall keychain FAILED for aid=%u -- traffic to it will not work\n",
                       umac_sta_data_get_aid(stad));
         }
-        /* Re-push the chip's sequence-number spaces, mirroring the STA and mesh paths
-         * (umac_connection.c:1796, umac_mesh.c:4262). mmdrv_init() restarts the chip's counters at 0
-         * while the STAs -- which did not restart -- keep their duplicate-detection state. */
-        umac_datapath_handle_hw_restarted(umacd, stad);
+        /* Re-push the chip's sequence-number spaces, mirroring the STA and mesh paths. mmdrv_init()
+         * restarts the chip's counters at 0 while the STAs -- which did not restart -- keep their
+         * duplicate-detection state.
+         * ⚠ vif_id is passed explicitly: the helper used to derive it from UMAC_INTERFACE_STA, which
+         * resolves to the STA host-slot even for an AP stad, so on the gateway it aimed these at the
+         * MESH vif and left the AP's counters at zero. */
+        umac_datapath_handle_hw_restarted(umacd, stad, vif_id);
     }
 
     /* Report failures rather than a bare success count: "silently deaf" is the failure mode this

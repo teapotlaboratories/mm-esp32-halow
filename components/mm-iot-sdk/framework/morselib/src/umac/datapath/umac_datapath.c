@@ -3509,15 +3509,23 @@ void umac_datapath_unpause(struct umac_data *umacd, uint16_t source_mask)
     umac_datapath_update_tx_paused(umacd, source_mask, return_false);
 }
 
-void umac_datapath_handle_hw_restarted(struct umac_data *umacd, struct umac_sta_data *stad)
+/* vif_id is a PARAMETER, not looked up here. It used to be
+ * umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA), which is correct for the STA and mesh callers
+ * -- mesh shares the STA host-slot -- and silently WRONG for an AP one: UMAC_INTERFACE_STA is inside
+ * VIF_STA_INTERFACE_TYPES_MASK (umac_interface.c:118-120), so that lookup returns the STA-slot vif id
+ * whatever the stad belongs to. On the mesh gateway it aimed an AP client's sequence-number spaces at
+ * the MESH vif while leaving the AP vif's counters at the post-mmdrv_init() zero -- the very
+ * duplicate-detection rewind this call exists to prevent. */
+void umac_datapath_handle_hw_restarted(struct umac_data *umacd,
+                                       struct umac_sta_data *stad,
+                                       uint16_t vif_id)
 {
+    MM_UNUSED(umacd);
     struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
 
     const uint8_t *peer_addr = umac_sta_data_peek_peer_addr(stad);
 
-    (void)mmdrv_set_seq_num_spaces(umac_interface_get_vif_id(umacd, UMAC_INTERFACE_STA),
-                                   sta_data->tx_seq_num_spaces,
-                                   peer_addr);
+    (void)mmdrv_set_seq_num_spaces(vif_id, sta_data->tx_seq_num_spaces, peer_addr);
 }
 
 enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,

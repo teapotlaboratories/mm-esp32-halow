@@ -1799,7 +1799,7 @@ void umac_connection_handle_hw_restarted(struct umac_data *umacd)
             }
         }
 
-        umac_datapath_handle_hw_restarted(umacd, data->stad);
+        umac_datapath_handle_hw_restarted(umacd, data->stad, vif_id);
     }
 }
 

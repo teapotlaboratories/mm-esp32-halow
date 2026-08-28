@@ -4242,7 +4242,7 @@ void umac_mesh_handle_hw_restarted(struct umac_data *umacd)
      * PER-PEER call further down is the one that must follow the station install. */
     if (mesh_ctx.common_stad != NULL)
     {
-        umac_datapath_handle_hw_restarted(umacd, mesh_ctx.common_stad);
+        umac_datapath_handle_hw_restarted(umacd, mesh_ctx.common_stad, vif_id);
     }
 
     /* 4. Re-push every ESTAB peer to the chip: the state ladder, then its keys. Peers that had not
@@ -4263,7 +4263,7 @@ void umac_mesh_handle_hw_restarted(struct umac_data *umacd)
         }
         if (umac_mesh_peer_reinstall_on_chip(peer))
         {
-            umac_datapath_handle_hw_restarted(umacd, peer->stad);
+            umac_datapath_handle_hw_restarted(umacd, peer->stad, vif_id);
             restored++;
         }
         else

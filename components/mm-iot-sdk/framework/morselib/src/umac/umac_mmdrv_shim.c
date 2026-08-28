@@ -137,10 +137,24 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
          * chip-powerdown and drives the connection restore directly. Dropping it there would silently
          * lose the channel on the power-save wake path. The cost here is one redundant SET_CHANNEL
          * with the same value on a STA node, issued before any vif is beaconing. */
-        if (umac_interface_reconfigure_channel(umacd) != MMWLAN_SUCCESS)
+        /* A failure here is FATAL, not a log line. Before the hoist this call lived inside the arms
+         * and carried real consequences -- the mesh arm ran umac_mesh_abort_restore() and the STA arm
+         * UMAC_FATAL_ERROR() -- and moving it must not quietly downgrade that. Without the channel the
+         * node cannot transmit or receive, so carrying on to re-arm beaconing would manufacture
+         * exactly the silently-deaf state this whole feature exists to eliminate: a node whose host
+         * view looks healthy and whose radio says nothing.
+         *
+         * UMAC_FATAL_ERROR is the right severity for every interface type, which is the point of
+         * being here rather than in an arm: it drives the shutdown path, which tears the mesh and the
+         * AP down honestly instead of leaving mesh_ctx.active true over a dead chip. It is also
+         * exactly what the STA arm did before. */
+        bool channel_ok = (umac_interface_reconfigure_channel(umacd) == MMWLAN_SUCCESS);
+        if (!channel_ok)
         {
-            MMLOG_ERR("Failed to reconfigure the channel after a hardware restart -- the node will "
-                      "be unable to transmit or receive\n");
+            MMLOG_ERR("Failed to reconfigure the channel after a hardware restart -- the node cannot "
+                      "transmit or receive; aborting the restore rather than beaconing on a chip with "
+                      "no channel\n");
+            UMAC_FATAL_ERROR(umacd);
         }
 
         /* Restore per HOST-SLOT, not by picking one interface type -- mirroring net/mac80211, where
@@ -175,11 +189,11 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
          * BSS, re-pushed every peer and armed beaconing -- re-adding the FW interface underneath all
          * of it, and driving mmdrv_update_sta_state() with the connection stad's aid 0 and all-zero
          * BSSID. It happened to survive on the bench; that is not a property worth depending on. */
-        if (umac_mesh_is_active())
+        if (channel_ok && umac_mesh_is_active())
         {
             umac_mesh_handle_hw_restarted(umacd);
         }
-        else
+        else if (channel_ok)
         {
             umac_connection_handle_hw_restarted(umacd);
         }
@@ -198,7 +212,10 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
          * an unguarded reference here is an undefined symbol at link -- exactly the trap documented on
          * umac_mmdrv_get_beacon() below, which the S2 work tripped once already by pulling this
          * translation unit back in. */
-        umac_ap_handle_hw_restarted(umacd);
+        if (channel_ok)
+        {
+            umac_ap_handle_hw_restarted(umacd);
+        }
 #endif
     }
 
