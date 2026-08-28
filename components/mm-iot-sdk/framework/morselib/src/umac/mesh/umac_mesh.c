@@ -4143,6 +4143,9 @@ static void umac_mesh_abort_restore(struct umac_data *umacd, const char *why)
  *    bss_info_change_notify(BSS_CHANGED_BEACON | BSS_CHANGED_BEACON_ENABLED) and the driver reacts.
  *    morselib has no notify layer, so the same intent is the explicit mmdrv_* sequence in the two
  *    chip helpers above.
+ *  - The channel restore is the CALLER's (hw_restart_evt_handler()): it is HW-global, and the mesh
+ *    gateway has a second vif that would otherwise re-program it. Linux puts ieee80211_hw_config()
+ *    outside the vif loop for the same reason.
  *  - Linux reinstalls keys (step 4) AFTER the beacon re-enable (step 3). Here keys ride along with
  *    the per-peer state ladder, because umac_mesh_peer_secure_estab() already pairs them and reusing
  *    that pairing keeps one description of "a peer is installed" rather than two. Beaconing is armed
@@ -4191,13 +4194,14 @@ void umac_mesh_handle_hw_restarted(struct umac_data *umacd)
 
     /* 2. Chip-side BSS config. The BSSID comes from mesh_ctx.mesh_mac -- the node's own MAC, which is
      *    what it advertises as SA/BSSID in its beacons -- NOT from umac_interface_get_vif_mac_addr(),
-     *    which does not resolve a mesh vif. */
-    status = umac_interface_reconfigure_channel(umacd);
-    if (status != MMWLAN_SUCCESS)
-    {
-        umac_mesh_abort_restore(umacd, "channel reconfigure failed");
-        return;
-    }
+     *    which does not resolve a mesh vif.
+     *
+     *    The channel used to be restored here, with umac_interface_reconfigure_channel(). It has
+     *    moved up to hw_restart_evt_handler(), before the per-slot arms, because it is HW-GLOBAL --
+     *    mmdrv_set_channel() is issued with MMDRV_VIF_ID_INVALID -- and the mesh gateway runs an AP
+     *    vif alongside this one. Left in the arms, the gateway would have re-programmed the channel
+     *    from the AP arm after this one had already armed beaconing. Same argument, and the same
+     *    place in the sequence, as the frag threshold and power-save restores. */
     status = mesh_chip_configure_bss(umacd, vif_id, mesh_ctx.beacon_interval_tu,
                                      mesh_ctx.mesh_mac);
     if (status != MMWLAN_SUCCESS)
