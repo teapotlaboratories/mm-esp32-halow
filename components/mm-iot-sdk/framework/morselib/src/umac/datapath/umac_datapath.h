@@ -173,7 +173,11 @@ void umac_datapath_update_tx_paused(struct umac_data *umacd,
                                     mmdrv_host_update_tx_paused_cb_t cb);
 
 
-void umac_datapath_handle_hw_restarted(struct umac_data *umacd, struct umac_sta_data *stad);
+/* @p vif_id is the vif the stad actually lives on -- pass it explicitly. Looking it up from
+ * UMAC_INTERFACE_STA inside would return the STA host-slot for an AP stad too. */
+void umac_datapath_handle_hw_restarted(struct umac_data *umacd,
+                                       struct umac_sta_data *stad,
+                                       uint16_t vif_id);
 
 
 enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,
